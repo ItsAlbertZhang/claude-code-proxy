@@ -321,6 +321,21 @@ const COMPACT_SYSTEM_MARKER: &str =
 const COMPACT_MESSAGE_PREFIX: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.";
 const COMPACT_MESSAGE_TASK: &str =
     "Your task is to create a detailed summary of the conversation so far";
+const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
+    "You are a security monitor for autonomous AI coding agents.";
+
+fn is_claude_auto_review_request(request: &MessagesRequest) -> bool {
+    if request.stream {
+        return false;
+    }
+    match request.extra.get("tools") {
+        Some(Value::Array(tools)) if !tools.is_empty() => return false,
+        Some(Value::Array(_)) | None => {}
+        Some(_) => return false,
+    }
+    flatten_system_text(request.extra.get("system"))
+        .is_some_and(|system| system.starts_with(CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX))
+}
 
 pub(crate) fn is_compact_request(instructions: Option<&str>) -> bool {
     instructions.is_some_and(|text| text.contains(COMPACT_SYSTEM_MARKER))
@@ -538,6 +553,13 @@ pub fn translate_request(
         && resolved_effort.as_ref().is_some_and(|e| *e > cap)
     {
         resolved_effort = Some(cap);
+    }
+    if is_claude_auto_review_request(req)
+        && !resolved_effort
+            .as_ref()
+            .is_some_and(|effort| *effort <= Effort::Low)
+    {
+        resolved_effort = Some(Effort::Low);
     }
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
@@ -1592,6 +1614,56 @@ mod tests {
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
         assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Low)));
+    }
+
+    #[test]
+    fn auto_review_requests_use_low_effort() {
+        for value in [
+            json!({
+                "model": "gpt-5.6-sol",
+                "messages": [{"role":"user", "content":"review this Bash command"}],
+                "system": "You are a security monitor for autonomous AI coding agents.\n\n## Context",
+                "stream": false,
+                "tools": []
+            }),
+            json!({
+                "model": "gpt-5.6-sol",
+                "messages": [{"role":"user", "content":"review this Bash command"}],
+                "system": "You are a security monitor for autonomous AI coding agents.\n\n## Context",
+                "stream": false,
+                "tools": [],
+                "output_config": {"effort": "xhigh"}
+            }),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(value).unwrap();
+            let out = translate_request(&request, opts()).unwrap();
+            assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Low)));
+        }
+    }
+
+    #[test]
+    fn auto_review_detection_rejects_streaming_tools_and_malformed_tools() {
+        let request = |stream: bool, tools: Value| -> MessagesRequest {
+            serde_json::from_value(json!({
+                "model": "gpt-5.6-sol",
+                "messages": [{"role":"user", "content":"review this Bash command"}],
+                "system": "You are a security monitor for autonomous AI coding agents.\n\n## Context",
+                "stream": stream,
+                "tools": tools
+            }))
+            .unwrap()
+        };
+
+        assert!(is_claude_auto_review_request(&request(false, json!([]))));
+        assert!(!is_claude_auto_review_request(&request(true, json!([]))));
+        assert!(!is_claude_auto_review_request(&request(
+            false,
+            json!([{"name":"Bash"}])
+        )));
+        assert!(!is_claude_auto_review_request(&request(
+            false,
+            json!({"name":"Bash"})
+        )));
     }
 
     #[test]
