@@ -112,6 +112,16 @@ pub fn uses_responses_lite(model: &str) -> bool {
     matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
 }
 
+/// Applies the opt-in full-lane policy for translated Anthropic requests.
+/// Native Responses callers intentionally keep using [`uses_responses_lite`].
+pub(crate) fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
+    match model {
+        "gpt-5.6-luna" => true,
+        "gpt-5.6-sol" | "gpt-5.6-terra" => !full_lane,
+        _ => false,
+    }
+}
+
 /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
 /// Responses API resolves it to a `-free` variant and returns 404 (Model not
 /// found gpt-5.6-luna-free-...). Hosted web_search requests must run on the
