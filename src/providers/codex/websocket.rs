@@ -4,12 +4,16 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use http::HeaderMap;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{self, Message, handshake::client::generate_key},
+    WebSocketStream,
+    tungstenite::{
+        Message,
+        handshake::{client::generate_key, derive_accept_key},
+        protocol::Role,
+    },
 };
 
 use crate::provider::RequestContext;
@@ -27,6 +31,7 @@ pub const WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
 pub const WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL: &str = "websocket_response_start_timeout";
 pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal";
+pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy_tunnel_rejected";
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_POOL_ENTRIES: usize = 10_000;
@@ -40,6 +45,7 @@ const TERMINAL_EVENTS: &[&str] = &[
 ];
 
 pub type CodexWebSocketEventReceiver = mpsc::Receiver<Result<serde_json::Value, CodexError>>;
+type CodexWebSocketStream = WebSocketStream<reqwest::Upgraded>;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -87,7 +93,7 @@ impl std::fmt::Display for CodexWebSocketError {
 // ---------------------------------------------------------------------------
 
 struct PoolEntry {
-    ws: Arc<AsyncMutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    ws: Arc<AsyncMutex<CodexWebSocketStream>>,
     created_at: u64,
 }
 
@@ -196,6 +202,25 @@ pub fn to_websocket_url(url: &str) -> Result<String, CodexWebSocketError> {
     Ok(parsed.to_string())
 }
 
+fn to_http_upgrade_url(url: &str) -> Result<String, CodexWebSocketError> {
+    let mut parsed = url::Url::parse(url)
+        .map_err(|e| CodexWebSocketError::new(format!("Failed to parse URL: {e}")))?;
+    match parsed.scheme() {
+        "ws" => parsed.set_scheme("http").map_err(|_| {
+            CodexWebSocketError::new("Unsupported Codex WebSocket URL scheme".to_string())
+        })?,
+        "wss" => parsed.set_scheme("https").map_err(|_| {
+            CodexWebSocketError::new("Unsupported Codex WebSocket URL scheme".to_string())
+        })?,
+        other => {
+            return Err(CodexWebSocketError::new(format!(
+                "Unsupported Codex WebSocket URL scheme: {other}"
+            )));
+        }
+    }
+    Ok(parsed.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Header rewriting
 // ---------------------------------------------------------------------------
@@ -207,7 +232,12 @@ pub fn codex_websocket_headers(http_headers: &HeaderMap) -> HeaderMap {
         // Skip hop-by-hop headers
         if matches!(
             key_str.as_str(),
-            "content-length" | "content-type" | "accept" | "connection" | "upgrade"
+            "content-length"
+                | "content-type"
+                | "accept"
+                | "connection"
+                | "upgrade"
+                | "proxy-authorization"
         ) {
             continue;
         }
@@ -298,6 +328,7 @@ fn extract_retry_after(payload: &serde_json::Value) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn codex_websocket_request(
+    websocket_client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
@@ -346,14 +377,14 @@ pub async fn codex_websocket_request(
         pool_get_for_turn(key, continuation.and_then(|candidate| candidate.turn_id))
     });
 
-    let (ws_stream, _response) = if let Some(entry) = pooled {
+    let ws_stream = if let Some(entry) = pooled {
         // Use pooled connection
         let mut ws_guard = entry.ws.lock().await;
         // Check if connection is still alive by sending a ping
         if ws_guard.send(Message::Ping(vec![])).await.is_err() {
             invalidate_pool_entry(pool_key.unwrap(), &entry);
             // Fall through to new connection
-            connect_with_timeout(&ws_url, headers, connect_timeout_ms).await?
+            connect_with_timeout(websocket_client, &ws_url, headers, connect_timeout_ms).await?
         } else {
             // Connection is alive, send the request through it
             let ws_msg = Message::Text(body_json.clone());
@@ -415,7 +446,7 @@ pub async fn codex_websocket_request(
             });
         }
     } else {
-        connect_with_timeout(&ws_url, headers, connect_timeout_ms).await?
+        connect_with_timeout(websocket_client, &ws_url, headers, connect_timeout_ms).await?
     };
 
     // New connection path (not pooled or pool miss)
@@ -496,7 +527,7 @@ pub async fn codex_websocket_request(
 
 pub(super) struct ReadyWebSocket {
     ws_url: String,
-    guard: OwnedMutexGuard<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    guard: OwnedMutexGuard<CodexWebSocketStream>,
     entry: Arc<PoolEntry>,
     used_pooled: bool,
     pool_key: Option<String>,
@@ -505,7 +536,9 @@ pub(super) struct ReadyWebSocket {
     idle_timeout_ms: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_codex_websocket(
+    websocket_client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
     traffic: Option<Arc<TrafficCapture>>,
@@ -526,7 +559,8 @@ pub(super) async fn prepare_codex_websocket(
     let entry = if let Some(entry) = pooled {
         entry
     } else {
-        let (stream, _) = connect_with_timeout(&ws_url, headers, connect_timeout_ms).await?;
+        let stream =
+            connect_with_timeout(websocket_client, &ws_url, headers, connect_timeout_ms).await?;
         Arc::new(PoolEntry {
             ws: Arc::new(AsyncMutex::new(stream)),
             created_at: now_ms(),
@@ -656,6 +690,7 @@ pub(super) fn start_codex_websocket_events(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn codex_websocket_event_stream(
+    websocket_client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
@@ -674,6 +709,7 @@ pub async fn codex_websocket_event_stream(
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let ready = prepare_codex_websocket(
+        websocket_client,
         url,
         headers,
         traffic,
@@ -773,7 +809,7 @@ fn write_websocket_response_capture(
 const MAX_HANDSHAKE_ERROR_DETAIL_BYTES: usize = 1024;
 const GENERIC_HANDSHAKE_ERROR_DETAIL: &str = "WebSocket upgrade was rejected";
 
-fn handshake_error_detail(body: Option<&Vec<u8>>) -> String {
+fn handshake_error_detail(body: Option<&[u8]>) -> String {
     let Some(value) = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
     else {
         return GENERIC_HANDSHAKE_ERROR_DETAIL.to_string();
@@ -796,90 +832,263 @@ fn handshake_error_detail(body: Option<&Vec<u8>>) -> String {
     sanitized[..end].to_string()
 }
 
-async fn connect_with_timeout(
+fn header_has_token(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(expected))
+        })
+    })
+}
+
+fn requested_subprotocols(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(http::header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn websocket_protocol_error(message: &str) -> CodexError {
+    CodexError {
+        status: 0,
+        message: message.to_string(),
+        detail: None,
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocketHandshake,
+    }
+}
+
+fn validate_websocket_upgrade(
+    version: http::Version,
+    headers: &HeaderMap,
+    websocket_key: &str,
+    requested_subprotocols: &[String],
+) -> Result<(), CodexError> {
+    if version != http::Version::HTTP_11 {
+        return Err(websocket_protocol_error(
+            "WebSocket upgrade response did not use HTTP/1.1",
+        ));
+    }
+    if !header_has_token(headers, http::header::UPGRADE.as_str(), "websocket") {
+        return Err(websocket_protocol_error(
+            "WebSocket upgrade response is missing Upgrade: websocket",
+        ));
+    }
+    if !header_has_token(headers, http::header::CONNECTION.as_str(), "upgrade") {
+        return Err(websocket_protocol_error(
+            "WebSocket upgrade response is missing Connection: Upgrade",
+        ));
+    }
+
+    let expected_accept = derive_accept_key(websocket_key.as_bytes());
+    let mut accept_values = headers.get_all(http::header::SEC_WEBSOCKET_ACCEPT).iter();
+    let accept = accept_values.next().and_then(|value| value.to_str().ok());
+    if accept_values.next().is_some() || accept != Some(expected_accept.as_str()) {
+        return Err(websocket_protocol_error(
+            "WebSocket upgrade response has an invalid Sec-WebSocket-Accept",
+        ));
+    }
+    if headers.contains_key(http::header::SEC_WEBSOCKET_EXTENSIONS) {
+        return Err(websocket_protocol_error(
+            "WebSocket upgrade response selected an unsolicited extension",
+        ));
+    }
+
+    let mut response_protocols = headers.get_all(http::header::SEC_WEBSOCKET_PROTOCOL).iter();
+    let response_protocol = response_protocols
+        .next()
+        .map(|value| value.to_str().map(str::trim));
+    if response_protocols.next().is_some() {
+        return Err(websocket_protocol_error(
+            "WebSocket upgrade response contains multiple subprotocols",
+        ));
+    }
+    match response_protocol {
+        None if requested_subprotocols.is_empty() => {}
+        None => {
+            return Err(websocket_protocol_error(
+                "WebSocket upgrade response omitted the requested subprotocol",
+            ));
+        }
+        Some(Err(_)) => {
+            return Err(websocket_protocol_error(
+                "WebSocket upgrade response contains an invalid subprotocol",
+            ));
+        }
+        Some(Ok(_)) if requested_subprotocols.is_empty() => {
+            return Err(websocket_protocol_error(
+                "WebSocket upgrade response selected an unsolicited subprotocol",
+            ));
+        }
+        Some(Ok(protocol))
+            if !requested_subprotocols
+                .iter()
+                .any(|requested| requested == protocol) =>
+        {
+            return Err(websocket_protocol_error(
+                "WebSocket upgrade response selected an unsupported subprotocol",
+            ));
+        }
+        Some(Ok(_)) => {}
+    }
+
+    Ok(())
+}
+
+async fn bounded_handshake_error_body(mut response: reqwest::Response) -> Vec<u8> {
+    let mut body = Vec::new();
+    while body.len() < MAX_HANDSHAKE_ERROR_DETAIL_BYTES {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) | Err(_) => break,
+        };
+        let remaining = MAX_HANDSHAKE_ERROR_DETAIL_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    body
+}
+
+fn error_chain_contains(error: &(dyn std::error::Error + 'static), expected: &str) -> bool {
+    let expected = expected.to_ascii_lowercase();
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.to_string().to_ascii_lowercase().contains(&expected) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn reqwest_handshake_error(error: reqwest::Error) -> CodexError {
+    let proxy_auth_required =
+        error.is_connect() && error_chain_contains(&error, "proxy authorization required");
+    let proxy_tunnel_rejected =
+        error.is_connect() && error_chain_contains(&error, "tunnel error: unsuccessful");
+    let status = if proxy_auth_required {
+        http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
+    } else {
+        error.status().map(|status| status.as_u16()).unwrap_or(0)
+    };
+    let message = if proxy_auth_required {
+        "WebSocket proxy authentication failed"
+    } else if proxy_tunnel_rejected {
+        "WebSocket proxy tunnel was rejected"
+    } else if error.is_timeout() {
+        "WebSocket upgrade request timed out"
+    } else if error.is_connect() {
+        "WebSocket connection failed"
+    } else {
+        "WebSocket upgrade request failed"
+    };
+    CodexError {
+        status,
+        message: message.to_string(),
+        detail: proxy_tunnel_rejected.then(|| WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocketHandshake,
+    }
+}
+
+async fn connect_via_http_upgrade(
+    websocket_client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
-    connect_timeout_ms: u64,
-) -> Result<
-    (
-        WebSocketStream<MaybeTlsStream<TcpStream>>,
-        tungstenite::handshake::client::Response,
-    ),
-    CodexError,
-> {
-    // Build an http::Request with the given headers for the WebSocket upgrade
-    let host = websocket_host_header(url);
-    let mut req_builder = http::Request::builder()
-        .uri(url)
-        .method("GET")
-        .header("Host", host)
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", generate_key());
+) -> Result<CodexWebSocketStream, CodexError> {
+    let http_url = to_http_upgrade_url(url).map_err(|error| CodexError {
+        status: 0,
+        message: error.message,
+        detail: None,
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocketHandshake,
+    })?;
+    let websocket_key = generate_key();
+    let subprotocols = requested_subprotocols(headers);
+    let mut request = websocket_client
+        .get(http_url)
+        .version(http::Version::HTTP_11)
+        .header(http::header::CONNECTION, "Upgrade")
+        .header(http::header::UPGRADE, "websocket")
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .header(http::header::SEC_WEBSOCKET_KEY, &websocket_key);
 
-    // Copy over the codex headers
-    for (key, value) in headers.iter() {
-        let key_str = key.as_str().to_lowercase();
-        // Skip headers already set for WebSocket upgrade
+    for (key, value) in headers {
+        let key_str = key.as_str();
         if matches!(
-            key_str.as_str(),
-            "connection" | "upgrade" | "sec-websocket-key" | "sec-websocket-version" | "host"
+            key_str,
+            "connection"
+                | "upgrade"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "host"
+                | "content-length"
+                | "proxy-authorization"
         ) {
             continue;
         }
-        req_builder = req_builder.header(key.as_str(), value.as_bytes());
+        request = request.header(key.clone(), value.clone());
     }
 
-    let request = req_builder.body(()).map_err(|e| CodexError {
-        status: 0,
-        message: format!("Failed to build WebSocket request: {e}"),
-        detail: None,
-        retry_after: None,
-        origin: CodexErrorOrigin::WebSocket,
-    })?;
-
-    let connect_fut = connect_async(request);
-    tokio::time::timeout(Duration::from_millis(connect_timeout_ms), connect_fut)
-        .await
-        .map_err(|_| CodexError {
-            status: 0,
-            message: format!("WebSocket connect timeout after {connect_timeout_ms}ms"),
-            detail: None,
-            retry_after: None,
+    let response = request.send().await.map_err(reqwest_handshake_error)?;
+    if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let detail = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
+            GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()
+        } else {
+            let body = bounded_handshake_error_body(response).await;
+            handshake_error_detail(Some(&body))
+        };
+        return Err(CodexError {
+            status,
+            message: format!("WebSocket upgrade rejected with status {status}"),
+            detail: Some(detail),
+            retry_after,
             origin: CodexErrorOrigin::WebSocketHandshake,
-        })?
-        .map_err(|e| {
-            let (status, retry_after, detail) = match &e {
-                tungstenite::Error::Http(response) => {
-                    let detail = Some(handshake_error_detail(response.body().as_ref()));
-                    (
-                        Some(response.status().as_u16()),
-                        response
-                            .headers()
-                            .get(http::header::RETRY_AFTER)
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_string),
-                        detail,
-                    )
-                }
-                _ => (None, None, None),
-            };
-            CodexError {
-                status: status.unwrap_or(0),
-                message: format!("WebSocket connect error: {e}"),
-                detail,
-                retry_after,
-                origin: CodexErrorOrigin::WebSocketHandshake,
-            }
-        })
+        });
+    }
+
+    validate_websocket_upgrade(
+        response.version(),
+        response.headers(),
+        &websocket_key,
+        &subprotocols,
+    )?;
+    let upgraded = response
+        .upgrade()
+        .await
+        .map_err(|_| websocket_protocol_error("WebSocket upgrade stream was not available"))?;
+    Ok(WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await)
 }
 
-fn websocket_host_header(url: &str) -> String {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return String::new();
-    };
-    parsed[url::Position::BeforeHost..url::Position::AfterPort].to_string()
+async fn connect_with_timeout(
+    websocket_client: &reqwest::Client,
+    url: &str,
+    headers: &HeaderMap,
+    connect_timeout_ms: u64,
+) -> Result<CodexWebSocketStream, CodexError> {
+    tokio::time::timeout(
+        Duration::from_millis(connect_timeout_ms),
+        connect_via_http_upgrade(websocket_client, url, headers),
+    )
+    .await
+    .map_err(|_| CodexError {
+        status: 0,
+        message: format!("WebSocket connect timeout after {connect_timeout_ms}ms"),
+        detail: None,
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocketHandshake,
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -891,13 +1100,16 @@ struct WsEvent {
     payload: serde_json::Value,
 }
 
-async fn collect_ws_events(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+async fn collect_ws_events<S>(
+    ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
     pool_key: Option<&str>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
-) -> Result<(Vec<u8>, Option<WsEvent>), CodexError> {
+) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut sse_body: Vec<u8> = Vec::new();
     let mut terminal_event: Option<WsEvent> = None;
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
@@ -1047,14 +1259,17 @@ async fn collect_ws_events(
     Ok((sse_body, terminal_event))
 }
 
-async fn stream_ws_events(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+async fn stream_ws_events<S>(
+    ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
     pool_key: Option<&str>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<Arc<TrafficCapture>>,
     tx: mpsc::Sender<Result<serde_json::Value, CodexError>>,
-) -> bool {
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let started_at = Instant::now();
     let mut sse_body: Vec<u8> = Vec::new();
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
@@ -1248,6 +1463,21 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 mod tests {
     use super::*;
 
+    static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+    async fn lock_ws_pool_tests() -> tokio::sync::MutexGuard<'static, ()> {
+        WS_POOL_TEST_LOCK.lock().await
+    }
+
+    fn test_websocket_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn event_error_status_requires_error_event_and_checks_numeric_fallbacks() {
         assert_eq!(
@@ -1292,16 +1522,105 @@ mod tests {
     }
 
     #[test]
-    fn websocket_host_header_preserves_explicit_port() {
+    fn websocket_upgrade_url_preserves_authority_path_and_query() {
         assert_eq!(
-            websocket_host_header("wss://chatgpt.com/backend-api/codex/responses"),
-            "chatgpt.com"
+            to_http_upgrade_url("wss://chatgpt.com/backend-api/codex/responses?mode=live").unwrap(),
+            "https://chatgpt.com/backend-api/codex/responses?mode=live"
         );
         assert_eq!(
-            websocket_host_header("ws://127.0.0.1:4141/backend-api/codex/responses"),
-            "127.0.0.1:4141"
+            to_http_upgrade_url("ws://127.0.0.1:4141/backend-api/codex/responses").unwrap(),
+            "http://127.0.0.1:4141/backend-api/codex/responses"
         );
-        assert_eq!(websocket_host_header("ws://[::1]:4141/path"), "[::1]:4141");
+        assert_eq!(
+            to_http_upgrade_url("ws://[::1]:4141/path").unwrap(),
+            "http://[::1]:4141/path"
+        );
+    }
+
+    #[test]
+    fn validates_tokenized_websocket_upgrade_headers() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::UPGRADE, "h2c, WebSocket".parse().unwrap());
+        headers.insert(
+            http::header::CONNECTION,
+            "keep-alive, Upgrade".parse().unwrap(),
+        );
+        headers.insert(
+            http::header::SEC_WEBSOCKET_ACCEPT,
+            derive_accept_key(key.as_bytes()).parse().unwrap(),
+        );
+        headers.insert(
+            http::header::SEC_WEBSOCKET_PROTOCOL,
+            "responses".parse().unwrap(),
+        );
+
+        validate_websocket_upgrade(
+            http::Version::HTTP_11,
+            &headers,
+            key,
+            &["responses".to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_websocket_upgrade_headers() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let valid = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+            headers.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+            headers.insert(
+                http::header::SEC_WEBSOCKET_ACCEPT,
+                derive_accept_key(key.as_bytes()).parse().unwrap(),
+            );
+            headers
+        };
+
+        let mut missing_upgrade = valid();
+        missing_upgrade.remove(http::header::UPGRADE);
+        assert!(
+            validate_websocket_upgrade(http::Version::HTTP_11, &missing_upgrade, key, &[]).is_err()
+        );
+
+        let mut missing_connection = valid();
+        missing_connection.remove(http::header::CONNECTION);
+        assert!(
+            validate_websocket_upgrade(http::Version::HTTP_11, &missing_connection, key, &[])
+                .is_err()
+        );
+
+        let mut wrong_accept = valid();
+        wrong_accept.insert(http::header::SEC_WEBSOCKET_ACCEPT, "wrong".parse().unwrap());
+        assert!(
+            validate_websocket_upgrade(http::Version::HTTP_11, &wrong_accept, key, &[]).is_err()
+        );
+
+        let unsolicited_extension = {
+            let mut headers = valid();
+            headers.insert(
+                http::header::SEC_WEBSOCKET_EXTENSIONS,
+                "permessage-deflate".parse().unwrap(),
+            );
+            headers
+        };
+        assert!(
+            validate_websocket_upgrade(http::Version::HTTP_11, &unsolicited_extension, key, &[],)
+                .is_err()
+        );
+
+        assert!(validate_websocket_upgrade(http::Version::HTTP_10, &valid(), key, &[]).is_err());
+
+        let mut unsolicited_protocol = valid();
+        unsolicited_protocol.insert(
+            http::header::SEC_WEBSOCKET_PROTOCOL,
+            "unexpected".parse().unwrap(),
+        );
+        assert!(
+            validate_websocket_upgrade(http::Version::HTTP_11, &unsolicited_protocol, key, &[])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1310,9 +1629,14 @@ mod tests {
         headers.insert("openai-beta", "responses=experimental".parse().unwrap());
         headers.insert("content-length", "10".parse().unwrap());
         headers.insert("authorization", "Bearer tok".parse().unwrap());
+        headers.insert(
+            http::header::PROXY_AUTHORIZATION,
+            "Basic dXNlcjpwYXNz".parse().unwrap(),
+        );
         let ws = codex_websocket_headers(&headers);
         assert_eq!(ws.get("openai-beta").unwrap(), WEBSOCKET_PROTOCOL_HEADER);
         assert!(!ws.contains_key("content-length"));
+        assert!(!ws.contains_key(http::header::PROXY_AUTHORIZATION));
         assert_eq!(ws.get("authorization").unwrap(), "Bearer tok");
     }
 
@@ -1391,6 +1715,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_checkout_is_exclusive_and_removal_is_identity_safe() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
         clear_codex_websocket_pool_for_tests();
         let first = Arc::new(PoolEntry {
             ws: Arc::new(AsyncMutex::new(create_dummy_stream_async().await)),
@@ -1416,17 +1741,19 @@ mod tests {
         clear_codex_websocket_pool_for_tests();
     }
 
-    #[test]
-    fn pool_invalidation() {
+    #[tokio::test]
+    async fn pool_invalidation() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
         clear_codex_websocket_pool_for_tests();
         // Verify pool operations work through the public API
         // We insert an entry directly into the pool, then invalidate it
+        let stream = create_dummy_stream_async().await;
         {
             let mut guard = WS_POOL.lock().unwrap();
             guard.insert(
                 "test-session".to_string(),
                 Arc::new(PoolEntry {
-                    ws: Arc::new(AsyncMutex::new(create_dummy_stream())),
+                    ws: Arc::new(AsyncMutex::new(stream)),
                     created_at: now_ms(),
                 }),
             );
@@ -1454,7 +1781,9 @@ mod tests {
                 .unwrap();
         });
 
+        let client = test_websocket_client();
         let err = match connect_with_timeout(
+            &client,
             &format!("ws://{addr}/backend-api/codex/responses"),
             &HeaderMap::new(),
             1_000,
@@ -1489,7 +1818,9 @@ mod tests {
                 .unwrap();
         });
 
+        let client = test_websocket_client();
         let err = match connect_with_timeout(
+            &client,
             &format!("ws://{addr}/backend-api/codex/responses"),
             &HeaderMap::new(),
             1_000,
@@ -1507,7 +1838,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_connects_through_explicit_http_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request_text = String::from_utf8(request).unwrap();
+            let key = request_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| value.trim().to_string())
+                })
+                .unwrap();
+            let _ = captured_tx.send(request_text);
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                derive_accept_key(key.as_bytes())
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+
+            let mut websocket = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+            assert_eq!(
+                websocket.next().await.unwrap().unwrap(),
+                Message::Text("hello".to_string())
+            );
+            websocket
+                .send(Message::Text("proxy-ok".to_string()))
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
+            .proxy(
+                reqwest::Proxy::http(format!("http://proxy-user:proxy-pass@{proxy_addr}")).unwrap(),
+            )
+            .build()
+            .unwrap();
+        let mut websocket = connect_with_timeout(
+            &client,
+            "ws://codex.invalid/backend-api/codex/responses",
+            &HeaderMap::new(),
+            2_000,
+        )
+        .await
+        .unwrap();
+        websocket
+            .send(Message::Text("hello".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            websocket.next().await.unwrap().unwrap(),
+            Message::Text("proxy-ok".to_string())
+        );
+
+        let captured = captured_rx.await.unwrap();
+        assert!(
+            captured.starts_with("GET http://codex.invalid/backend-api/codex/responses HTTP/1.1")
+        );
+        assert!(
+            captured
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic ")
+        );
+        proxy.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_wss_uses_http_connect_without_leaking_proxy_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let _ = captured_tx.send(String::from_utf8(request).unwrap());
+            stream
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
+            .proxy(
+                reqwest::Proxy::https(format!("http://secret-user:secret-pass@{proxy_addr}"))
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let error = match connect_with_timeout(
+            &client,
+            "wss://codex.invalid:4443/backend-api/codex/responses",
+            &HeaderMap::new(),
+            2_000,
+        )
+        .await
+        {
+            Ok(_) => panic!("proxy rejection should fail the WebSocket connection"),
+            Err(error) => error,
+        };
+
+        let captured = captured_rx.await.unwrap();
+        assert!(captured.starts_with("CONNECT codex.invalid:4443 HTTP/1.1"));
+        assert!(
+            captured
+                .to_ascii_lowercase()
+                .contains("proxy-authorization: basic ")
+        );
+        assert!(!error.message.contains("secret-user"));
+        assert!(!error.message.contains("secret-pass"));
+        assert!(
+            !error
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("secret")
+        );
+        proxy.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn binary_frame_invalidates_pool_key() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
         clear_codex_websocket_pool_for_tests();
         let pooled_stream = create_dummy_stream_async().await;
         {
@@ -1544,6 +2023,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_start_timeout_ignores_rate_limits_and_pings() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
         clear_codex_websocket_pool_for_tests();
         let pooled_stream = create_dummy_stream_async().await;
         {
@@ -1598,6 +2078,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_idle_timeout_ignores_pings_after_response_event() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
         clear_codex_websocket_pool_for_tests();
         let pooled_stream = create_dummy_stream_async().await;
         {
@@ -1649,7 +2130,7 @@ mod tests {
         );
     }
 
-    async fn create_dummy_stream_async() -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+    async fn create_dummy_stream_async() -> CodexWebSocketStream {
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1660,14 +2141,10 @@ mod tests {
             futures_util::future::pending::<()>().await;
         });
         let url = format!("ws://{addr}/");
-        let (ws, _) = tokio::time::timeout(
-            Duration::from_millis(1000),
-            tokio_tungstenite::connect_async(&url),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        ws
+        let client = test_websocket_client();
+        connect_with_timeout(&client, &url, &HeaderMap::new(), 1_000)
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1695,33 +2172,5 @@ mod tests {
                 GENERIC_HANDSHAKE_ERROR_DETAIL
             );
         }
-    }
-
-    fn create_dummy_stream() -> WebSocketStream<MaybeTlsStream<TcpStream>> {
-        // Use a connected TcpStream pair with connect_async which returns
-        // WebSocketStream<MaybeTlsStream<TcpStream>>
-        use tokio::net::TcpListener;
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let _conn = tokio::spawn(async move {
-                let (socket, _) = listener.accept().await.unwrap();
-                // Accept WebSocket handshake
-                let _ = tokio_tungstenite::accept_async(socket).await;
-                // Keep alive
-                futures_util::future::pending::<()>().await;
-            });
-            // Use connect_async to get MaybeTlsStream
-            let url = format!("ws://{}/", addr);
-            let (ws, _) = tokio::time::timeout(
-                Duration::from_millis(1000),
-                tokio_tungstenite::connect_async(&url),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            ws
-        })
     }
 }

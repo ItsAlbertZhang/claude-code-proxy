@@ -418,3 +418,24 @@ fn set_mode(path: &Path, mode: u32) {
 fn _provider_alias(_provider: &str) -> Option<AliasProvider> {
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn traffic_redacts_proxy_authorization() {
+        let redacted = redact_traffic(&serde_json::json!({
+            "headers": {
+                "proxy-authorization": "Basic dXNlcjpwYXNz",
+                "x-safe": "kept"
+            }
+        }));
+
+        assert_eq!(redacted["headers"]["x-safe"], "kept");
+        assert_eq!(
+            redacted["headers"]["proxy-authorization"],
+            "[redacted len=18]"
+        );
+    }
+}

@@ -3,6 +3,12 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Codex WebSocket connections honor `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  and `NO_PROXY`, restoring standard non-TUN HTTP proxy support for both plain
+  WebSocket Upgrade requests and WSS CONNECT tunnels.
+
 ## v0.1.25 (2026-07-24)
 
 - Kimi users can select Kimi K3 with the `kimi-k3` or `k3` model name, including
