@@ -35,6 +35,18 @@ pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_POOL_ENTRIES: usize = 10_000;
+const POOL_CONNECT_CLEANUP_THRESHOLD: usize = 50;
+const POOL_CONNECT_CLEANUP_TARGET: usize = 25;
+// Unit tests use dedicated gates with explicit delays, avoiding cross-test throttling here.
+#[cfg(not(test))]
+const WEBSOCKET_CONNECT_SUCCESS_SPACING_MS: u64 = 1_000;
+#[cfg(test)]
+const WEBSOCKET_CONNECT_SUCCESS_SPACING_MS: u64 = 0;
+#[cfg(not(test))]
+const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN_MS: u64 = 3_000;
+#[cfg(test)]
+const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN_MS: u64 = 0;
+const WEBSOCKET_CONNECT_FORBIDDEN_RETRIES: usize = 1;
 
 // Terminal WebSocket event types that signal the request is done
 const TERMINAL_EVENTS: &[&str] = &[
@@ -99,6 +111,13 @@ struct PoolEntry {
 
 static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<PoolEntry>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
+    once_cell::sync::Lazy::new(|| {
+        WebSocketConnectGate::new(
+            Duration::from_millis(WEBSOCKET_CONNECT_SUCCESS_SPACING_MS),
+            Duration::from_millis(WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN_MS),
+        )
+    });
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -176,6 +195,84 @@ fn pool_insert(key: String, entry: Arc<PoolEntry>) {
     let now = now_ms();
     guard.retain(|_, e| now.saturating_sub(e.created_at) < POOL_IDLE_TTL_MS);
     guard.insert(key, entry);
+}
+
+fn cleanup_pool_before_connect() {
+    let mut guard = WS_POOL.lock().unwrap();
+    if guard.len() <= POOL_CONNECT_CLEANUP_THRESHOLD {
+        return;
+    }
+
+    let remove_count = guard.len() - POOL_CONNECT_CLEANUP_TARGET;
+    let mut entries: Vec<_> = guard
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.created_at))
+        .collect();
+    entries.sort_unstable_by_key(|(_, created_at)| *created_at);
+    for (key, _) in entries.into_iter().take(remove_count) {
+        guard.remove(&key);
+    }
+}
+
+struct WebSocketConnectGate {
+    next_attempt_at: AsyncMutex<Option<Instant>>,
+    success_spacing: Duration,
+    forbidden_cooldown: Duration,
+}
+
+impl WebSocketConnectGate {
+    fn new(success_spacing: Duration, forbidden_cooldown: Duration) -> Self {
+        Self {
+            next_attempt_at: AsyncMutex::new(None),
+            success_spacing,
+            forbidden_cooldown,
+        }
+    }
+
+    async fn connect<T, F, Fut>(&self, mut connect: F) -> Result<T, CodexError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, CodexError>>,
+    {
+        let mut forbidden_retries = 0;
+        loop {
+            let result = {
+                // Tokio's mutex serves waiters in FIFO order. A rejected attempt
+                // releases this guard before retrying, so it rejoins at the tail.
+                let mut next_attempt_at = self.next_attempt_at.lock().await;
+                if let Some(deadline) = *next_attempt_at {
+                    let wait = deadline.saturating_duration_since(Instant::now());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+
+                let result = connect().await;
+                *next_attempt_at = match &result {
+                    Ok(_) => Some(Instant::now() + self.success_spacing),
+                    Err(error) if is_forbidden_handshake(error) => {
+                        Some(Instant::now() + self.forbidden_cooldown)
+                    }
+                    Err(_) => None,
+                };
+                result
+            };
+
+            let retry_forbidden = matches!(&result, Err(error) if is_forbidden_handshake(error))
+                && forbidden_retries < WEBSOCKET_CONNECT_FORBIDDEN_RETRIES;
+            if !retry_forbidden {
+                return result;
+            }
+
+            forbidden_retries += 1;
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+fn is_forbidden_handshake(error: &CodexError) -> bool {
+    error.origin == CodexErrorOrigin::WebSocketHandshake
+        && error.status == http::StatusCode::FORBIDDEN.as_u16()
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,7 +1168,7 @@ async fn connect_via_http_upgrade(
     Ok(WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await)
 }
 
-async fn connect_with_timeout(
+async fn connect_once_with_timeout(
     websocket_client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
@@ -1089,6 +1186,23 @@ async fn connect_with_timeout(
         retry_after: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?
+}
+
+async fn connect_with_timeout(
+    websocket_client: &reqwest::Client,
+    url: &str,
+    headers: &HeaderMap,
+    connect_timeout_ms: u64,
+) -> Result<CodexWebSocketStream, CodexError> {
+    WS_CONNECT_GATE
+        .connect(|| {
+            let websocket_client = websocket_client;
+            async move {
+                cleanup_pool_before_connect();
+                connect_once_with_timeout(websocket_client, url, headers, connect_timeout_ms).await
+            }
+        })
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1461,6 +1575,8 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
@@ -1476,6 +1592,146 @@ mod tests {
             .no_proxy()
             .build()
             .unwrap()
+    }
+
+    fn forbidden_handshake_error() -> CodexError {
+        CodexError {
+            status: http::StatusCode::FORBIDDEN.as_u16(),
+            message: "forbidden".to_string(),
+            detail: Some(GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_gate_serializes_and_spaces_successes() {
+        let success_spacing = Duration::from_millis(25);
+        let gate = Arc::new(WebSocketConnectGate::new(
+            success_spacing,
+            Duration::from_millis(50),
+        ));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let gate = gate.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let starts = starts.clone();
+            tasks.push(tokio::spawn(async move {
+                gate.connect(move || {
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    let starts = starts.clone();
+                    async move {
+                        starts.lock().unwrap().push(Instant::now());
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok::<(), CodexError>(())
+                    }
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        let starts = starts.lock().unwrap();
+        assert_eq!(starts.len(), 3);
+        for pair in starts.windows(2) {
+            assert!(pair[1].duration_since(pair[0]) >= success_spacing);
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_gate_applies_global_403_cooldown_and_requeues() {
+        let success_spacing = Duration::from_millis(20);
+        let forbidden_cooldown = Duration::from_millis(60);
+        let gate = Arc::new(WebSocketConnectGate::new(
+            success_spacing,
+            forbidden_cooldown,
+        ));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+
+        let first_gate = gate.clone();
+        let first_attempts = attempts.clone();
+        let first_order = order.clone();
+        let first_entered_tx = entered_tx.clone();
+        let first = tokio::spawn(async move {
+            first_gate
+                .connect(move || {
+                    let attempt = first_attempts.fetch_add(1, Ordering::SeqCst);
+                    let order = first_order.clone();
+                    let entered_tx = first_entered_tx.clone();
+                    async move {
+                        let label = if attempt == 0 { "first-1" } else { "first-2" };
+                        order.lock().unwrap().push((label, Instant::now()));
+                        if attempt == 0 {
+                            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            Err(forbidden_handshake_error())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })
+                .await
+        });
+
+        entered_rx.await.unwrap();
+        let second_gate = gate.clone();
+        let second_order = order.clone();
+        let second = tokio::spawn(async move {
+            second_gate
+                .connect(move || {
+                    let order = second_order.clone();
+                    async move {
+                        order.lock().unwrap().push(("second-1", Instant::now()));
+                        Ok::<(), CodexError>(())
+                    }
+                })
+                .await
+        });
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let order = order.lock().unwrap();
+        let labels: Vec<_> = order.iter().map(|(label, _)| *label).collect();
+        assert_eq!(labels, ["first-1", "second-1", "first-2"]);
+        assert!(order[1].1.duration_since(order[0].1) >= forbidden_cooldown);
+        assert!(order[2].1.duration_since(order[1].1) >= success_spacing);
+    }
+
+    #[tokio::test]
+    async fn connect_gate_retries_persistent_403_only_once() {
+        let gate = WebSocketConnectGate::new(Duration::ZERO, Duration::from_millis(1));
+        let attempts = AtomicUsize::new(0);
+
+        let error = gate
+            .connect(|| async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), CodexError>(forbidden_handshake_error())
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1711,6 +1967,39 @@ mod tests {
 
         let unrelated = serde_json::json!({"type": "error", "error": {"message": "rate limited"}});
         assert!(!is_previous_response_missing(&unrelated));
+    }
+
+    #[tokio::test]
+    async fn new_connection_trims_pool_only_above_threshold() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let entry = Arc::new(PoolEntry {
+            ws: Arc::new(AsyncMutex::new(create_dummy_stream_async().await)),
+            created_at: now_ms(),
+        });
+
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            for index in 0..POOL_CONNECT_CLEANUP_THRESHOLD {
+                guard.insert(format!("cleanup-{index}"), entry.clone());
+            }
+        }
+        let connection_at_threshold = create_dummy_stream_async().await;
+        assert_eq!(
+            WS_POOL.lock().unwrap().len(),
+            POOL_CONNECT_CLEANUP_THRESHOLD
+        );
+        drop(connection_at_threshold);
+
+        WS_POOL
+            .lock()
+            .unwrap()
+            .insert("cleanup-over-threshold".to_string(), entry.clone());
+        let connection_over_threshold = create_dummy_stream_async().await;
+        assert_eq!(WS_POOL.lock().unwrap().len(), POOL_CONNECT_CLEANUP_TARGET);
+        drop(connection_over_threshold);
+
+        clear_codex_websocket_pool_for_tests();
     }
 
     #[tokio::test]
