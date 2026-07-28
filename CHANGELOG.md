@@ -5,6 +5,8 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- The `claude-opus-5` model name follows the existing Opus aliases, routing to
+  `gpt-5.6-sol` on Codex or `kimi-for-coding` on Kimi.
 - Codex WebSocket connections honor `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
   and `NO_PROXY`, restoring standard non-TUN HTTP proxy support for both plain
   WebSocket Upgrade requests and WSS CONNECT tunnels.

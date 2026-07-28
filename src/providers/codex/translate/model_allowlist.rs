@@ -26,6 +26,7 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("opus", "gpt-5.6-sol"),
     ("claude-opus-4-7", "gpt-5.6-sol"),
     ("claude-opus-4-8", "gpt-5.6-sol"),
+    ("claude-opus-5", "gpt-5.6-sol"),
     ("fable", "gpt-5.6-sol"),
     ("claude-fable-5", "gpt-5.6-sol"),
 ];
@@ -182,9 +183,14 @@ mod tests {
     }
 
     #[test]
-    fn opus_4_8_resolves_to_sol() {
-        let r = resolve_model_request("claude-opus-4-8");
-        assert_eq!(r.model, "gpt-5.6-sol");
+    fn versioned_opus_aliases_target_sol() {
+        for model in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5"] {
+            let target = MODEL_ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == model)
+                .map(|(_, target)| *target);
+            assert_eq!(target, Some("gpt-5.6-sol"));
+        }
     }
 
     #[test]

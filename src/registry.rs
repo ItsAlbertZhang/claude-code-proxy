@@ -19,6 +19,7 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "opus",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-5",
     "fable",
     "claude-fable-5",
 ];
@@ -332,11 +333,15 @@ mod tests {
     }
 
     #[test]
-    fn opus_4_8_routes_to_configured_provider() {
-        let registry = Registry::new(AliasProvider::Codex);
-        let p = registry.provider_for_model("claude-opus-4-8", None);
-        assert!(p.is_some());
-        assert_eq!(p.expect("provider").name(), "codex");
+    fn versioned_opus_aliases_route_to_configured_provider() {
+        for alias_provider in [AliasProvider::Codex, AliasProvider::Kimi] {
+            let registry = Registry::new(alias_provider);
+            for model in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5"] {
+                let provider = registry.provider_for_model(model, None);
+                assert!(provider.is_some(), "{model} should route to a provider");
+                assert_eq!(provider.expect("provider").name(), alias_provider.as_str());
+            }
+        }
     }
 
     #[test]

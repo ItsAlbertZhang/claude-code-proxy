@@ -187,7 +187,7 @@ async fn known_model_reaches_codex_provider() {
 }
 
 #[tokio::test]
-async fn count_tokens_routes_to_provider() {
+async fn count_tokens_accepts_opus_5_alias() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(
@@ -196,19 +196,14 @@ async fn count_tokens_routes_to_provider() {
                 .uri("/v1/messages/count_tokens")
                 .header("content-type", "application/json")
                 .body(body_string(
-                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}"#,
+                    r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hello"}]}"#,
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
 
-    // Codex provider is now concrete, so count_tokens should succeed
-    let status = response.status();
-    assert!(
-        status != StatusCode::NOT_IMPLEMENTED,
-        "count_tokens should no longer return 501 for codex models"
-    );
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -442,7 +437,7 @@ async fn models_endpoint_lists_supported_models() {
 }
 
 #[tokio::test]
-async fn models_endpoint_includes_claude_prefixed_aliases_for_discovery() {
+async fn models_endpoint_includes_opus_5_alias_for_discovery() {
     // Claude Code's gateway model discovery ignores ids that don't start with
     // "claude" or "anthropic", so the alias entries are what make
     // CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 useful at all.
@@ -456,7 +451,7 @@ async fn models_endpoint_includes_claude_prefixed_aliases_for_discovery() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert!(ids.iter().any(|id| id.starts_with("claude-")));
+    assert!(ids.contains(&"claude-opus-5"));
 }
 
 #[tokio::test]

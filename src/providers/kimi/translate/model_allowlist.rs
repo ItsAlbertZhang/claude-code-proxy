@@ -14,6 +14,7 @@ static ALIAS_TARGETS: once_cell::sync::Lazy<HashMap<&'static str, &'static str>>
         m.insert("opus", KIMI_DEFAULT_MODEL);
         m.insert("claude-opus-4-7", KIMI_DEFAULT_MODEL);
         m.insert("claude-opus-4-8", KIMI_DEFAULT_MODEL);
+        m.insert("claude-opus-5", KIMI_DEFAULT_MODEL);
         m.insert("fable", KIMI_DEFAULT_MODEL);
         m.insert("claude-fable-5", KIMI_DEFAULT_MODEL);
         m.insert("kimi-for-coding", KIMI_DEFAULT_MODEL);
@@ -69,8 +70,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_opus_4_8_to_default() {
-        assert_eq!(resolve_model("claude-opus-4-8"), KIMI_DEFAULT_MODEL);
+    fn versioned_opus_aliases_resolve_to_default() {
+        for model in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5"] {
+            assert_eq!(resolve_model(model), KIMI_DEFAULT_MODEL);
+        }
     }
 
     #[test]
