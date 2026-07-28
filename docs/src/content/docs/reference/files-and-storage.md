@@ -21,6 +21,8 @@ Windows falls back to `%USERPROFILE%/AppData/Roaming` and `%USERPROFILE%/AppData
 
 `config.json` lives directly under the configuration root. See [Configuration](/reference/configuration/) for its schema and precedence.
 
+On Linux, the optional systemd helper reads service environment variables from `${XDG_CONFIG_HOME:-~/.config}/claude-code-proxy/ccpd.env`. The file uses systemd `KEY=value` syntax and should have mode `0600` when it contains sensitive values. Unlike `config.json`, this path is not relocated by `CCP_CONFIG_DIR`.
+
 ## Provider credentials
 
 On macOS, Codex and Cursor use Keychain services:
@@ -42,7 +44,9 @@ Kimi stores a persistent UUID at `<configuration-root>/kimi/device_id` for file-
 
 `proxy.log` lives under the state root. It uses JSON Lines and rotates at 20 MiB. Known credential keys, including authorization, access tokens, refresh tokens, ID tokens, and account headers, are redacted before writing.
 
-A Homebrew service also writes `service.log` under the state root.
+A Homebrew service also writes `service.log` under the state root. The Linux `ccpd` service sends stdout and stderr to the systemd user journal instead; use `ccpd logs` to follow it.
+
+`ccpd install` writes its generated unit to `${XDG_CONFIG_HOME:-~/.config}/systemd/user/claude-code-proxy.service`. Removing the service leaves the configuration root, state root, credentials, and journal history untouched.
 
 ## Failed responses
 

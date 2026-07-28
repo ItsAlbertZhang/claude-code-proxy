@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+#
+# Manage claude-code-proxy as a systemd user service on Linux.
+#
+# Environment variables:
+#   CCPD_PROXY_BIN   - Absolute path to claude-code-proxy
+#   CCPD_HEALTH_URL  - Health endpoint (default: http://127.0.0.1:18765/healthz)
+
+set -euo pipefail
+umask 077
+
+UNIT_NAME="claude-code-proxy.service"
+MANAGER_ENVIRONMENT=""
+MANAGER_ENVIRONMENT_LOADED=false
+MANAGER_ENVIRONMENT_VALUE=""
+
+usage() {
+	cat <<'EOF'
+Usage: ccpd <command>
+
+Commands:
+  install [--now]  Install or update the user unit; optionally enable and start it
+  uninstall        Stop, disable, and remove the user unit
+  enable           Enable autostart and start the service now
+  disable          Stop the service and disable autostart
+  start            Start the service
+  stop             Stop the service
+  restart          Restart the service
+  status           Show service status
+  logs [options]   Follow service journal logs; pass options to journalctl
+  health           Query the local proxy health endpoint
+  version          Print the managed proxy version
+  print-unit       Render the unit without installing it
+  help             Show this help
+
+Optional proxy environment variables belong in:
+  ${XDG_CONFIG_HOME:-~/.config}/claude-code-proxy/ccpd.env
+EOF
+}
+
+die() {
+	printf 'ccpd: %s\n' "$*" >&2
+	exit 1
+}
+
+require_linux() {
+	[[ "$(uname -s)" == "Linux" ]] ||
+		die "systemd user services are supported on Linux only; use Homebrew services on macOS"
+}
+
+require_systemctl() {
+	command -v systemctl >/dev/null 2>&1 || die "systemctl is required"
+	if ! MANAGER_ENVIRONMENT="$(systemctl --user show-environment 2>/dev/null)"; then
+		die "the systemd user manager is unavailable"
+	fi
+	MANAGER_ENVIRONMENT_LOADED=true
+}
+
+load_manager_environment() {
+	command -v systemctl >/dev/null 2>&1 || return 0
+	if MANAGER_ENVIRONMENT="$(systemctl --user show-environment 2>/dev/null)"; then
+		MANAGER_ENVIRONMENT_LOADED=true
+	fi
+}
+
+manager_environment_value() {
+	local key="$1"
+	local line serialized decoded
+	while IFS= read -r line; do
+		if [[ "$line" == "${key}="* ]]; then
+			serialized="${line#*=}"
+			if [[ "$serialized" == "\$'"* ]]; then
+				[[ "$serialized" == *"'" ]] ||
+					die "systemd returned malformed shell quoting for $key"
+				# systemctl documents dollar-single-quoted values as safe to source.
+				# Decode only the selected assignment into a fixed local variable.
+				eval "decoded=${serialized}"
+			else
+				decoded="$serialized"
+			fi
+			MANAGER_ENVIRONMENT_VALUE="$decoded"
+			return 0
+		fi
+	done <<<"$MANAGER_ENVIRONMENT"
+	return 1
+}
+
+validate_absolute_path() {
+	local label="$1"
+	local value="$2"
+	[[ "$value" == /* ]] || die "$label must be an absolute path"
+	[[ "$value" != *[[:cntrl:]]* ]] || die "$label cannot contain control characters"
+}
+
+service_home() {
+	local value=""
+	if [[ "$MANAGER_ENVIRONMENT_LOADED" == true ]]; then
+		if manager_environment_value HOME; then
+			value="$MANAGER_ENVIRONMENT_VALUE"
+		fi
+	fi
+	if [[ -z "$value" ]]; then
+		value="${HOME:-}"
+	fi
+	validate_absolute_path "HOME" "$value"
+	[[ "$value" != *:* ]] || die "HOME cannot contain ':'"
+	printf '%s\n' "$value"
+}
+
+config_home() {
+	local value=""
+	if [[ "$MANAGER_ENVIRONMENT_LOADED" == true ]]; then
+		if manager_environment_value XDG_CONFIG_HOME; then
+			value="$MANAGER_ENVIRONMENT_VALUE"
+		fi
+	elif [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
+		value="$XDG_CONFIG_HOME"
+	fi
+	if [[ -n "$value" ]]; then
+		validate_absolute_path "XDG_CONFIG_HOME" "$value"
+		printf '%s\n' "$value"
+		return
+	fi
+	printf '%s/.config\n' "$(service_home)"
+}
+
+unit_path() {
+	printf '%s/systemd/user/%s\n' "$(config_home)" "$UNIT_NAME"
+}
+
+proxy_binary() {
+	local candidate="${CCPD_PROXY_BIN:-}"
+	if [[ -z "$candidate" ]]; then
+		candidate="$(command -v claude-code-proxy || true)"
+	fi
+	[[ -n "$candidate" ]] || die "claude-code-proxy is not in PATH; set CCPD_PROXY_BIN"
+	validate_absolute_path "proxy path" "$candidate"
+	[[ -f "$candidate" ]] || die "proxy is not a regular file: $candidate"
+	[[ -x "$candidate" ]] || die "proxy is not executable: $candidate"
+	printf '%s\n' "$candidate"
+}
+
+unit_quote() {
+	local value="$1"
+	[[ "$value" != *[[:cntrl:]]* ]] || die "unit values cannot contain control characters"
+	value="${value//\\/\\\\}"
+	value="${value//\"/\\\"}"
+	value="${value//%/%%}"
+	printf '"%s"' "$value"
+}
+
+exec_quote() {
+	local value="$1"
+	value="${value//\$/\$\$}"
+	unit_quote "$value"
+}
+
+render_unit() {
+	local proxy_bin="$1"
+	local home_dir
+	local proxy_dir service_path path_entry
+	home_dir="$(service_home)"
+	proxy_dir="$(dirname "$proxy_bin")"
+	[[ "$proxy_dir" != *:* ]] || die "proxy directory cannot contain ':'"
+	service_path="$proxy_dir"
+	for path_entry in \
+		"${home_dir}/.local/bin" \
+		"${home_dir}/.cargo/bin" \
+		/home/linuxbrew/.linuxbrew/bin \
+		/usr/local/bin \
+		/usr/bin \
+		/bin; do
+		if [[ ":${service_path}:" != *":${path_entry}:"* ]]; then
+			service_path="${service_path}:${path_entry}"
+		fi
+	done
+
+	cat <<EOF
+[Unit]
+Description=Claude Code Proxy
+Documentation=https://claude-code-proxy.raine.dev/using/monitor-tui/
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=$(unit_quote "PATH=${service_path}")
+EnvironmentFile=-%E/claude-code-proxy/ccpd.env
+ExecStart=$(exec_quote "$proxy_bin") serve --no-monitor
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+UMask=0077
+
+ConfigurationDirectory=claude-code-proxy
+ConfigurationDirectoryMode=0700
+StateDirectory=claude-code-proxy
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+PrivateUsers=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+KeyringMode=private
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+install_unit() {
+	local start_now=false
+	if [[ "${1:-}" == "--now" ]]; then
+		start_now=true
+		shift
+	fi
+	[[ $# -eq 0 ]] || die "install accepts only --now"
+
+	require_systemctl
+
+	local proxy_bin destination destination_dir temporary
+	proxy_bin="$(proxy_binary)"
+	destination="$(unit_path)"
+	destination_dir="$(dirname "$destination")"
+	mkdir -p "$destination_dir"
+	temporary="$(mktemp "${destination_dir}/.ccpd.service.XXXXXX")"
+	trap 'rm -f "$temporary"' EXIT
+	render_unit "$proxy_bin" >"$temporary"
+	chmod 0644 "$temporary"
+
+	if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then
+		rm -f "$temporary"
+	else
+		mv -f "$temporary" "$destination"
+	fi
+	trap - EXIT
+
+	systemctl --user daemon-reload
+	if [[ "$start_now" == true ]]; then
+		systemctl --user enable "$UNIT_NAME"
+		systemctl --user restart "$UNIT_NAME"
+	fi
+
+	printf 'Installed %s\n' "$destination"
+	if [[ "$start_now" == false ]]; then
+		printf 'Run `ccpd enable` to enable autostart and start the service.\n'
+	fi
+}
+
+uninstall_unit() {
+	require_systemctl
+	local destination
+	destination="$(unit_path)"
+
+	if systemctl --user is-enabled --quiet "$UNIT_NAME" ||
+		systemctl --user is-active --quiet "$UNIT_NAME"; then
+		systemctl --user disable --now "$UNIT_NAME"
+	fi
+	rm -f "$destination"
+	systemctl --user daemon-reload
+	printf 'Removed %s\n' "$destination"
+	printf 'Provider credentials, configuration, and logs were left untouched.\n'
+}
+
+main() {
+	require_linux
+	local command_name="${1:-status}"
+	local proxy_bin
+	if [[ $# -gt 0 ]]; then
+		shift
+	fi
+
+	case "$command_name" in
+	install)
+		install_unit "$@"
+		;;
+	uninstall)
+		[[ $# -eq 0 ]] || die "uninstall does not accept arguments"
+		uninstall_unit
+		;;
+	enable)
+		[[ $# -eq 0 ]] || die "enable does not accept arguments"
+		require_systemctl
+		systemctl --user daemon-reload
+		exec systemctl --user enable --now "$UNIT_NAME"
+		;;
+	disable)
+		[[ $# -eq 0 ]] || die "disable does not accept arguments"
+		require_systemctl
+		exec systemctl --user disable --now "$UNIT_NAME"
+		;;
+	start | stop | restart)
+		[[ $# -eq 0 ]] || die "$command_name does not accept arguments"
+		require_systemctl
+		exec systemctl --user "$command_name" "$UNIT_NAME"
+		;;
+	status)
+		[[ $# -eq 0 ]] || die "status does not accept arguments"
+		require_systemctl
+		exec systemctl --user status --no-pager --full "$UNIT_NAME"
+		;;
+	logs)
+		require_systemctl
+		exec journalctl --user --unit="$UNIT_NAME" --follow "$@"
+		;;
+	health)
+		[[ $# -eq 0 ]] || die "health does not accept arguments"
+		command -v curl >/dev/null 2>&1 || die "curl is required for health checks"
+		curl --fail --silent --show-error \
+			-- "${CCPD_HEALTH_URL:-http://127.0.0.1:18765/healthz}"
+		printf '\n'
+		;;
+	version)
+		[[ $# -eq 0 ]] || die "version does not accept arguments"
+		proxy_bin="$(proxy_binary)"
+		exec "$proxy_bin" --version
+		;;
+	print-unit)
+		[[ $# -eq 0 ]] || die "print-unit does not accept arguments"
+		load_manager_environment
+		proxy_bin="$(proxy_binary)"
+		render_unit "$proxy_bin"
+		;;
+	help | -h | --help)
+		usage
+		;;
+	*)
+		die "unknown command: $command_name"
+		;;
+	esac
+}
+
+main "$@"

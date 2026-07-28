@@ -15,7 +15,9 @@
 set -e
 
 BIN_NAME="claude-code-proxy"
+CCPD_NAME="ccpd"
 REPO="raine/claude-code-proxy"
+CCPD_INSTALLED=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -211,6 +213,27 @@ install_from_release() {
 
 	log_success "${BIN_NAME} installed to $install_dir/${BIN_NAME}"
 
+	if [[ "$platform" == linux-* && -f "$CCPD_NAME" ]]; then
+		log_info "Installing Linux service helper..."
+		local tmp_ccpd="$install_dir/${CCPD_NAME}.tmp.$$"
+
+		if [[ -w "$install_dir" ]]; then
+			cp "$CCPD_NAME" "$tmp_ccpd"
+			chmod +x "$tmp_ccpd"
+			mv -f "$tmp_ccpd" "$install_dir/$CCPD_NAME"
+		else
+			if ! sudo cp "$CCPD_NAME" "$tmp_ccpd"; then
+				log_error "Failed to install $CCPD_NAME to $install_dir (sudo required)"
+				exit 1
+			fi
+			sudo chmod +x "$tmp_ccpd"
+			sudo mv -f "$tmp_ccpd" "$install_dir/$CCPD_NAME"
+		fi
+
+		CCPD_INSTALLED="$install_dir/$CCPD_NAME"
+		log_success "$CCPD_NAME installed to $CCPD_INSTALLED"
+	fi
+
 	if [[ ":$PATH:" != *":$install_dir:"* ]]; then
 		log_warning "$install_dir is not in your PATH"
 		echo ""
@@ -236,6 +259,10 @@ verify_installation() {
 		log_error "${BIN_NAME} binary exists but failed to run"
 		exit 1
 	fi
+	if [ -n "$CCPD_INSTALLED" ] && [ ! -x "$CCPD_INSTALLED" ]; then
+		log_error "$CCPD_NAME was installed but is not executable at $CCPD_INSTALLED"
+		exit 1
+	fi
 
 	log_success "${BIN_NAME} is installed and ready!"
 	echo ""
@@ -246,6 +273,9 @@ verify_installation() {
 	echo "  ${BIN_NAME} codex auth login    # authenticate with your ChatGPT account, or"
 	echo "  ${BIN_NAME} kimi auth login     # authenticate with your kimi.com account"
 	echo "  ${BIN_NAME} serve               # start the proxy"
+	if [ -n "$CCPD_INSTALLED" ]; then
+		echo "  ${CCPD_NAME} install --now      # or run it as a systemd user service"
+	fi
 	echo ""
 	echo "Documentation: https://github.com/${REPO}"
 	echo ""

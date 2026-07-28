@@ -5,6 +5,8 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Linux release archives include `ccpd` for installing and managing
+  claude-code-proxy as a hardened systemd user service.
 - The `claude-opus-5` model name follows the existing Opus aliases, routing to
   `gpt-5.6-sol` on Codex or `kimi-for-coding` on Kimi.
 - Codex WebSocket connections honor `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,

@@ -88,8 +88,14 @@ jobs:
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${BIN_NAME}"
+          archive_files=("${BIN_NAME}")
+          if [[ "${{ matrix.platform }}" == linux-* ]]; then
+            cp scripts/ccpd dist/ccpd
+            chmod 0755 dist/ccpd
+            archive_files+=(ccpd)
+          fi
           archive="${BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
-          tar -C dist -czf "$archive" "${BIN_NAME}"
+          tar -C dist -czf "$archive" "${archive_files[@]}"
           shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256"
       - name: Package Windows
         if: runner.os == 'Windows'
@@ -120,8 +126,25 @@ jobs:
           Expand-Archive claude-code-proxy-windows-amd64.zip -DestinationPath .
           .\claude-code-proxy.exe --version
 
+  smoke-linux:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: linux-amd64
+      - name: Verify Linux archive
+        run: |
+          mkdir dist
+          tar -C dist -xzf claude-code-proxy-linux-amd64.tar.gz
+          test -x dist/claude-code-proxy
+          test -x dist/ccpd
+          bash -n dist/ccpd
+          dist/claude-code-proxy --version
+          dist/ccpd --help
+
   release:
-    needs: [build, smoke-windows]
+    needs: [build, smoke-linux, smoke-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,0 +1,38 @@
+name: ccpd
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/ccpd'
+      - 'scripts/install.sh'
+      - 'tests/ccpd.rs'
+      - '.github/workflows/ccpd.yml'
+      - '.github/workflows/release.yml'
+  pull_request:
+    paths:
+      - 'scripts/ccpd'
+      - 'scripts/install.sh'
+      - 'tests/ccpd.rs'
+      - '.github/workflows/ccpd.yml'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test service manager
+        run: cargo test --locked --test ccpd
+      - name: Verify generated systemd unit
+        run: |
+          bash -n scripts/ccpd
+          test -x scripts/ccpd
+          unit="$(mktemp --suffix=.service)"
+          trap 'rm -f "$unit"' EXIT
+          CCPD_PROXY_BIN=/bin/true scripts/ccpd print-unit > "$unit"
+          systemd-analyze --user --generators=no verify "$unit"

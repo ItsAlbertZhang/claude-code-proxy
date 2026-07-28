@@ -74,6 +74,28 @@ A missing credential makes `auth status` exit with status 1. Other provider comm
 
 Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token.
 
+## `ccpd` on Linux
+
+Direct Linux release archives and the release installer include `ccpd`, a companion command for running the proxy as a systemd user service. It is not a subcommand of the main binary; Homebrew installations use `brew services` instead.
+
+```sh
+ccpd <command>
+```
+
+| Command | Behavior |
+| --- | --- |
+| `install [--now]` | Install or update the user unit. `--now` also enables and restarts it. |
+| `uninstall` | Stop, disable, and remove the unit without deleting credentials, configuration, or logs. |
+| `enable` / `disable` | Enable and start, or stop and disable, the unit. |
+| `start` / `stop` / `restart` | Change the current service state. |
+| `status` | Show the complete, non-paged service status. |
+| `logs [journalctl options]` | Follow service output in the user journal. |
+| `health` | Query `http://127.0.0.1:18765/healthz`; set `CCPD_HEALTH_URL` for this invocation to override it. |
+| `version` | Print the managed `claude-code-proxy` version. |
+| `print-unit` | Render the generated unit without installing it. |
+
+Set `CCPD_PROXY_BIN` to select a particular absolute proxy executable during `install`, `version`, or `print-unit`. See [Background services](/using/monitor-tui/#background-services) for setup and environment-file details.
+
 ## Development commands
 
 From a source checkout:
