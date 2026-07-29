@@ -369,6 +369,21 @@ fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
     }
 }
 
+fn cap_auto_review_effort(
+    resolved_effort: Option<Effort>,
+    is_claude_auto_review: bool,
+) -> Option<Effort> {
+    if is_claude_auto_review
+        && resolved_effort
+            .as_ref()
+            .is_none_or(|effort| *effort > Effort::Low)
+    {
+        Some(Effort::Low)
+    } else {
+        resolved_effort
+    }
+}
+
 const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "flex"];
 
 fn normalize_service_tier(tier: &str) -> Result<ServiceTier, anyhow::Error> {
@@ -539,6 +554,7 @@ pub fn translate_request(
     {
         resolved_effort = Some(cap);
     }
+    resolved_effort = cap_auto_review_effort(resolved_effort, req.is_claude_auto_review);
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
             && reasoning_summary_requested(config::codex_reasoning_summary().as_deref())
@@ -1592,6 +1608,66 @@ mod tests {
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
         assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Low)));
+    }
+
+    #[test]
+    fn auto_review_effort_cap_handles_all_resolved_efforts() {
+        for effort in [
+            None,
+            Some(Effort::Medium),
+            Some(Effort::High),
+            Some(Effort::Xhigh),
+            Some(Effort::Max),
+        ] {
+            assert_eq!(cap_auto_review_effort(effort, true), Some(Effort::Low));
+        }
+        assert_eq!(
+            cap_auto_review_effort(Some(Effort::None), true),
+            Some(Effort::None)
+        );
+        assert_eq!(
+            cap_auto_review_effort(Some(Effort::Low), true),
+            Some(Effort::Low)
+        );
+        assert_eq!(
+            cap_auto_review_effort(Some(Effort::High), false),
+            Some(Effort::High)
+        );
+    }
+
+    #[test]
+    fn proven_auto_review_request_uses_low_effort() {
+        let mut req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-luna",
+            "messages": [{"role":"user", "content":"review this Bash command"}],
+            "output_config": {"effort": "high"}
+        }))
+        .unwrap();
+        req.is_claude_auto_review = true;
+        assert!(
+            serde_json::to_value(&req)
+                .unwrap()
+                .get("is_claude_auto_review")
+                .is_none()
+        );
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert_eq!(out.reasoning.unwrap().effort, Some(Effort::Low));
+    }
+
+    #[test]
+    fn incoming_json_cannot_spoof_auto_review_provenance() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"hello"}],
+            "output_config": {"effort": "high"},
+            "is_claude_auto_review": true
+        }))
+        .unwrap();
+        assert!(!req.is_claude_auto_review);
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert_eq!(out.reasoning.unwrap().effort, Some(Effort::High));
     }
 
     #[test]

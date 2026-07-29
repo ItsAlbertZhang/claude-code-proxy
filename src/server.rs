@@ -49,13 +49,10 @@ fn is_claude_auto_review_request(body: &crate::anthropic::schema::MessagesReques
         return false;
     }
 
-    let has_tools = body
-        .extra
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty());
-    if has_tools {
-        return false;
+    match body.extra.get("tools") {
+        Some(Value::Array(tools)) if !tools.is_empty() => return false,
+        Some(Value::Array(_)) | None => {}
+        Some(_) => return false,
     }
 
     body.extra
@@ -80,6 +77,7 @@ fn apply_auto_review_model(
     if count_tokens || !is_claude_auto_review_request(body) {
         return None;
     }
+    body.is_claude_auto_review = true;
 
     let override_model = configured_model
         .filter(|model| !model.is_empty())
@@ -1438,6 +1436,11 @@ mod auto_review_tests {
             false,
             json!([{"name": "Bash"}]),
         )));
+        assert!(!is_claude_auto_review_request(&request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!({"name": "Bash"}),
+        )));
     }
 
     #[test]
@@ -1452,6 +1455,7 @@ mod auto_review_tests {
         assert_eq!(route.requested_model, "gpt-5.6-sol");
         assert_eq!(route.override_model, "gpt-5.6-luna");
         assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-luna"));
+        assert!(classifier.is_claude_auto_review);
     }
 
     #[test]
@@ -1464,6 +1468,7 @@ mod auto_review_tests {
         classifier.model = Some("kimi-for-coding".to_string());
         assert!(apply_auto_review_model(&mut classifier, false, None, "kimi").is_none());
         assert_eq!(classifier.model.as_deref(), Some("kimi-for-coding"));
+        assert!(classifier.is_claude_auto_review);
     }
 
     #[test]
@@ -1490,5 +1495,6 @@ mod auto_review_tests {
             apply_auto_review_model(&mut classifier, true, Some("grok-4.5"), "codex").is_none()
         );
         assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
+        assert!(!classifier.is_claude_auto_review);
     }
 }

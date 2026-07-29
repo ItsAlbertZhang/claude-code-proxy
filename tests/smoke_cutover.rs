@@ -1124,11 +1124,29 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
         .await
         .unwrap();
 
+    let spoofed = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "messages": [{"role":"user","content":"hello"}],
+        "output_config": {"effort": "high"},
+        "is_claude_auto_review": true
+    }))
+    .await;
+    assert_eq!(spoofed.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(spoofed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
     let sent = captured.lock().unwrap();
-    assert_eq!(sent.len(), 3);
+    assert_eq!(sent.len(), 4);
     assert_eq!(sent[0]["model"], "gpt-5.6-luna");
+    assert_eq!(sent[0]["reasoning"]["effort"], "low");
     assert_eq!(sent[1]["model"], "gpt-5.6-terra");
+    assert_eq!(sent[1]["reasoning"]["effort"], "low");
     assert_eq!(sent[2]["model"], "gpt-5.6-sol");
+    assert!(sent[2]["reasoning"]["effort"].is_null());
+    assert_eq!(sent[3]["model"], "gpt-5.6-sol");
+    assert_eq!(sent[3]["reasoning"]["effort"], "high");
 }
 
 #[allow(clippy::await_holding_lock)]
