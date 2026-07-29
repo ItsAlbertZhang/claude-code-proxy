@@ -13,6 +13,9 @@ use crate::providers::translate_shared::{
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
 
+pub(crate) const RESPONSES_LITE_METADATA_KEY: &str =
+    "ws_request_header_x_openai_internal_codex_responses_lite";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -255,6 +258,14 @@ pub struct TranslateOptions {
     pub use_responses_lite: bool,
 }
 
+pub(crate) fn request_uses_responses_lite(request: &ResponsesRequest) -> bool {
+    request
+        .client_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(RESPONSES_LITE_METADATA_KEY))
+        .is_some_and(|value| value == "true")
+}
+
 // ---------------------------------------------------------------------------
 // Translation entry point
 // ---------------------------------------------------------------------------
@@ -456,9 +467,11 @@ pub fn translate_request(
 
     if opts.use_responses_lite {
         out.client_metadata = Some(std::collections::HashMap::from([(
-            "ws_request_header_x_openai_internal_codex_responses_lite".to_string(),
+            RESPONSES_LITE_METADATA_KEY.to_string(),
             "true".to_string(),
         )]));
+        // The Lite lane rejects parallel tool calls; the full lane keeps the
+        // default so independent tools can be emitted in one assistant turn.
         out.parallel_tool_calls = false;
 
         let mut prefix = Vec::new();
@@ -2066,7 +2079,14 @@ mod tests {
         assert!(out.instructions.is_none());
         assert!(out.tools.is_none());
         assert!(!out.parallel_tool_calls);
-        assert!(out.client_metadata.is_some());
+        assert_eq!(
+            out.client_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(RESPONSES_LITE_METADATA_KEY))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(request_uses_responses_lite(&out));
         assert_eq!(out.input.len(), 3);
         assert!(matches!(
             out.input[0],
@@ -2078,6 +2098,40 @@ mod tests {
         } else {
             panic!("expected developer message");
         }
+    }
+
+    #[test]
+    fn full_lane_keeps_instructions_and_function_tools_top_level() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"hello"}],
+            "system": "be helpful",
+            "tools": [{"name":"test","input_schema":{"type":"object"}}]
+        }))
+        .unwrap();
+        let mut out = translate_request(
+            &req,
+            TranslateOptions {
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: false,
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out.instructions.as_deref(), Some("be helpful"));
+        assert_eq!(out.tools.as_ref().map(Vec::len), Some(1));
+        assert!(out.parallel_tool_calls);
+        assert!(out.client_metadata.is_none());
+        assert!(!request_uses_responses_lite(&out));
+        assert_eq!(out.input.len(), 1);
+        assert!(matches!(out.input[0], ResponsesInputItem::Message { .. }));
+
+        out.client_metadata = Some(std::collections::HashMap::from([(
+            "unrelated".to_string(),
+            "true".to_string(),
+        )]));
+        assert!(!request_uses_responses_lite(&out));
     }
 
     #[test]

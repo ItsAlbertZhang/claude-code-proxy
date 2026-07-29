@@ -8,6 +8,7 @@ use crate::providers::codex::client::{CodexError, CodexHttpClient};
 
 use super::translate::request::{
     ResponsesContentPart, ResponsesInputItem, ResponsesRequest, is_compact_message_text,
+    request_uses_responses_lite,
 };
 
 const RETAINED_MESSAGE_TOKEN_BUDGET: u64 = 20_000;
@@ -39,6 +40,7 @@ enum CompactionPhase {
 
 struct CompactionState {
     model: String,
+    use_responses_lite: bool,
     native_history: Vec<ResponsesInputItem>,
     phase: CompactionPhase,
     updated_at: u64,
@@ -80,11 +82,12 @@ pub async fn request_compaction(
 
 pub fn store_compaction(
     session_id: &str,
-    model: &str,
+    request: &ResponsesRequest,
     native_history: Vec<ResponsesInputItem>,
 ) -> bool {
     let state = CompactionState {
-        model: model.to_string(),
+        model: request.model.clone(),
+        use_responses_lite: request_uses_responses_lite(request),
         native_history,
         phase: CompactionPhase::Unconfirmed,
         updated_at: now_ms(),
@@ -105,7 +108,7 @@ pub fn store_compaction(
 
 pub fn activate_compaction(
     session_id: Option<&str>,
-    model: &str,
+    request: &ResponsesRequest,
     output: &[ResponsesInputItem],
 ) -> bool {
     let Some(session_id) = session_id else {
@@ -125,7 +128,10 @@ pub fn activate_compaction(
     let Some(state) = registry.states.get_mut(session_id) else {
         return false;
     };
-    if state.model != model || !matches!(state.phase, CompactionPhase::Unconfirmed) {
+    if state.model != request.model
+        || state.use_responses_lite != request_uses_responses_lite(request)
+        || !matches!(state.phase, CompactionPhase::Unconfirmed)
+    {
         registry.states.remove(session_id);
         update_total_bytes(registry);
         return false;
@@ -151,7 +157,9 @@ pub fn apply_compaction_replay(
     let registry = guard.as_mut()?;
     evict_states(registry, now);
     let state = registry.states.get_mut(session_id)?;
-    if state.model != request.model {
+    if state.model != request.model
+        || state.use_responses_lite != request_uses_responses_lite(request)
+    {
         registry.states.remove(session_id);
         update_total_bytes(registry);
         return None;
@@ -464,7 +472,11 @@ fn state_size(session_id: &str, state: &CompactionState) -> usize {
         CompactionPhase::Unconfirmed => 0,
         CompactionPhase::Anchored { portable_summary } => portable_summary.len(),
     };
-    session_id.len() + state.model.len() + summary_len + serialized_size(&state.native_history)
+    session_id.len()
+        + state.model.len()
+        + std::mem::size_of::<bool>()
+        + summary_len
+        + serialized_size(&state.native_history)
 }
 
 fn now_ms() -> u64 {
@@ -515,16 +527,26 @@ mod tests {
     static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
     fn request(input: serde_json::Value) -> ResponsesRequest {
-        serde_json::from_value(json!({
+        request_for_lane(input, true)
+    }
+
+    fn request_for_lane(input: serde_json::Value, use_responses_lite: bool) -> ResponsesRequest {
+        let mut request: ResponsesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
             "input": input,
             "store": false,
             "stream": true,
-            "parallel_tool_calls": false,
-            "client_metadata": {"lite":"true"},
+            "parallel_tool_calls": !use_responses_lite,
             "text": {"verbosity":"low"}
         }))
-        .unwrap()
+        .unwrap();
+        if use_responses_lite {
+            request.client_metadata = Some(HashMap::from([(
+                super::super::translate::request::RESPONSES_LITE_METADATA_KEY.to_string(),
+                "true".to_string(),
+            )]));
+        }
+        request
     }
 
     fn output(text: &str) -> Vec<ResponsesInputItem> {
@@ -534,6 +556,16 @@ mod tests {
             "content":[{"type":"output_text","text":text}]
         }]))
         .unwrap()
+    }
+
+    fn store_opaque(session_id: &str, request: &ResponsesRequest) {
+        assert!(store_compaction(
+            session_id,
+            request,
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "opaque".to_string(),
+            }],
+        ));
     }
 
     #[test]
@@ -567,13 +599,8 @@ mod tests {
     fn replay_requires_activation_and_wrapped_summary_anchor() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        store_compaction(
-            "session",
-            "gpt-5.6-sol",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "opaque".to_string(),
-            }],
-        );
+        let stored = request(json!([]));
+        store_opaque("session", &stored);
         let next = request(json!([
             {"type":"additional_tools","role":"developer","tools":[]},
             {"type":"message","role":"developer","content":[{"type":"input_text","text":"instructions"}]},
@@ -583,7 +610,7 @@ mod tests {
         assert!(apply_compaction_replay(Some("session"), &next).is_none());
         assert!(activate_compaction(
             Some("session"),
-            "gpt-5.6-sol",
+            &stored,
             &output(&format!(
                 "<analysis>summary preparation</analysis>\n<summary>\n{SUMMARY}\n</summary>"
             ))
@@ -612,14 +639,9 @@ mod tests {
             format!("{SUMMARY} and {SUMMARY}"),
         ] {
             clear_all_compactions_for_tests();
-            store_compaction(
-                "session",
-                "gpt-5.6-sol",
-                vec![ResponsesInputItem::Compaction {
-                    encrypted_content: "opaque".to_string(),
-                }],
-            );
-            activate_compaction(Some("session"), "gpt-5.6-sol", &output(SUMMARY));
+            let stored = request(json!([]));
+            store_opaque("session", &stored);
+            activate_compaction(Some("session"), &stored, &output(SUMMARY));
             let changed = request(json!([
                 {"type":"message","role":"user","content":[{"type":"input_text","text":text}]},
                 {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
@@ -653,14 +675,9 @@ mod tests {
     fn failed_replay_clears_anchored_state() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        store_compaction(
-            "failed-replay",
-            "gpt-5.6-sol",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "opaque".to_string(),
-            }],
-        );
-        activate_compaction(Some("failed-replay"), "gpt-5.6-sol", &output(SUMMARY));
+        let stored = request(json!([]));
+        store_opaque("failed-replay", &stored);
+        activate_compaction(Some("failed-replay"), &stored, &output(SUMMARY));
         let next = request(json!([
             {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
@@ -676,20 +693,33 @@ mod tests {
     fn replay_clears_on_model_change() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        store_compaction(
-            "session",
-            "gpt-5.6-sol",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "opaque".to_string(),
-            }],
-        );
-        activate_compaction(Some("session"), "gpt-5.6-sol", &output(SUMMARY));
+        let stored = request(json!([]));
+        store_opaque("session", &stored);
+        activate_compaction(Some("session"), &stored, &output(SUMMARY));
         let mut changed = request(json!([
             {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
         ]));
         changed.model = "gpt-5.4".to_string();
         assert!(apply_compaction_replay(Some("session"), &changed).is_none());
+    }
+
+    #[test]
+    fn replay_clears_on_lane_change() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let stored = request(json!([]));
+        store_opaque("session", &stored);
+        activate_compaction(Some("session"), &stored, &output(SUMMARY));
+        let input = json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]);
+        let full_lane = request_for_lane(input.clone(), false);
+        assert!(apply_compaction_replay(Some("session"), &full_lane).is_none());
+
+        let lite_lane = request_for_lane(input, true);
+        assert!(apply_compaction_replay(Some("session"), &lite_lane).is_none());
     }
 
     #[test]

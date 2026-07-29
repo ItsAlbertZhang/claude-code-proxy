@@ -56,6 +56,8 @@ struct CodexConfig {
     pub user_agent: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "fullLane")]
+    pub full_lane: Option<bool>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
@@ -109,6 +111,14 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
+        _ => None,
+    }
+}
+
+fn parse_standard_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
 }
@@ -226,6 +236,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_RESPONSES_API") {
         out.push("codex.responsesApi (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_FULL_LANE") {
+        out.push("codex.fullLane (env)".to_string());
+    }
     if env.contains_key("CCP_KIMI_OAUTH_HOST") {
         out.push("kimi.oauthHost (env)".to_string());
     }
@@ -298,6 +311,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
+            }
+            if let Some(enabled) = codex.full_lane {
+                out.push(format!("codex.fullLane: {enabled}"));
             }
         }
     }
@@ -510,17 +526,34 @@ pub fn codex_previous_response_id() -> bool {
 
 pub fn codex_server_compaction() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => return true,
-            "0" | "false" | "no" | "off" => return false,
-            _ => {}
-        }
+    if let Some(enabled) = env
+        .get("CCP_CODEX_SERVER_COMPACTION")
+        .and_then(|raw| parse_standard_bool(raw))
+    {
+        return enabled;
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.server_compaction
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn codex_full_lane() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(enabled) = env
+        .get("CCP_CODEX_FULL_LANE")
+        .and_then(|raw| parse_standard_bool(raw))
+    {
+        return enabled;
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.full_lane
     {
         return enabled;
     }
@@ -748,6 +781,7 @@ mod tests {
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
             std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
+            std::env::remove_var("CCP_CODEX_FULL_LANE");
             std::env::remove_var("CCP_CODEX_RESPONSES_API");
             std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
         }
@@ -1002,6 +1036,76 @@ mod tests {
             let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "");
             assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
         }
+    }
+
+    #[test]
+    fn parse_standard_bool_accepts_common_words() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            assert_eq!(parse_standard_bool(value), Some(true), "{value}");
+        }
+        for value in ["0", "false", "FALSE", " no ", "Off"] {
+            assert_eq!(parse_standard_bool(value), Some(false), "{value}");
+        }
+        for value in ["", "  ", "enabled", "2"] {
+            assert_eq!(parse_standard_bool(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn codex_full_lane_defaults_parses_values_and_honors_env_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(!codex_full_lane());
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_full_lane());
+
+        for value in ["0", "false", "FALSE", " no ", "Off"] {
+            let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(!codex_full_lane(), "{value}");
+        }
+        for value in ["", "invalid"] {
+            let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(codex_full_lane(), "{value}");
+        }
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":false}}"#,
+        )
+        .unwrap();
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(codex_full_lane(), "{value}");
+        }
+    }
+
+    #[test]
+    fn codex_full_lane_is_reported_for_config_and_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":true}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let loaded = load_config();
+
+        let config_lines = config_override_summary_lines(&loaded);
+        assert!(config_lines.contains(&"codex.fullLane: true".to_string()));
+
+        let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "false");
+        let env_lines = config_override_summary_lines(&loaded);
+        assert!(env_lines.contains(&"codex.fullLane (env)".to_string()));
     }
 
     #[test]

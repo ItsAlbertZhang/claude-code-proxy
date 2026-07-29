@@ -47,7 +47,7 @@ use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
-    uses_responses_lite,
+    uses_responses_lite_with_full_lane,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
@@ -204,7 +204,9 @@ impl Provider for CodexProvider {
                 ctx.traffic.as_deref(),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let full_lane = config::codex_full_lane();
+        let use_responses_lite =
+            apply_model_lane_for_request(&mut resolved.model, &body, full_lane);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -251,7 +253,7 @@ impl Provider for CodexProvider {
             compaction_ctx.monitor = None;
             match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
                 Ok(native_history) => {
-                    if store_compaction(session_id, &translated.model, native_history) {
+                    if store_compaction(session_id, &translated, native_history) {
                         log_compaction_event(
                             "server_compaction_completed",
                             &ctx,
@@ -448,7 +450,9 @@ impl Provider for CodexProvider {
                 ),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let full_lane = config::codex_full_lane();
+        let use_responses_lite =
+            apply_model_lane_for_request(&mut resolved.model, &body, full_lane);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -490,12 +494,16 @@ impl Provider for CodexProvider {
 /// run on the full Responses API (the lite lane rejects hosted tools), and
 /// lite-only models like gpt-5.6-luna don't exist there, so such requests
 /// are upgraded to a full-lane model. Returns whether to use the lite lane.
-fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> bool {
+fn apply_model_lane_for_request(
+    model: &mut String,
+    body: &MessagesRequest,
+    full_lane: bool,
+) -> bool {
     if has_hosted_web_search(body) {
         *model = full_lane_web_search_model(model).to_string();
         return false;
     }
-    uses_responses_lite(model)
+    uses_responses_lite_with_full_lane(model, full_lane)
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -1143,7 +1151,7 @@ fn update_continuation_from_upstream(
     match finish_metadata_from_upstream(upstream_body) {
         Ok(Some(finish)) if finish.continuation_eligible => {
             if compact_boundary {
-                activate_compaction(session_id, &request_body.model, &finish.output_items);
+                activate_compaction(session_id, request_body, &finish.output_items);
             }
             record_continuation(
                 session_id,
@@ -1466,33 +1474,43 @@ mod tests {
         let body = request_with_tools(serde_json::json!([
             {"type":"web_search_20250305", "name":"web_search"}
         ]));
-        for (resolved, expected) in [
-            ("gpt-5.6-luna", "gpt-5.6-sol"),
-            ("gpt-5.6-sol", "gpt-5.6-sol"),
-            ("gpt-5.6-terra", "gpt-5.6-terra"),
-            ("gpt-5.4", "gpt-5.4"),
-        ] {
-            let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
-            assert!(!lite, "{resolved} with web_search must use the full lane");
-            assert_eq!(model, expected);
+        for full_lane in [false, true] {
+            for (resolved, expected) in [
+                ("gpt-5.6-luna", "gpt-5.6-sol"),
+                ("gpt-5.6-sol", "gpt-5.6-sol"),
+                ("gpt-5.6-terra", "gpt-5.6-terra"),
+                ("gpt-5.4", "gpt-5.4"),
+            ] {
+                let mut model = resolved.to_string();
+                let lite = apply_model_lane_for_request(&mut model, &body, full_lane);
+                assert!(!lite, "{resolved} with web_search must use the full lane");
+                assert_eq!(model, expected);
+            }
         }
     }
 
     #[test]
-    fn requests_without_web_search_keep_model_and_lite_lane() {
+    fn requests_without_web_search_apply_full_lane_flag() {
         let body = request_with_tools(serde_json::json!([
             {"name":"Bash", "input_schema":{}}
         ]));
-        for (resolved, lite_expected) in [
-            ("gpt-5.6-luna", true),
-            ("gpt-5.6-sol", true),
-            ("gpt-5.4", false),
+        for (resolved, full_lane, lite_expected) in [
+            ("gpt-5.6-luna", false, true),
+            ("gpt-5.6-luna", true, true),
+            ("gpt-5.6-sol", false, true),
+            ("gpt-5.6-sol", true, false),
+            ("gpt-5.6-terra", false, true),
+            ("gpt-5.6-terra", true, false),
+            ("gpt-5.4", false, false),
+            ("gpt-5.4", true, false),
         ] {
             let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
+            let lite = apply_model_lane_for_request(&mut model, &body, full_lane);
             assert_eq!(model, resolved, "model must not change without web_search");
-            assert_eq!(lite, lite_expected);
+            assert_eq!(
+                lite, lite_expected,
+                "model={resolved}, full_lane={full_lane}"
+            );
         }
     }
 
