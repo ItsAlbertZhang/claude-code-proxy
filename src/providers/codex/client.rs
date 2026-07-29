@@ -32,6 +32,7 @@ pub enum CodexErrorOrigin {
     Http,
     WebSocket,
     WebSocketHandshake,
+    WebSocketProxyTunnel,
     Auth,
     BufferedHttp,
     BufferedWebSocket,
@@ -1645,6 +1646,7 @@ fn codex_error_origin_name(origin: CodexErrorOrigin) -> &'static str {
         CodexErrorOrigin::Http => "http",
         CodexErrorOrigin::WebSocket => "websocket",
         CodexErrorOrigin::WebSocketHandshake => "websocket_handshake",
+        CodexErrorOrigin::WebSocketProxyTunnel => "websocket_proxy_tunnel",
         CodexErrorOrigin::Auth => "auth",
         CodexErrorOrigin::BufferedHttp => "buffered_http",
         CodexErrorOrigin::BufferedWebSocket => "buffered_websocket",
@@ -1697,10 +1699,10 @@ fn log_buffered_retry_exhausted(
 }
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
+    if err.origin == CodexErrorOrigin::WebSocketProxyTunnel {
+        return false;
+    }
     if err.origin == CodexErrorOrigin::WebSocketHandshake {
-        if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
-            return false;
-        }
         return err.status == 0 || should_retry_codex_status(err.status);
     }
     if err.detail.as_deref() == Some("websocket_pre_request") {
@@ -1753,7 +1755,6 @@ fn should_refresh_after_unauthorized(
 fn should_fallback_to_http(err: &CodexError) -> bool {
     err.origin == CodexErrorOrigin::WebSocketHandshake
         && err.status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
-        && err.detail.as_deref() != Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL)
 }
 
 fn should_retry_without_continuation(
@@ -2457,11 +2458,26 @@ mod tests {
                 super::super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string(),
             ),
             retry_after: None,
-            origin: CodexErrorOrigin::WebSocketHandshake,
+            origin: CodexErrorOrigin::WebSocketProxyTunnel,
         };
 
         assert!(!is_retryable_transport_error(&err));
         assert!(!should_fallback_to_http(&err));
+    }
+
+    #[test]
+    fn origin_detail_cannot_spoof_proxy_tunnel_classification() {
+        let err = CodexError {
+            status: http::StatusCode::FORBIDDEN.as_u16(),
+            message: "WebSocket upgrade rejected".to_string(),
+            detail: Some(
+                super::super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string(),
+            ),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        };
+
+        assert!(should_fallback_to_http(&err));
     }
 
     #[test]

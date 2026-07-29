@@ -41,7 +41,18 @@ pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_POOL_ENTRIES: usize = 10_000;
+const POOL_CONNECT_CLEANUP_THRESHOLD: usize = 50;
+const POOL_CONNECT_CLEANUP_TARGET: usize = 25;
 const MAX_CONNECT_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+#[cfg(not(test))]
+const WEBSOCKET_CONNECT_SUCCESS_SPACING_MS: u64 = 1_000;
+#[cfg(test)]
+const WEBSOCKET_CONNECT_SUCCESS_SPACING_MS: u64 = 0;
+#[cfg(not(test))]
+const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN_MS: u64 = 3_000;
+#[cfg(test)]
+const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN_MS: u64 = 0;
+const WEBSOCKET_CONNECT_FORBIDDEN_RETRIES: usize = 1;
 
 // Terminal WebSocket event types that signal the request is done
 const TERMINAL_EVENTS: &[&str] = &[
@@ -221,6 +232,13 @@ struct PoolEntry {
 
 static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<PoolEntry>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
+    once_cell::sync::Lazy::new(|| {
+        WebSocketConnectGate::new(
+            Duration::from_millis(WEBSOCKET_CONNECT_SUCCESS_SPACING_MS),
+            Duration::from_millis(WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN_MS),
+        )
+    });
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -298,6 +316,85 @@ fn pool_insert(key: String, entry: Arc<PoolEntry>) {
     let now = now_ms();
     guard.retain(|_, e| now.saturating_sub(e.created_at) < POOL_IDLE_TTL_MS);
     guard.insert(key, entry);
+}
+
+fn cleanup_pool_before_connect() {
+    let mut guard = WS_POOL.lock().unwrap();
+    if guard.len() <= POOL_CONNECT_CLEANUP_THRESHOLD {
+        return;
+    }
+
+    let remove_count = guard.len() - POOL_CONNECT_CLEANUP_TARGET;
+    let mut entries: Vec<_> = guard
+        .iter()
+        .filter(|(_, entry)| Arc::strong_count(entry) == 1)
+        .map(|(key, entry)| (key.clone(), entry.created_at))
+        .collect();
+    entries.sort_unstable_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    for (key, _) in entries.into_iter().take(remove_count) {
+        guard.remove(&key);
+    }
+}
+
+struct WebSocketConnectGate {
+    next_attempt_at: AsyncMutex<Option<Instant>>,
+    success_spacing: Duration,
+    forbidden_cooldown: Duration,
+}
+
+impl WebSocketConnectGate {
+    fn new(success_spacing: Duration, forbidden_cooldown: Duration) -> Self {
+        Self {
+            next_attempt_at: AsyncMutex::new(None),
+            success_spacing,
+            forbidden_cooldown,
+        }
+    }
+
+    async fn connect<T, F, Fut>(&self, mut connect: F) -> Result<T, CodexError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, CodexError>>,
+    {
+        let mut forbidden_retries = 0;
+        loop {
+            let result = {
+                // Tokio's mutex serves queued waiters in FIFO order. A rejected
+                // attempt releases the guard before retrying at the queue tail.
+                let mut next_attempt_at = self.next_attempt_at.lock().await;
+                if let Some(deadline) = *next_attempt_at {
+                    let wait = deadline.saturating_duration_since(Instant::now());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+
+                let result = connect().await;
+                *next_attempt_at = match &result {
+                    Ok(_) => Some(Instant::now() + self.success_spacing),
+                    Err(error) if is_forbidden_handshake(error) => {
+                        Some(Instant::now() + self.forbidden_cooldown)
+                    }
+                    Err(_) => None,
+                };
+                result
+            };
+
+            let retry_forbidden = matches!(&result, Err(error) if is_forbidden_handshake(error))
+                && forbidden_retries < WEBSOCKET_CONNECT_FORBIDDEN_RETRIES;
+            if !retry_forbidden {
+                return result;
+            }
+
+            forbidden_retries += 1;
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+fn is_forbidden_handshake(error: &CodexError) -> bool {
+    error.origin == CodexErrorOrigin::WebSocketHandshake
+        && error.status == http::StatusCode::FORBIDDEN.as_u16()
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,7 +1235,11 @@ fn reqwest_handshake_error(error: reqwest::Error) -> CodexError {
         message: message.to_string(),
         detail: proxy_tunnel_rejected.then(|| WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
         retry_after: None,
-        origin: CodexErrorOrigin::WebSocketHandshake,
+        origin: if proxy_auth_required || proxy_tunnel_rejected {
+            CodexErrorOrigin::WebSocketProxyTunnel
+        } else {
+            CodexErrorOrigin::WebSocketHandshake
+        },
     }
 }
 
@@ -1234,7 +1335,7 @@ fn tunnel_error(status: u16, retry_after: Option<String>) -> CodexError {
             Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string())
         },
         retry_after,
-        origin: CodexErrorOrigin::WebSocketHandshake,
+        origin: CodexErrorOrigin::WebSocketProxyTunnel,
     }
 }
 
@@ -1244,7 +1345,7 @@ fn invalid_tunnel_response(message: &str) -> CodexError {
         message: message.to_string(),
         detail: Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
         retry_after: None,
-        origin: CodexErrorOrigin::WebSocketHandshake,
+        origin: CodexErrorOrigin::WebSocketProxyTunnel,
     }
 }
 
@@ -1309,7 +1410,7 @@ async fn establish_connect_tunnel(
         message: "WebSocket proxy tunnel request failed".to_string(),
         detail: None,
         retry_after: None,
-        origin: CodexErrorOrigin::WebSocketHandshake,
+        origin: CodexErrorOrigin::WebSocketProxyTunnel,
     })?;
 
     let mut response = Vec::new();
@@ -1546,6 +1647,19 @@ async fn connect_via_http_upgrade(
     Ok(WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await)
 }
 
+async fn connect_once(
+    websocket_client: &reqwest::Client,
+    proxy_config: &WebSocketProxyConfig,
+    url: &str,
+    headers: &HeaderMap,
+) -> Result<CodexWebSocketStream, CodexError> {
+    if let Some(route) = proxy_config.http_connect_route(url)? {
+        connect_via_http_proxy_tunnel(proxy_config, route, url, headers).await
+    } else {
+        connect_via_http_upgrade(websocket_client, url, headers).await
+    }
+}
+
 async fn connect_with_timeout(
     websocket_client: &reqwest::Client,
     proxy_config: &WebSocketProxyConfig,
@@ -1553,13 +1667,10 @@ async fn connect_with_timeout(
     headers: &HeaderMap,
     connect_timeout_ms: u64,
 ) -> Result<CodexWebSocketStream, CodexError> {
-    let connect = async {
-        if let Some(route) = proxy_config.http_connect_route(url)? {
-            connect_via_http_proxy_tunnel(proxy_config, route, url, headers).await
-        } else {
-            connect_via_http_upgrade(websocket_client, url, headers).await
-        }
-    };
+    let connect = WS_CONNECT_GATE.connect(|| async {
+        cleanup_pool_before_connect();
+        connect_once(websocket_client, proxy_config, url, headers).await
+    });
     tokio::time::timeout(Duration::from_millis(connect_timeout_ms), connect)
         .await
         .map_err(|_| CodexError {
@@ -1941,6 +2052,8 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
@@ -1963,6 +2076,273 @@ mod tests {
         let first = websocket_tls_config();
         let second = websocket_tls_config();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    fn forbidden_handshake_error() -> CodexError {
+        CodexError {
+            status: http::StatusCode::FORBIDDEN.as_u16(),
+            message: "forbidden".to_string(),
+            detail: Some(GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        }
+    }
+
+    fn proxy_forbidden_handshake_error() -> CodexError {
+        CodexError {
+            detail: Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
+            origin: CodexErrorOrigin::WebSocketProxyTunnel,
+            ..forbidden_handshake_error()
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_gate_serializes_and_spaces_from_completion() {
+        let success_spacing = Duration::from_millis(25);
+        let gate = Arc::new(WebSocketConnectGate::new(
+            success_spacing,
+            Duration::from_millis(50),
+        ));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let gate = gate.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let windows = windows.clone();
+            tasks.push(tokio::spawn(async move {
+                gate.connect(move || {
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    let windows = windows.clone();
+                    async move {
+                        let started = Instant::now();
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        windows.lock().unwrap().push((started, Instant::now()));
+                        Ok::<(), CodexError>(())
+                    }
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        let windows = windows.lock().unwrap();
+        assert_eq!(windows.len(), 3);
+        for pair in windows.windows(2) {
+            assert!(pair[1].0.duration_since(pair[0].1) >= success_spacing);
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_gate_applies_403_cooldown_and_requeues() {
+        let success_spacing = Duration::from_millis(20);
+        let forbidden_cooldown = Duration::from_millis(60);
+        let gate = Arc::new(WebSocketConnectGate::new(
+            success_spacing,
+            forbidden_cooldown,
+        ));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_finished = Arc::new(std::sync::Mutex::new(None));
+        let second_finished = Arc::new(std::sync::Mutex::new(None));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+
+        let first_gate = gate.clone();
+        let first_attempts = attempts.clone();
+        let first_order = order.clone();
+        let first_finished_for_task = first_finished.clone();
+        let first_entered_tx = entered_tx.clone();
+        let first = tokio::spawn(async move {
+            first_gate
+                .connect(move || {
+                    let attempt = first_attempts.fetch_add(1, Ordering::SeqCst);
+                    let order = first_order.clone();
+                    let first_finished = first_finished_for_task.clone();
+                    let entered_tx = first_entered_tx.clone();
+                    async move {
+                        let label = if attempt == 0 { "first-1" } else { "first-2" };
+                        order.lock().unwrap().push((label, Instant::now()));
+                        if attempt == 0 {
+                            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            *first_finished.lock().unwrap() = Some(Instant::now());
+                            Err(forbidden_handshake_error())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })
+                .await
+        });
+
+        entered_rx.await.unwrap();
+        let second_gate = gate.clone();
+        let second_order = order.clone();
+        let second_finished_for_task = second_finished.clone();
+        let second = tokio::spawn(async move {
+            second_gate
+                .connect(move || {
+                    let order = second_order.clone();
+                    let second_finished = second_finished_for_task.clone();
+                    async move {
+                        order.lock().unwrap().push(("second-1", Instant::now()));
+                        *second_finished.lock().unwrap() = Some(Instant::now());
+                        Ok::<(), CodexError>(())
+                    }
+                })
+                .await
+        });
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let order = order.lock().unwrap();
+        let labels: Vec<_> = order.iter().map(|(label, _)| *label).collect();
+        assert_eq!(labels, ["first-1", "second-1", "first-2"]);
+        let first_finished = first_finished.lock().unwrap().unwrap();
+        let second_finished = second_finished.lock().unwrap().unwrap();
+        assert!(order[1].1.duration_since(first_finished) >= forbidden_cooldown);
+        assert!(order[2].1.duration_since(second_finished) >= success_spacing);
+    }
+
+    #[tokio::test]
+    async fn connect_gate_retries_persistent_origin_403_only_once() {
+        let gate = WebSocketConnectGate::new(Duration::ZERO, Duration::from_millis(1));
+        let attempts = AtomicUsize::new(0);
+
+        let error = gate
+            .connect(|| async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), CodexError>(forbidden_handshake_error())
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn connect_gate_does_not_retry_proxy_connect_403() {
+        let gate = WebSocketConnectGate::new(Duration::ZERO, Duration::from_millis(1));
+        let attempts = AtomicUsize::new(0);
+
+        let error = gate
+            .connect(|| async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), CodexError>(proxy_forbidden_handshake_error())
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn origin_403_detail_cannot_spoof_proxy_tunnel_provenance() {
+        let gate = WebSocketConnectGate::new(Duration::ZERO, Duration::from_millis(1));
+        let attempts = AtomicUsize::new(0);
+
+        let error = gate
+            .connect(|| async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), CodexError>(CodexError {
+                    detail: Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
+                    ..forbidden_handshake_error()
+                })
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn queued_connect_consumes_outer_timeout_budget() {
+        let gate = Arc::new(WebSocketConnectGate::new(Duration::ZERO, Duration::ZERO));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+        let blocker_gate = gate.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_gate
+                .connect(move || {
+                    let entered_tx = entered_tx.clone();
+                    async move {
+                        if let Some(tx) = entered_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        std::future::pending::<Result<(), CodexError>>().await
+                    }
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(25),
+            gate.connect(|| async { Ok::<(), CodexError>(()) }),
+        )
+        .await;
+        assert!(result.is_err());
+
+        blocker.abort();
+        let _ = blocker.await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            gate.connect(|| async { Ok::<(), CodexError>(()) }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_connection_cleanup_retains_newest_and_leased_entries() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let ws = Arc::new(AsyncMutex::new(create_dummy_stream_async().await));
+        let leased = {
+            let mut guard = WS_POOL.lock().unwrap();
+            for index in 0..=POOL_CONNECT_CLEANUP_THRESHOLD {
+                guard.insert(
+                    format!("cleanup-{index:02}"),
+                    Arc::new(PoolEntry {
+                        ws: ws.clone(),
+                        created_at: index as u64,
+                    }),
+                );
+            }
+            guard.get("cleanup-00").unwrap().clone()
+        };
+
+        cleanup_pool_before_connect();
+
+        let guard = WS_POOL.lock().unwrap();
+        assert_eq!(guard.len(), POOL_CONNECT_CLEANUP_TARGET);
+        assert!(guard.contains_key("cleanup-00"));
+        assert!(!guard.contains_key("cleanup-26"));
+        assert!(guard.contains_key("cleanup-27"));
+        assert!(guard.contains_key("cleanup-50"));
+        drop(guard);
+        drop(leased);
+        clear_codex_websocket_pool_for_tests();
     }
 
     #[test]
@@ -2288,6 +2668,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_origin_403_retries_once_even_when_detail_matches_proxy_marker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                server_attempts.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+
+                if attempt == 0 {
+                    let body = format!(
+                        "{{\"error\":{{\"message\":\"{WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL}\"}}}}"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    continue;
+                }
+
+                let request_text = String::from_utf8(request).unwrap();
+                let key = request_text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("sec-websocket-key")
+                            .then(|| value.trim().to_string())
+                    })
+                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                    derive_accept_key(key.as_bytes())
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                let _websocket = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+            }
+        });
+
+        let client = test_websocket_client();
+        let websocket = connect_with_timeout(
+            &client,
+            &WebSocketProxyConfig::direct(),
+            &format!("ws://{addr}/backend-api/codex/responses"),
+            &HeaderMap::new(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        drop(websocket);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn websocket_connect_502_preserves_retry_metadata() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -2409,6 +2855,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_tunnel_write_failure_is_typed_proxy_error() {
+        let (client, proxy) = tokio::io::duplex(64);
+        drop(proxy);
+        let stream: BoxedWebSocketIo = Box::new(client);
+        let error = match establish_connect_tunnel(stream, "codex.invalid:4443", None).await {
+            Ok(_) => panic!("closed proxy stream should reject CONNECT write"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, 0);
+        assert_eq!(error.origin, CodexErrorOrigin::WebSocketProxyTunnel);
+    }
+
+    #[tokio::test]
     async fn connect_tunnel_accepts_fragmented_non_200_success() {
         let (client, mut proxy) = tokio::io::duplex(4096);
         let proxy_task = tokio::spawn(async move {
@@ -2462,6 +2921,7 @@ mod tests {
             http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
         );
         assert_eq!(error.message, "WebSocket proxy authentication failed");
+        assert_eq!(error.origin, CodexErrorOrigin::WebSocketProxyTunnel);
     }
 
     #[test]
@@ -2494,6 +2954,83 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    async fn assert_connect_proxy_rejection_is_typed_and_not_retried(
+        status: http::StatusCode,
+        reason: &str,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let reason = reason.to_string();
+        let proxy = tokio::spawn(async move {
+            let mut accepted = 0;
+            let respond = |mut stream: TcpStream| {
+                let reason = reason.clone();
+                async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {} {reason}\r\nContent-Length: 0\r\n\r\n",
+                        status.as_u16()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            };
+
+            let (stream, _) = listener.accept().await.unwrap();
+            accepted += 1;
+            respond(stream).await;
+            if let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                accepted += 1;
+                respond(stream).await;
+            }
+            accepted
+        });
+
+        let proxy_url = format!("http://{proxy_addr}");
+        let config = WebSocketProxyConfig::new(None, Some(&proxy_url), None, None);
+        let client = test_websocket_client();
+        let error = match connect_with_timeout(
+            &client,
+            &config,
+            "wss://codex.invalid/backend-api/codex/responses",
+            &HeaderMap::new(),
+            1_000,
+        )
+        .await
+        {
+            Ok(_) => panic!("proxy CONNECT rejection should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, status.as_u16());
+        assert_eq!(error.origin, CodexErrorOrigin::WebSocketProxyTunnel);
+        assert_eq!(proxy.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_connect_proxy_rejections_are_typed_and_not_retried() {
+        assert_connect_proxy_rejection_is_typed_and_not_retried(
+            http::StatusCode::FORBIDDEN,
+            "Forbidden",
+        )
+        .await;
+        assert_connect_proxy_rejection_is_typed_and_not_retried(
+            http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "Proxy Authentication Required",
+        )
+        .await;
     }
 
     #[tokio::test]
