@@ -329,7 +329,11 @@ impl CodexConversationRoute {
     }
 
     fn matches_request(&self, body: &ResponsesRequest) -> bool {
-        self.protocol_lane == ProtocolLane::from_responses_lite(body.client_metadata.is_some())
+        self.matches_protocol(body.client_metadata.is_some())
+    }
+
+    fn matches_protocol(&self, use_responses_lite: bool) -> bool {
+        self.protocol_lane == ProtocolLane::from_responses_lite(use_responses_lite)
     }
 }
 
@@ -721,14 +725,7 @@ impl CodexHttpClient {
         use_responses_lite: bool,
         stream: bool,
     ) -> Result<reqwest::Response, CodexError> {
-        let body_json = serde_json::to_string(body).map_err(|err| CodexError {
-            status: 500,
-            message: "Failed to serialize native Responses request".to_string(),
-            detail: Some(err.to_string()),
-            retry_after: None,
-            origin: CodexErrorOrigin::Http,
-        })?;
-        let mut auth = self
+        let auth = self
             .auth_manager
             .get_auth()
             .await
@@ -739,6 +736,56 @@ impl CodexHttpClient {
                 retry_after: None,
                 origin: CodexErrorOrigin::Auth,
             })?;
+        self.post_native_responses_with_auth(body, ctx, use_responses_lite, stream, auth, true)
+            .await
+    }
+
+    pub async fn post_native_responses_bound(
+        &self,
+        route: &CodexConversationRoute,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+        stream: bool,
+    ) -> Result<reqwest::Response, CodexError> {
+        let use_responses_lite = body
+            .get("client_metadata")
+            .is_some_and(|metadata| !metadata.is_null());
+        if !route.matches_protocol(use_responses_lite) {
+            return Err(CodexError {
+                status: 500,
+                message: "Codex route protocol mismatch".to_string(),
+                detail: None,
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            });
+        }
+        self.post_native_responses_with_auth(
+            body,
+            ctx,
+            use_responses_lite,
+            stream,
+            route.auth.clone(),
+            false,
+        )
+        .await
+    }
+
+    async fn post_native_responses_with_auth(
+        &self,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+        use_responses_lite: bool,
+        stream: bool,
+        mut auth: StoredAuth,
+        allow_auth_refresh: bool,
+    ) -> Result<reqwest::Response, CodexError> {
+        let body_json = serde_json::to_string(body).map_err(|err| CodexError {
+            status: 500,
+            message: "Failed to serialize native Responses request".to_string(),
+            detail: Some(err.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
         let mut refresh_attempted = false;
 
         loop {
@@ -754,13 +801,18 @@ impl CodexHttpClient {
             let status = response.status().as_u16();
             if status == 401 && !refresh_attempted {
                 refresh_attempted = true;
-                drop(response);
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
-                continue;
+                if allow_auth_refresh {
+                    drop(response);
+                    auth = self
+                        .auth_manager
+                        .force_refresh(&auth.access)
+                        .await
+                        .map_err(auth_refresh_error)?;
+                    continue;
+                }
+                // Preserve this request's immutable route. Refresh or observed
+                // rotation is available only when the next route binds.
+                let _ = self.auth_manager.refresh_after_rejection(&auth).await;
             }
 
             if let Some(traffic) = ctx.traffic.as_deref() {
@@ -2923,6 +2975,142 @@ mod tests {
             response.bytes().await.unwrap(),
             br#"{"id":"resp_native","object":"response"}"#.as_slice()
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_native_responses_validates_route_against_payload_metadata() {
+        let client = authenticated_http_test_client("http://127.0.0.1:1/responses".to_string());
+        let ctx = http_test_context();
+        let full_route = client.conversation_route(false).await.unwrap();
+        let full_error = match client
+            .post_native_responses_bound(
+                &full_route,
+                &serde_json::json!({
+                    "model":"gpt-5.4",
+                    "input":"hello",
+                    "client_metadata":{"lite":"true"}
+                }),
+                &ctx,
+                false,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("Lite payload must not use a Full route"),
+        };
+        assert_eq!(full_error.status, 500);
+
+        let lite_route = client.conversation_route(true).await.unwrap();
+        let lite_error = match client
+            .post_native_responses_bound(
+                &lite_route,
+                &serde_json::json!({"model":"gpt-5.6-sol","input":"hello"}),
+                &ctx,
+                false,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("Full payload must not use a Lite route"),
+        };
+        assert_eq!(lite_error.status, 500);
+    }
+
+    #[tokio::test]
+    async fn bound_native_responses_preserves_route_identity_and_does_not_retry_401() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/v1/responses"
+        )));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "native-token-a".into(),
+            refresh: "native-refresh-a".into(),
+            account_id: Some("native-acct-a".into()),
+            expires: u64::MAX,
+        });
+        let route_a = client.conversation_route(false).await.unwrap();
+        let bound_a = route_a.bind_lane("native-raw-lane");
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "native-token-b".into(),
+            refresh: "native-refresh-b".into(),
+            account_id: Some("native-acct-b".into()),
+            expires: u64::MAX,
+        });
+
+        let (no_retry_tx, no_retry_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut first).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("authorization: Bearer native-token-a"));
+            assert!(request.contains("chatgpt-account-id: native-acct-a"));
+            assert!(request.contains(&format!("session_id: {bound_a}")));
+            assert!(request.contains(&format!("x-codex-window-id: {bound_a}:0")));
+            assert!(request.contains("x-client-request-id: native-route-a"));
+            assert!(!request.contains("session_id: native-raw-lane"));
+            first
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err(),
+                "the bound native request must not retry with rotated auth"
+            );
+            no_retry_tx.send(()).unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut second).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("authorization: Bearer native-token-b"));
+            assert!(request.contains("chatgpt-account-id: native-acct-b"));
+            assert!(request.contains("x-client-request-id: native-route-b"));
+            assert!(!request.contains("authorization: Bearer native-token-a"));
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut ctx_a = http_test_context();
+        ctx_a.req_id = "native-route-a".into();
+        ctx_a.session_id = Some(route_a.bind_lane("native-raw-lane"));
+        let response = client
+            .post_native_responses_bound(
+                &route_a,
+                &serde_json::json!({"model":"gpt-5.4","input":"hello"}),
+                &ctx_a,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        no_retry_rx.await.unwrap();
+
+        let route_b = client.conversation_route(false).await.unwrap();
+        let bound_b = route_b.bind_lane("native-raw-lane");
+        assert_ne!(ctx_a.session_id.as_deref(), Some(bound_b.as_str()));
+        let mut ctx_b = http_test_context();
+        ctx_b.req_id = "native-route-b".into();
+        ctx_b.session_id = Some(bound_b);
+        let response = client
+            .post_native_responses_bound(
+                &route_b,
+                &serde_json::json!({"model":"gpt-5.4","input":"hello"}),
+                &ctx_b,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
         server.await.unwrap();
     }
 

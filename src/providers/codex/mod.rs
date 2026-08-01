@@ -86,6 +86,13 @@ impl CodexProvider {
             client: Arc::new(CodexHttpClient::new()),
         }
     }
+
+    #[cfg(test)]
+    fn with_client(client: CodexHttpClient) -> Self {
+        Self {
+            client: Arc::new(client),
+        }
+    }
 }
 
 #[async_trait]
@@ -132,7 +139,8 @@ impl Provider for CodexProvider {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.model_resolved(&ctx.req_id, &resolved.model);
             }
-            let (search_request, query) = match search::build_search_request(
+            let lane_token = ctx.session_id.clone();
+            let (mut search_request, query) = match search::build_search_request(
                 &body,
                 &resolved.model,
                 ctx.session_id.as_deref(),
@@ -150,6 +158,11 @@ impl Provider for CodexProvider {
                 Ok(route) => route,
                 Err(error) => return map_codex_error_to_response(&error),
             };
+            if let Some(lane_token) = lane_token.as_deref() {
+                let bound_lane = route.bind_lane(lane_token);
+                search_request.id = bound_lane.clone();
+                ctx.session_id = Some(bound_lane);
+            }
             let log = create_logger("codex");
             let started_at = Instant::now();
             log.info(
@@ -1387,6 +1400,11 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::codex::auth::token_store::StoredAuth;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn upstream_sse(events: &[serde_json::Value]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1394,6 +1412,137 @@ mod tests {
             bytes.extend_from_slice(format!("data: {event}\n\n").as_bytes());
         }
         bytes
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return request;
+            }
+        }
+    }
+
+    fn standalone_search_request() -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.4",
+            "max_tokens": 1024,
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": "Perform a web search for the query: route binding"
+            }],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search"
+            }],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        }))
+        .unwrap()
+    }
+
+    fn search_context(req_id: &str, session_id: Option<&str>) -> RequestContext {
+        RequestContext {
+            req_id: req_id.to_string(),
+            session_id: session_id.map(str::to_string),
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_search_route_binds_stateful_identity_and_keeps_stateless_random() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                let header_end = request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap();
+                let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end + 4..]).unwrap();
+                captured.push((headers, body));
+                let response = br#"{"output":"search answer","results":[]}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(response).await.unwrap();
+            }
+            captured
+        });
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "search-token".into(),
+            refresh: String::new(),
+            account_id: Some("search-account".into()),
+            expires: u64::MAX,
+        });
+        let provider = CodexProvider::with_client(client);
+
+        for (req_id, lane) in [
+            ("stateful-search", Some("raw-search-lane")),
+            ("stateless-search", None),
+        ] {
+            let response = provider
+                .handle_messages(standalone_search_request(), search_context(req_id, lane))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+
+        let captured = server.await.unwrap();
+        let (stateful_headers, stateful_body) = &captured[0];
+        assert!(stateful_headers.starts_with("POST /v1/alpha/search HTTP/1.1"));
+        let bound_id = stateful_body["id"].as_str().unwrap();
+        assert_ne!(bound_id, "raw-search-lane");
+        assert!(!stateful_headers.contains("raw-search-lane"));
+        assert!(stateful_headers.contains(&format!("session_id: {bound_id}")));
+        assert!(stateful_headers.contains(&format!("x-codex-window-id: {bound_id}:0")));
+        assert!(stateful_headers.contains("x-client-request-id: stateful-search"));
+
+        let (stateless_headers, stateless_body) = &captured[1];
+        assert!(
+            stateless_body["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("search-"))
+        );
+        assert!(!stateless_headers.contains("\nsession_id: "));
+        assert!(!stateless_headers.contains("x-codex-window-id:"));
+        assert!(!stateless_headers.contains("x-client-request-id:"));
     }
 
     #[test]

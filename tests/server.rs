@@ -153,6 +153,24 @@ impl Provider for ScopeCaptureProvider {
         (StatusCode::OK, "ok").into_response()
     }
 
+    async fn generate_anthropic_stream_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> Result<Generation, ProviderError> {
+        self.contexts.lock().unwrap().push(ctx.session_id);
+        self.scopes.lock().unwrap().push(scope);
+        let model = body.model.unwrap_or_else(|| "kimi-k2.6".to_string());
+        let sse = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_scope\",\"model\":{model:?},\"usage\":{{\"input_tokens\":1}}}}}}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"ok\"}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        Ok(Generation {
+            body: GenerationBody::BufferedSse(sse.into()),
+            resolved_model: model,
+        })
+    }
+
     async fn generate_anthropic_stream(
         &self,
         _body: MessagesRequest,
@@ -338,6 +356,98 @@ async fn messages_ingress_preserves_agent_identity_and_auxiliary_purpose() {
         *contexts.lock().unwrap(),
         vec![
             Some("shared-session".to_string()),
+            Some("shared-session".to_string()),
+            None,
+            None,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn openai_ingress_restores_legacy_identity_without_bypassing_claude_validation() {
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(Registry::from_providers(
+        AliasProvider::Kimi,
+        vec![Arc::new(ScopeCaptureProvider {
+            scopes: scopes.clone(),
+            contexts: contexts.clone(),
+        }) as Arc<dyn Provider>],
+    ));
+    let app = app_with_options(registry, None, true);
+
+    for (endpoint, body) in [
+        ("/v1/responses", r#"{"model":"kimi-k2.6","input":"hello"}"#),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}]}"#,
+        ),
+    ] {
+        for headers in [
+            vec![("session_id", "legacy-session")],
+            vec![("x-client-request-id", "legacy-request")],
+            vec![
+                ("x-claude-code-session-id", "shared-session"),
+                ("x-claude-code-agent-id", "child-agent"),
+                ("session_id", "ignored-legacy"),
+            ],
+            vec![
+                ("x-claude-code-agent-id", "orphan-agent"),
+                ("session_id", "must-not-fallback"),
+            ],
+            vec![
+                ("x-claude-code-session-id", "duplicate-one"),
+                ("x-claude-code-session-id", "duplicate-two"),
+                ("x-client-request-id", "must-not-fallback-either"),
+            ],
+        ] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri(endpoint)
+                .header("content-type", "application/json");
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(body_string(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "endpoint={endpoint}");
+        }
+    }
+
+    let scopes = scopes.lock().unwrap();
+    assert_eq!(scopes.len(), 10);
+    for offset in [0, 5] {
+        assert!(matches!(
+            scopes[offset].lane(),
+            Some(AgentLaneKey::Main { session_id }) if session_id == "legacy-session"
+        ));
+        assert!(matches!(
+            scopes[offset + 1].lane(),
+            Some(AgentLaneKey::Main { session_id }) if session_id == "legacy-request"
+        ));
+        assert!(matches!(
+            scopes[offset + 2].lane(),
+            Some(AgentLaneKey::Agent {
+                session_id,
+                agent_id,
+            }) if session_id == "shared-session" && agent_id == "child-agent"
+        ));
+        assert!(scopes[offset + 3].lane().is_none());
+        assert!(scopes[offset + 4].lane().is_none());
+    }
+    assert_eq!(
+        *contexts.lock().unwrap(),
+        vec![
+            Some("legacy-session".to_string()),
+            Some("legacy-request".to_string()),
+            Some("shared-session".to_string()),
+            None,
+            None,
+            Some("legacy-session".to_string()),
+            Some("legacy-request".to_string()),
             Some("shared-session".to_string()),
             None,
             None,

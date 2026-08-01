@@ -41,14 +41,27 @@ impl ChatCompletionsBackend {
         }
     }
 
-    pub async fn handle(&self, request: TranslatedRequest, ctx: RequestContext) -> Response {
+    pub async fn handle(&self, request: TranslatedRequest, mut ctx: RequestContext) -> Response {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &request.model);
+        }
+        let route = match self
+            .client
+            .conversation_route(request.use_responses_lite)
+            .await
+        {
+            Ok(route) => route,
+            Err(error) => return codex_error_response(error),
+        };
+        if let Some(lane_token) = ctx.session_id.as_deref() {
+            ctx.session_id = Some(route.bind_lane(lane_token));
+        }
+        if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
         let upstream = match self
             .client
-            .post_native_responses(&request.upstream, &ctx, request.use_responses_lite, true)
+            .post_native_responses_bound(&route, &request.upstream, &ctx, true)
             .await
         {
             Ok(upstream) => upstream,
@@ -315,7 +328,10 @@ mod tests {
 
     async fn mock_backend(
         sse_body: &'static [u8],
-    ) -> (ChatCompletionsBackend, tokio::task::JoinHandle<Value>) {
+    ) -> (
+        ChatCompletionsBackend,
+        tokio::task::JoinHandle<(Value, String)>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -351,6 +367,7 @@ mod tests {
                 .windows(4)
                 .position(|window| window == b"\r\n\r\n")
                 .unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
             let body: Value = serde_json::from_slice(&request[header_end + 4..]).unwrap();
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nx-request-id: upstream-1\r\nconnection: close\r\n\r\n",
@@ -358,7 +375,7 @@ mod tests {
             );
             socket.write_all(response.as_bytes()).await.unwrap();
             socket.write_all(sse_body).await.unwrap();
-            body
+            (body, headers)
         });
         let client = CodexHttpClient::new_for_test(
             reqwest::Client::new(),
@@ -403,13 +420,20 @@ mod tests {
         );
         assert_eq!(value["usage"]["total_tokens"], 12);
 
-        let upstream = server.await.unwrap();
+        let (upstream, upstream_headers) = server.await.unwrap();
         assert_eq!(upstream["store"], false);
         assert_eq!(upstream["stream"], true);
         assert_eq!(upstream["input"][0]["role"], "developer");
         assert_eq!(upstream["reasoning"]["effort"], "low");
         assert_eq!(upstream["reasoning"]["context"], "all_turns");
         assert_eq!(upstream["text"]["format"]["name"], "answer");
+        let bound_session = upstream_headers
+            .lines()
+            .find_map(|line| line.strip_prefix("session_id: "))
+            .unwrap();
+        assert_ne!(bound_session, "session");
+        assert!(upstream_headers.contains(&format!("x-codex-window-id: {bound_session}:0")));
+        assert!(upstream_headers.contains("x-client-request-id: chat-test"));
         let snapshot = monitor.snapshot();
         assert_eq!(snapshot.active[0].input_tokens, Some(8));
         assert_eq!(snapshot.active[0].output_tokens, Some(4));

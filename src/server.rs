@@ -21,7 +21,10 @@ use crate::{
         },
     },
     registry::{Registry, normalize_incoming_model},
-    request_identity::{RequestPurpose, RequestScope},
+    request_identity::{
+        CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, CLAUDE_SESSION_HEADER, RequestPurpose,
+        RequestScope,
+    },
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
@@ -636,7 +639,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     );
 
     let session_id = native_session_id(&headers);
-    let request_scope = RequestScope::from_headers(&headers, RequestPurpose::Conversation);
+    let request_scope = openai_request_scope(&headers, session_id.as_deref());
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Responses);
     }
@@ -787,7 +790,11 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     }
     let context = RequestContext {
         req_id: req_id.clone(),
-        session_id: request_scope.conversational_lane().and(session_id),
+        session_id: openai_upstream_session_id(
+            provider.name(),
+            &request_scope,
+            session_id.as_deref(),
+        ),
         session_seq: current.map(|session| session.seq),
         provider: provider.name().to_string(),
         traffic: traffic.clone(),
@@ -868,7 +875,7 @@ async fn handler_chat_completions(
     );
 
     let session_id = native_session_id(&headers);
-    let request_scope = RequestScope::from_headers(&headers, RequestPurpose::Conversation);
+    let request_scope = openai_request_scope(&headers, session_id.as_deref());
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(
             &req_id,
@@ -1032,7 +1039,11 @@ async fn handler_chat_completions(
     }
     let context = RequestContext {
         req_id: req_id.clone(),
-        session_id: request_scope.conversational_lane().and(session_id),
+        session_id: openai_upstream_session_id(
+            provider.name(),
+            &request_scope,
+            session_id.as_deref(),
+        ),
         session_seq: current.map(|session| session.seq),
         provider: provider.name().to_string(),
         traffic: traffic.clone(),
@@ -1089,6 +1100,36 @@ async fn handler_chat_completions(
         started_at,
     );
     monitor_response_body(response, request_guard)
+}
+
+fn openai_request_scope(headers: &http::HeaderMap, session_id: Option<&str>) -> RequestScope {
+    let has_claude_identity = [
+        CLAUDE_SESSION_HEADER,
+        CLAUDE_AGENT_HEADER,
+        CLAUDE_PARENT_AGENT_HEADER,
+    ]
+    .into_iter()
+    .any(|name| headers.contains_key(name));
+    if has_claude_identity {
+        RequestScope::from_headers(headers, RequestPurpose::Conversation)
+    } else {
+        RequestScope::legacy(session_id, RequestPurpose::Conversation)
+    }
+}
+
+fn openai_upstream_session_id(
+    provider: &str,
+    scope: &RequestScope,
+    raw_session_id: Option<&str>,
+) -> Option<String> {
+    if provider == "codex" {
+        scope.lane_token("codex-conversation")
+    } else {
+        scope
+            .conversational_lane()
+            .and(raw_session_id)
+            .map(str::to_string)
+    }
 }
 
 fn native_session_id(headers: &http::HeaderMap) -> Option<String> {
@@ -1961,8 +2002,9 @@ fn _unused(session_state: Option<&SessionState>) {
 #[cfg(test)]
 mod auto_review_tests {
     use super::{
-        apply_auto_review_effort, apply_auto_review_model, headers_to_record,
-        is_claude_auto_review_request,
+        CLAUDE_AGENT_HEADER, CLAUDE_SESSION_HEADER, apply_auto_review_effort,
+        apply_auto_review_model, headers_to_record, is_claude_auto_review_request,
+        openai_request_scope, openai_upstream_session_id,
     };
     use crate::anthropic::schema::MessagesRequest;
     use serde_json::{Value, json};
@@ -2165,6 +2207,30 @@ mod auto_review_tests {
             Some("low")
         ));
         assert!(count_tokens.extra.get("output_config").is_none());
+    }
+
+    #[test]
+    fn native_codex_context_uses_distinct_opaque_agent_lanes() {
+        let mut agent_a = http::HeaderMap::new();
+        agent_a.insert(CLAUDE_SESSION_HEADER, "shared-session".parse().unwrap());
+        agent_a.insert(CLAUDE_AGENT_HEADER, "agent-a".parse().unwrap());
+        let mut agent_b = agent_a.clone();
+        agent_b.insert(CLAUDE_AGENT_HEADER, "agent-b".parse().unwrap());
+
+        let scope_a = openai_request_scope(&agent_a, Some("shared-session"));
+        let scope_b = openai_request_scope(&agent_b, Some("shared-session"));
+        let codex_a =
+            openai_upstream_session_id("codex", &scope_a, Some("shared-session")).unwrap();
+        let codex_b =
+            openai_upstream_session_id("codex", &scope_b, Some("shared-session")).unwrap();
+        assert_ne!(codex_a, codex_b);
+        assert!(!codex_a.contains("shared-session"));
+        assert!(!codex_a.contains("agent-a"));
+        assert!(!codex_b.contains("agent-b"));
+        assert_eq!(
+            openai_upstream_session_id("kimi", &scope_a, Some("shared-session")).as_deref(),
+            Some("shared-session")
+        );
     }
 
     #[test]
