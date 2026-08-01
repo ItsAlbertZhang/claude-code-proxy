@@ -400,6 +400,10 @@ async fn openai_ingress_restores_legacy_identity_without_bypassing_claude_valida
                 ("x-claude-code-session-id", "duplicate-two"),
                 ("x-client-request-id", "must-not-fallback-either"),
             ],
+            vec![
+                ("x-claude-code-session-id", "coalesced-one,coalesced-two"),
+                ("session_id", "must-not-fallback-from-coalesced"),
+            ],
         ] {
             let mut request = Request::builder()
                 .method(Method::POST)
@@ -418,8 +422,8 @@ async fn openai_ingress_restores_legacy_identity_without_bypassing_claude_valida
     }
 
     let scopes = scopes.lock().unwrap();
-    assert_eq!(scopes.len(), 10);
-    for offset in [0, 5] {
+    assert_eq!(scopes.len(), 12);
+    for offset in [0, 6] {
         assert!(matches!(
             scopes[offset].lane(),
             Some(AgentLaneKey::Main { session_id }) if session_id == "legacy-session"
@@ -437,6 +441,8 @@ async fn openai_ingress_restores_legacy_identity_without_bypassing_claude_valida
         ));
         assert!(scopes[offset + 3].lane().is_none());
         assert!(scopes[offset + 4].lane().is_none());
+        assert!(scopes[offset + 5].identity.session_id().is_none());
+        assert!(!scopes[offset + 5].identity.is_stateful());
     }
     assert_eq!(
         *contexts.lock().unwrap(),
@@ -446,9 +452,11 @@ async fn openai_ingress_restores_legacy_identity_without_bypassing_claude_valida
             Some("shared-session".to_string()),
             None,
             None,
+            None,
             Some("legacy-session".to_string()),
             Some("legacy-request".to_string()),
             Some("shared-session".to_string()),
+            None,
             None,
             None,
         ]

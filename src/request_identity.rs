@@ -240,6 +240,7 @@ fn read_identity_header<'a>(headers: &'a HeaderMap, name: &str) -> ParsedHeader<
     let value = value.trim();
     if value.is_empty()
         || value.len() > MAX_IDENTITY_LEN
+        || value.contains(',')
         || !value.bytes().all(|byte| byte.is_ascii_graphic())
     {
         return ParsedHeader::Invalid;
@@ -275,6 +276,10 @@ mod tests {
             (CLAUDE_AGENT_HEADER, "agent-b"),
         ]));
 
+        assert!(matches!(
+            main.lane(),
+            Some(AgentLaneKey::Main { session_id }) if session_id == "session-a"
+        ));
         assert_ne!(main.lane(), agent.lane());
         assert_ne!(agent.lane(), sibling.lane());
         assert_eq!(agent.agent_id(), Some("agent-a"));
@@ -296,19 +301,61 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_identity_falls_back_to_stateless() {
+    fn empty_identity_is_stateless() {
+        let identity = RequestIdentity::from_headers(&HeaderMap::new());
+
+        assert!(identity.lane().is_none());
+    }
+
+    #[test]
+    fn ambiguous_identity_tuples_are_stateless() {
         let missing_session =
             RequestIdentity::from_headers(&headers(&[(CLAUDE_AGENT_HEADER, "agent-a")]));
         let parent_without_agent = RequestIdentity::from_headers(&headers(&[
             (CLAUDE_SESSION_HEADER, "session-a"),
             (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
         ]));
-        let whitespace =
-            RequestIdentity::from_headers(&headers(&[(CLAUDE_SESSION_HEADER, "session a")]));
 
         assert!(missing_session.lane().is_none());
         assert!(parent_without_agent.lane().is_none());
-        assert!(whitespace.lane().is_none());
+    }
+
+    #[test]
+    fn malformed_identity_headers_are_stateless() {
+        let identity =
+            RequestIdentity::from_headers(&headers(&[(CLAUDE_SESSION_HEADER, "session a")]));
+
+        assert!(identity.session_id().is_none());
+        assert!(identity.lane().is_none());
+    }
+
+    #[test]
+    fn comma_in_identity_header_is_rejected() {
+        for value in ["first,second", "first,", ",second", "first,first"] {
+            let session = RequestIdentity::from_headers(&headers(&[
+                (CLAUDE_SESSION_HEADER, value),
+                (CLAUDE_AGENT_HEADER, "agent-child"),
+                (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+            ]));
+            assert!(session.session_id().is_none(), "value={value}");
+            assert!(session.lane().is_none(), "value={value}");
+
+            let agent = RequestIdentity::from_headers(&headers(&[
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_AGENT_HEADER, value),
+                (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+            ]));
+            assert!(agent.agent_id().is_none(), "value={value}");
+            assert!(agent.lane().is_none(), "value={value}");
+
+            let parent = RequestIdentity::from_headers(&headers(&[
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_AGENT_HEADER, "agent-child"),
+                (CLAUDE_PARENT_AGENT_HEADER, value),
+            ]));
+            assert!(parent.parent_agent_id().is_none(), "value={value}");
+            assert!(parent.lane().is_none(), "value={value}");
+        }
     }
 
     #[test]
