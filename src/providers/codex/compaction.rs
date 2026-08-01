@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::sse::parse_sse_events;
 use crate::provider::RequestContext;
-use crate::providers::codex::client::{CodexError, CodexHttpClient};
+use crate::providers::codex::client::{CodexConversationRoute, CodexError, CodexHttpClient};
 
 use super::translate::request::{
     ResponsesContentPart, ResponsesInputItem, ResponsesRequest, is_compact_message_text,
@@ -34,38 +34,145 @@ impl std::fmt::Display for CompactionError {
 }
 
 enum CompactionPhase {
-    Preparing,
-    Unconfirmed,
-    Anchored { portable_summary: String },
+    PendingRemote,
+    PendingAnchor {
+        native_history: Vec<ResponsesInputItem>,
+    },
+    Anchored {
+        native_history: Vec<ResponsesInputItem>,
+        portable_summary: String,
+        active_replays: HashSet<String>,
+    },
 }
 
 struct CompactionState {
-    attempt: CompactionAttempt,
+    lane_token: String,
+    operation_id: String,
+    start_order: u64,
+    revision: u64,
     model: String,
-    native_history: Vec<ResponsesInputItem>,
     phase: CompactionPhase,
     updated_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompactionAttempt(u64);
+enum CompactionLeaseKind {
+    Build,
+    Replay,
+}
+
+#[derive(Debug)]
+struct CompactionLeaseCleanup {
+    session_id: String,
+    operation_id: String,
+    revision: u64,
+    kind: CompactionLeaseKind,
+    armed: AtomicBool,
+}
+
+impl Drop for CompactionLeaseCleanup {
+    fn drop(&mut self) {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut guard = REGISTRY.lock().unwrap();
+        if let Some(registry) = guard.as_mut() {
+            cleanup_lease_attempt(
+                registry,
+                &self.session_id,
+                &self.operation_id,
+                self.revision,
+                self.kind,
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactionLease {
+    session_id: String,
+    operation_id: String,
+    revision: u64,
+    kind: CompactionLeaseKind,
+    cleanup: Arc<CompactionLeaseCleanup>,
+}
+
+impl PartialEq for CompactionLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.operation_id == other.operation_id
+            && self.revision == other.revision
+            && self.kind == other.kind
+    }
+}
+
+impl Eq for CompactionLease {}
+
+impl CompactionLease {
+    fn new(session_id: &str, operation_id: &str, revision: u64, kind: CompactionLeaseKind) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            operation_id: operation_id.to_string(),
+            revision,
+            kind,
+            cleanup: Arc::new(CompactionLeaseCleanup {
+                session_id: session_id.to_string(),
+                operation_id: operation_id.to_string(),
+                revision,
+                kind,
+                armed: AtomicBool::new(true),
+            }),
+        }
+    }
+
+    fn disarm_cleanup(&self) {
+        self.cleanup.armed.store(false, Ordering::Release);
+    }
+}
 
 pub struct CompactionReplay {
     pub request: ResponsesRequest,
-    pub attempt: CompactionAttempt,
+    pub lease: CompactionLease,
 }
 
 #[derive(Default)]
 struct CompactionRegistry {
     states: HashMap<String, CompactionState>,
+    pending_starts: HashMap<(String, String), u64>,
+    lane_start_orders: HashMap<String, u64>,
+    next_revision: u64,
     total_bytes: usize,
 }
 
+#[derive(Debug)]
+pub struct CompactionStartPermit {
+    lane_token: String,
+    operation_id: String,
+    start_order: u64,
+    active: bool,
+}
+
+impl Drop for CompactionStartPermit {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut guard = REGISTRY.lock().unwrap();
+        if let Some(registry) = guard.as_mut() {
+            let key = (self.lane_token.clone(), self.operation_id.clone());
+            if registry.pending_starts.get(&key) == Some(&self.start_order) {
+                registry.pending_starts.remove(&key);
+            }
+            cleanup_lane_start_order(registry, &self.lane_token);
+        }
+    }
+}
+
 static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
-static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub async fn request_compaction(
     client: &CodexHttpClient,
+    route: &CodexConversationRoute,
     request: &ResponsesRequest,
     ctx: &RequestContext,
 ) -> Result<Vec<ResponsesInputItem>, CompactionError> {
@@ -83,34 +190,169 @@ pub async fn request_compaction(
     compaction_request.include = Some(vec!["reasoning.encrypted_content".to_string()]);
 
     let response = client
-        .post_codex(&compaction_request, ctx, None)
+        .post_codex_bound(route, &compaction_request, ctx, None)
         .await
         .map_err(CompactionError::Upstream)?;
     let compaction = parse_compaction_response(&response.body)?;
     Ok(build_compacted_history(&conversation, compaction))
 }
 
-pub fn begin_compaction(session_id: &str, model: &str) -> CompactionAttempt {
-    let attempt = CompactionAttempt(NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed));
-    let state = CompactionState {
-        attempt,
-        model: model.to_string(),
-        native_history: Vec::new(),
-        phase: CompactionPhase::Preparing,
-        updated_at: now_ms(),
-    };
-    let now = state.updated_at;
+pub fn reserve_compaction_start(
+    lane_token: Option<&str>,
+    operation_id: &str,
+) -> Option<CompactionStartPermit> {
+    let lane_token = lane_token?;
+    let key = (lane_token.to_string(), operation_id.to_string());
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.get_or_insert_with(CompactionRegistry::default);
+    if registry.pending_starts.contains_key(&key) {
+        return None;
+    }
+    registry.next_revision = registry.next_revision.wrapping_add(1).max(1);
+    let start_order = registry.next_revision;
+    registry.pending_starts.insert(key, start_order);
+    registry
+        .lane_start_orders
+        .insert(lane_token.to_string(), start_order);
+    Some(CompactionStartPermit {
+        lane_token: lane_token.to_string(),
+        operation_id: operation_id.to_string(),
+        start_order,
+        active: true,
+    })
+}
+
+pub fn begin_compaction(
+    session_id: Option<&str>,
+    model: &str,
+    operation_id: &str,
+) -> Option<CompactionLease> {
+    begin_compaction_for_lane(session_id, session_id, model, operation_id)
+}
+
+pub fn begin_compaction_for_lane(
+    session_id: Option<&str>,
+    lane_token: Option<&str>,
+    model: &str,
+    operation_id: &str,
+) -> Option<CompactionLease> {
+    let session_id = session_id?;
+    let lane_token = lane_token?;
+    let now = now_ms();
+    let mut guard = REGISTRY.lock().unwrap();
+    let registry = guard.get_or_insert_with(CompactionRegistry::default);
+    registry.next_revision = registry.next_revision.wrapping_add(1).max(1);
+    let start_order = registry.next_revision;
+    begin_compaction_locked(
+        registry,
+        session_id,
+        lane_token,
+        model,
+        operation_id,
+        start_order,
+        now,
+    )
+}
+
+pub fn begin_compaction_with_permit(
+    session_id: Option<&str>,
+    model: &str,
+    mut permit: CompactionStartPermit,
+) -> Option<CompactionLease> {
+    let session_id = session_id?;
+    let now = now_ms();
+    let mut guard = REGISTRY.lock().unwrap();
+    let registry = guard.get_or_insert_with(CompactionRegistry::default);
+    let key = (permit.lane_token.clone(), permit.operation_id.clone());
+    if registry.pending_starts.get(&key) != Some(&permit.start_order) {
+        permit.active = false;
+        return None;
+    }
+    registry.pending_starts.remove(&key);
+    permit.active = false;
+    let lease = begin_compaction_locked(
+        registry,
+        session_id,
+        &permit.lane_token,
+        model,
+        &permit.operation_id,
+        permit.start_order,
+        now,
+    );
+    cleanup_lane_start_order(registry, &permit.lane_token);
+    lease
+}
+
+fn begin_compaction_locked(
+    registry: &mut CompactionRegistry,
+    session_id: &str,
+    lane_token: &str,
+    model: &str,
+    operation_id: &str,
+    start_order: u64,
+    now: u64,
+) -> Option<CompactionLease> {
+    if registry
+        .lane_start_orders
+        .get(lane_token)
+        .is_some_and(|latest| *latest > start_order)
+    {
+        cleanup_lane_start_order(registry, lane_token);
+        return None;
+    }
+    registry
+        .lane_start_orders
+        .insert(lane_token.to_string(), start_order);
     evict_states(registry, now);
-    registry.states.insert(session_id.to_string(), state);
+    if registry
+        .states
+        .get(session_id)
+        .is_some_and(|state| state.start_order >= start_order)
+    {
+        cleanup_lane_start_order(registry, lane_token);
+        return None;
+    }
+    registry.next_revision = registry.next_revision.wrapping_add(1).max(1);
+    let lease = CompactionLease::new(
+        session_id,
+        operation_id,
+        registry.next_revision,
+        CompactionLeaseKind::Build,
+    );
+    let replaced = registry.states.insert(
+        session_id.to_string(),
+        CompactionState {
+            lane_token: lane_token.to_string(),
+            operation_id: operation_id.to_string(),
+            start_order,
+            revision: lease.revision,
+            model: model.to_string(),
+            phase: CompactionPhase::PendingRemote,
+            updated_at: now,
+        },
+    );
+    registry
+        .lane_start_orders
+        .insert(lane_token.to_string(), start_order);
+    if let Some(replaced) = replaced
+        && replaced.lane_token != lane_token
+    {
+        cleanup_lane_start_order(registry, &replaced.lane_token);
+    }
     evict_states(registry, now);
-    attempt
+    if registry.states.get(session_id).is_some_and(|state| {
+        state.revision == lease.revision && state.operation_id == lease.operation_id
+    }) {
+        Some(lease)
+    } else {
+        lease.disarm_cleanup();
+        None
+    }
 }
 
 pub fn store_compaction(
-    session_id: &str,
-    attempt: CompactionAttempt,
+    lease: &CompactionLease,
+    model: &str,
     native_history: Vec<ResponsesInputItem>,
 ) -> bool {
     let now = now_ms();
@@ -119,104 +361,141 @@ pub fn store_compaction(
         return false;
     };
     evict_states(registry, now);
-    let Some(state) = registry.states.get_mut(session_id) else {
+    let Some(state) = registry.states.get_mut(&lease.session_id) else {
         return false;
     };
-    if state.attempt != attempt || !matches!(state.phase, CompactionPhase::Preparing) {
+    if !build_lease_matches(state, lease)
+        || state.model != model
+        || !matches!(state.phase, CompactionPhase::PendingRemote)
+    {
         return false;
     }
-    state.native_history = native_history;
-    state.phase = CompactionPhase::Unconfirmed;
+    state.phase = CompactionPhase::PendingAnchor { native_history };
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+    if state_size(&lease.session_id, state) > MAX_STATE_BYTES {
+        remove_if_current_build(registry, lease);
         return false;
     }
     evict_states(registry, now);
     registry
         .states
-        .get(session_id)
-        .is_some_and(|state| state.attempt == attempt)
+        .get(&lease.session_id)
+        .is_some_and(|state| build_lease_matches(state, lease))
 }
 
 pub fn activate_compaction(
-    session_id: Option<&str>,
-    attempt: Option<CompactionAttempt>,
+    lease: Option<&CompactionLease>,
     model: &str,
     output: &[ResponsesInputItem],
 ) -> bool {
-    let (Some(session_id), Some(attempt)) = (session_id, attempt) else {
+    let Some(lease) = lease else {
         return false;
     };
-    let Some(portable_summary) = portable_summary_text(output) else {
-        abort_compaction_attempt(Some(session_id), Some(attempt));
-        return false;
-    };
-
+    lease.disarm_cleanup();
     let now = now_ms();
-    let mut guard = REGISTRY.lock().unwrap();
-    let Some(registry) = guard.as_mut() else {
-        return false;
-    };
-    evict_states(registry, now);
-    let Some(state) = registry.states.get_mut(session_id) else {
-        return false;
-    };
-    if state.attempt != attempt {
-        return false;
+
+    match lease.kind {
+        CompactionLeaseKind::Build => {
+            let Some(portable_summary) = portable_summary_text(output) else {
+                abort_compaction_attempt(Some(lease));
+                return false;
+            };
+            let mut guard = REGISTRY.lock().unwrap();
+            let Some(registry) = guard.as_mut() else {
+                return false;
+            };
+            evict_states(registry, now);
+            registry.next_revision = registry.next_revision.wrapping_add(1).max(1);
+            let anchored_revision = registry.next_revision;
+            let Some(state) = registry.states.get_mut(&lease.session_id) else {
+                return false;
+            };
+            if !build_lease_matches(state, lease)
+                || state.model != model
+                || !matches!(state.phase, CompactionPhase::PendingAnchor { .. })
+            {
+                return false;
+            }
+            let CompactionPhase::PendingAnchor { native_history } =
+                std::mem::replace(&mut state.phase, CompactionPhase::PendingRemote)
+            else {
+                unreachable!("phase checked above")
+            };
+            state.phase = CompactionPhase::Anchored {
+                native_history,
+                portable_summary,
+                active_replays: HashSet::new(),
+            };
+            state.revision = anchored_revision;
+            state.updated_at = now;
+            if state_size(&lease.session_id, state) > MAX_STATE_BYTES {
+                remove_compaction_state(registry, &lease.session_id);
+                return false;
+            }
+            evict_states(registry, now);
+            registry
+                .states
+                .get(&lease.session_id)
+                .is_some_and(|state| state.revision == anchored_revision)
+        }
+        CompactionLeaseKind::Replay => {
+            let mut guard = REGISTRY.lock().unwrap();
+            let Some(registry) = guard.as_mut() else {
+                return false;
+            };
+            evict_states(registry, now);
+            registry.next_revision = registry.next_revision.wrapping_add(1).max(1);
+            let settled_revision = registry.next_revision;
+            let Some(state) = registry.states.get_mut(&lease.session_id) else {
+                return false;
+            };
+            if state.revision != lease.revision || state.model != model {
+                return false;
+            }
+            let CompactionPhase::Anchored { active_replays, .. } = &mut state.phase else {
+                return false;
+            };
+            if !active_replays.remove(&lease.operation_id) {
+                return false;
+            }
+            active_replays.clear();
+            state.revision = settled_revision;
+            state.updated_at = now;
+            true
+        }
     }
-    if state.model != model || !matches!(state.phase, CompactionPhase::Unconfirmed) {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return false;
-    }
-    state.phase = CompactionPhase::Anchored { portable_summary };
-    state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return false;
-    }
-    evict_states(registry, now);
-    registry.states.contains_key(session_id)
 }
 
 pub fn apply_compaction_replay(
     session_id: Option<&str>,
     request: &ResponsesRequest,
+    operation_id: &str,
 ) -> Option<CompactionReplay> {
     let session_id = session_id?;
+    if operation_id.is_empty() {
+        return None;
+    }
     let now = now_ms();
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.as_mut()?;
     evict_states(registry, now);
     let state = registry.states.get_mut(session_id)?;
-    if !matches!(state.phase, CompactionPhase::Anchored { .. }) {
-        return None;
-    }
     if state.model != request.model {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
         return None;
     }
-    let CompactionPhase::Anchored { portable_summary } = &state.phase else {
+    let CompactionPhase::Anchored {
+        native_history,
+        portable_summary,
+        active_replays,
+    } = &mut state.phase
+    else {
         return None;
     };
 
     let (envelope, conversation) = split_input_envelope(&request.input);
     let summary_item = conversation.first()?;
-    let Some(text) = message_text(summary_item) else {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return None;
-    };
-    if text.match_indices(portable_summary).count() != 1 {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return None;
-    }
-    if conversation.len() == 1 {
+    let text = message_text(summary_item)?;
+    if text.match_indices(portable_summary.as_str()).count() != 1 || conversation.len() == 1 {
         return None;
     }
 
@@ -224,45 +503,187 @@ pub fn apply_compaction_replay(
     replay.input = envelope
         .iter()
         .cloned()
-        .chain(state.native_history.iter().cloned())
+        .chain(native_history.iter().cloned())
         .chain(conversation[1..].iter().cloned())
         .collect();
-    if serialized_size(&replay.input) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+    if serialized_size(&replay.input) > MAX_STATE_BYTES
+        || !active_replays.insert(operation_id.to_string())
+    {
+        return None;
+    }
+    if state_size(session_id, state) > MAX_STATE_BYTES {
+        if let CompactionPhase::Anchored { active_replays, .. } = &mut state.phase {
+            active_replays.remove(operation_id);
+        }
         return None;
     }
     state.updated_at = now;
     Some(CompactionReplay {
         request: replay,
-        attempt: state.attempt,
+        lease: CompactionLease::new(
+            session_id,
+            operation_id,
+            state.revision,
+            CompactionLeaseKind::Replay,
+        ),
     })
 }
 
-pub fn abort_compaction_attempt(session_id: Option<&str>, attempt: Option<CompactionAttempt>) {
-    let (Some(session_id), Some(attempt)) = (session_id, attempt) else {
+pub fn abort_compaction_attempt(lease: Option<&CompactionLease>) {
+    let Some(lease) = lease else {
         return;
     };
+    lease.disarm_cleanup();
     let mut guard = REGISTRY.lock().unwrap();
     let Some(registry) = guard.as_mut() else {
         return;
     };
-    if registry
-        .states
-        .get(session_id)
-        .is_some_and(|state| state.attempt == attempt)
-    {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-    }
+    cleanup_lease_attempt(
+        registry,
+        &lease.session_id,
+        &lease.operation_id,
+        lease.revision,
+        lease.kind,
+    );
+}
+
+pub fn request_contains_compaction(request: &ResponsesRequest) -> bool {
+    request
+        .input
+        .iter()
+        .any(|item| matches!(item, ResponsesInputItem::Compaction { .. }))
 }
 
 pub fn clear_compaction(session_id: &str) {
     let mut guard = REGISTRY.lock().unwrap();
     if let Some(registry) = guard.as_mut() {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+        remove_compaction_state(registry, session_id);
     }
+}
+
+pub fn clear_compactions_for_lane(lane_token: &str) {
+    let mut guard = REGISTRY.lock().unwrap();
+    let registry = guard.get_or_insert_with(CompactionRegistry::default);
+    registry
+        .states
+        .retain(|_, state| state.lane_token != lane_token);
+    registry
+        .pending_starts
+        .retain(|(pending_lane, _), _| pending_lane != lane_token);
+    registry.lane_start_orders.remove(lane_token);
+    update_total_bytes(registry);
+}
+
+fn cleanup_lease_attempt(
+    registry: &mut CompactionRegistry,
+    session_id: &str,
+    operation_id: &str,
+    revision: u64,
+    kind: CompactionLeaseKind,
+) {
+    match kind {
+        CompactionLeaseKind::Build => {
+            remove_if_current_build_identity(registry, session_id, operation_id, revision);
+        }
+        CompactionLeaseKind::Replay => {
+            let remove_state = {
+                let Some(state) = registry.states.get_mut(session_id) else {
+                    return;
+                };
+                if state.revision != revision {
+                    return;
+                }
+                let CompactionPhase::Anchored { active_replays, .. } = &mut state.phase else {
+                    return;
+                };
+                if !active_replays.remove(operation_id) {
+                    return;
+                }
+                if active_replays.is_empty() {
+                    true
+                } else {
+                    state.updated_at = now_ms();
+                    false
+                }
+            };
+            if remove_state {
+                remove_compaction_state(registry, session_id);
+            } else {
+                update_total_bytes(registry);
+            }
+        }
+    }
+}
+
+fn build_identity_matches(state: &CompactionState, operation_id: &str, revision: u64) -> bool {
+    state.operation_id == operation_id && state.revision == revision
+}
+
+fn build_lease_matches(state: &CompactionState, lease: &CompactionLease) -> bool {
+    lease.kind == CompactionLeaseKind::Build
+        && build_identity_matches(state, &lease.operation_id, lease.revision)
+}
+
+fn remove_if_current_build(registry: &mut CompactionRegistry, lease: &CompactionLease) -> bool {
+    remove_if_current_build_identity(
+        registry,
+        &lease.session_id,
+        &lease.operation_id,
+        lease.revision,
+    )
+}
+
+fn remove_if_current_build_identity(
+    registry: &mut CompactionRegistry,
+    session_id: &str,
+    operation_id: &str,
+    revision: u64,
+) -> bool {
+    let current = registry
+        .states
+        .get(session_id)
+        .is_some_and(|state| build_identity_matches(state, operation_id, revision));
+    current && remove_compaction_state(registry, session_id)
+}
+
+fn remove_compaction_state(registry: &mut CompactionRegistry, session_id: &str) -> bool {
+    let Some(state) = registry.states.remove(session_id) else {
+        return false;
+    };
+    update_total_bytes(registry);
+    cleanup_lane_start_order(registry, &state.lane_token);
+    true
+}
+
+fn cleanup_lane_start_order(registry: &mut CompactionRegistry, lane_token: &str) {
+    let lane_is_active = registry
+        .states
+        .values()
+        .any(|state| state.lane_token == lane_token)
+        || registry
+            .pending_starts
+            .keys()
+            .any(|(pending_lane, _)| pending_lane == lane_token);
+    if !lane_is_active {
+        registry.lane_start_orders.remove(lane_token);
+    }
+}
+
+fn cleanup_lane_start_orders(registry: &mut CompactionRegistry) {
+    let active_lanes = registry
+        .states
+        .values()
+        .map(|state| state.lane_token.clone())
+        .chain(
+            registry
+                .pending_starts
+                .keys()
+                .map(|(lane_token, _)| lane_token.clone()),
+        )
+        .collect::<HashSet<_>>();
+    registry
+        .lane_start_orders
+        .retain(|lane_token, _| active_lanes.contains(lane_token));
 }
 
 fn split_input_envelope(
@@ -506,11 +927,24 @@ fn serialized_size(items: &[ResponsesInputItem]) -> usize {
 }
 
 fn state_size(session_id: &str, state: &CompactionState) -> usize {
-    let summary_len = match &state.phase {
-        CompactionPhase::Preparing | CompactionPhase::Unconfirmed => 0,
-        CompactionPhase::Anchored { portable_summary } => portable_summary.len(),
+    let (summary_len, native_history_len) = match &state.phase {
+        CompactionPhase::PendingRemote => (0, 0),
+        CompactionPhase::PendingAnchor { native_history } => (0, serialized_size(native_history)),
+        CompactionPhase::Anchored {
+            native_history,
+            portable_summary,
+            active_replays,
+        } => (
+            portable_summary.len() + active_replays.iter().map(String::len).sum::<usize>(),
+            serialized_size(native_history),
+        ),
     };
-    session_id.len() + state.model.len() + summary_len + serialized_size(&state.native_history)
+    session_id.len()
+        + state.lane_token.len()
+        + state.operation_id.len()
+        + state.model.len()
+        + summary_len
+        + native_history_len
 }
 
 fn now_ms() -> u64 {
@@ -545,6 +979,7 @@ fn evict_states(registry: &mut CompactionRegistry, now: u64) {
         registry.states.remove(&oldest);
         update_total_bytes(registry);
     }
+    cleanup_lane_start_orders(registry);
 }
 
 pub fn clear_all_compactions_for_tests() {
@@ -584,13 +1019,16 @@ mod tests {
         .unwrap()
     }
 
-    fn stored_compaction(
-        session_id: &str,
-        native_history: Vec<ResponsesInputItem>,
-    ) -> CompactionAttempt {
-        let attempt = begin_compaction(session_id, "gpt-5.6-sol");
-        assert!(store_compaction(session_id, attempt, native_history));
-        attempt
+    fn stage(session_id: &str, operation_id: &str, encrypted_content: &str) -> CompactionLease {
+        let lease = begin_compaction(Some(session_id), "gpt-5.6-sol", operation_id).unwrap();
+        assert!(store_compaction(
+            &lease,
+            "gpt-5.6-sol",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: encrypted_content.to_string(),
+            }],
+        ));
+        lease
     }
 
     #[test]
@@ -624,71 +1062,51 @@ mod tests {
     fn replay_requires_activation_and_wrapped_summary_anchor() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        let attempt = stored_compaction(
-            "session",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "opaque".to_string(),
-            }],
-        );
+        let lease = stage("session", "operation-1", "opaque");
         let next = request(json!([
             {"type":"additional_tools","role":"developer","tools":[]},
             {"type":"message","role":"developer","content":[{"type":"input_text","text":"instructions"}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":format!("<summary>{SUMMARY}</summary>")}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
         ]));
-        assert!(apply_compaction_replay(Some("session"), &next).is_none());
+        assert!(apply_compaction_replay(Some("session"), &next, "replay").is_none());
         assert!(activate_compaction(
-            Some("session"),
-            Some(attempt),
+            Some(&lease),
             "gpt-5.6-sol",
             &output(&format!(
                 "<analysis>summary preparation</analysis>\n<summary>\n{SUMMARY}\n</summary>"
             ))
         ));
 
-        let replay = apply_compaction_replay(Some("session"), &next)
-            .unwrap()
-            .request;
+        let replay = apply_compaction_replay(Some("session"), &next, "replay").unwrap();
         assert!(matches!(
-            replay.input[0],
+            replay.request.input[0],
             ResponsesInputItem::AdditionalTools { .. }
         ));
         assert!(
-            matches!(replay.input[1], ResponsesInputItem::Message { ref role, .. } if role == "developer")
+            matches!(replay.request.input[1], ResponsesInputItem::Message { ref role, .. } if role == "developer")
         );
         assert!(matches!(
-            replay.input[2],
+            replay.request.input[2],
             ResponsesInputItem::Compaction { .. }
         ));
-        assert_eq!(replay.client_metadata, next.client_metadata);
+        assert_eq!(replay.request.client_metadata, next.client_metadata);
     }
 
     #[test]
     fn stale_activation_cannot_anchor_newer_native_history() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        let older = stored_compaction(
-            "session",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "older-native-history".to_string(),
-            }],
-        );
-        let newer = stored_compaction(
-            "session",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "newer-native-history".to_string(),
-            }],
-        );
+        let older = stage("session", "older", "older-native-history");
+        let newer = stage("session", "newer", "newer-native-history");
 
         assert!(!activate_compaction(
-            Some("session"),
-            Some(older),
+            Some(&older),
             "gpt-5.6-sol",
             &output(STALE_SUMMARY),
         ));
         assert!(activate_compaction(
-            Some("session"),
-            Some(newer),
+            Some(&newer),
             "gpt-5.6-sol",
             &output(SUMMARY),
         ));
@@ -698,24 +1116,18 @@ mod tests {
     fn stale_store_cannot_replace_newer_compaction() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        let older = begin_compaction("session", "gpt-5.6-sol");
-        let newer = stored_compaction(
-            "session",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "newer-native-history".to_string(),
-            }],
-        );
+        let older = begin_compaction(Some("session"), "gpt-5.6-sol", "older").unwrap();
+        let newer = stage("session", "newer", "newer-native-history");
 
         assert!(!store_compaction(
-            "session",
-            older,
+            &older,
+            "gpt-5.6-sol",
             vec![ResponsesInputItem::Compaction {
                 encrypted_content: "late-older-native-history".to_string(),
             }],
         ));
         assert!(activate_compaction(
-            Some("session"),
-            Some(newer),
+            Some(&newer),
             "gpt-5.6-sol",
             &output(SUMMARY),
         ));
@@ -723,10 +1135,8 @@ mod tests {
             {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
         ]));
-        let replay = apply_compaction_replay(Some("session"), &next)
-            .unwrap()
-            .request;
-        assert!(replay.input.iter().any(|item| matches!(
+        let replay = apply_compaction_replay(Some("session"), &next, "replay").unwrap();
+        assert!(replay.request.input.iter().any(|item| matches!(
             item,
             ResponsesInputItem::Compaction { encrypted_content }
                 if encrypted_content == "newer-native-history"
@@ -734,19 +1144,19 @@ mod tests {
     }
 
     #[test]
-    fn preparing_compaction_survives_model_mismatched_replay_check() {
+    fn pending_remote_compaction_survives_model_mismatched_replay_check() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        let attempt = begin_compaction("session", "gpt-5.6-sol");
+        let lease = begin_compaction(Some("session"), "gpt-5.6-sol", "build").unwrap();
         let mut mismatched = request(json!([
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
         ]));
         mismatched.model = "gpt-5.6-terra".to_string();
 
-        assert!(apply_compaction_replay(Some("session"), &mismatched).is_none());
+        assert!(apply_compaction_replay(Some("session"), &mismatched, "replay").is_none());
         assert!(store_compaction(
-            "session",
-            attempt,
+            &lease,
+            "gpt-5.6-sol",
             vec![ResponsesInputItem::Compaction {
                 encrypted_content: "native-history".to_string(),
             }],
@@ -757,19 +1167,13 @@ mod tests {
     fn stale_abort_cannot_clear_newer_compaction() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        let older = begin_compaction("session", "gpt-5.6-sol");
-        let newer = stored_compaction(
-            "session",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "newer-native-history".to_string(),
-            }],
-        );
+        let older = begin_compaction(Some("session"), "gpt-5.6-sol", "older").unwrap();
+        let newer = stage("session", "newer", "newer-native-history");
 
-        abort_compaction_attempt(Some("session"), Some(older));
+        abort_compaction_attempt(Some(&older));
 
         assert!(activate_compaction(
-            Some("session"),
-            Some(newer),
+            Some(&newer),
             "gpt-5.6-sol",
             &output(SUMMARY),
         ));
@@ -779,15 +1183,9 @@ mod tests {
     fn stale_replay_abort_cannot_clear_newer_compaction() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        let older = stored_compaction(
-            "session",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "older-native-history".to_string(),
-            }],
-        );
+        let older = stage("session", "older-build", "older-native-history");
         assert!(activate_compaction(
-            Some("session"),
-            Some(older),
+            Some(&older),
             "gpt-5.6-sol",
             &output(STALE_SUMMARY),
         ));
@@ -795,31 +1193,24 @@ mod tests {
             {"type":"message","role":"user","content":[{"type":"input_text","text":STALE_SUMMARY}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue old"}]}
         ]));
-        let older_replay = apply_compaction_replay(Some("session"), &older_next).unwrap();
+        let older_replay =
+            apply_compaction_replay(Some("session"), &older_next, "older-replay").unwrap();
 
-        let newer = stored_compaction(
-            "session",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "newer-native-history".to_string(),
-            }],
-        );
+        let newer = stage("session", "newer-build", "newer-native-history");
         assert!(activate_compaction(
-            Some("session"),
-            Some(newer),
+            Some(&newer),
             "gpt-5.6-sol",
             &output(SUMMARY),
         ));
 
-        abort_compaction_attempt(Some("session"), Some(older_replay.attempt));
+        abort_compaction_attempt(Some(&older_replay.lease));
 
         let newer_next = request(json!([
             {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue new"}]}
         ]));
-        let replay = apply_compaction_replay(Some("session"), &newer_next)
-            .unwrap()
-            .request;
-        assert!(replay.input.iter().any(|item| matches!(
+        let replay = apply_compaction_replay(Some("session"), &newer_next, "newer-replay").unwrap();
+        assert!(replay.request.input.iter().any(|item| matches!(
             item,
             ResponsesInputItem::Compaction { encrypted_content }
                 if encrypted_content == "newer-native-history"
@@ -830,54 +1221,42 @@ mod tests {
     fn invalid_stale_summary_cannot_clear_newer_compaction() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        let older = begin_compaction("session", "gpt-5.6-sol");
-        let newer = stored_compaction(
-            "session",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "newer-native-history".to_string(),
-            }],
-        );
+        let older = begin_compaction(Some("session"), "gpt-5.6-sol", "older").unwrap();
+        let newer = stage("session", "newer", "newer-native-history");
 
         assert!(!activate_compaction(
-            Some("session"),
-            Some(older),
+            Some(&older),
             "gpt-5.6-sol",
             &output("too short"),
         ));
         assert!(activate_compaction(
-            Some("session"),
-            Some(newer),
+            Some(&newer),
             "gpt-5.6-sol",
             &output(SUMMARY),
         ));
     }
 
     #[test]
-    fn replay_clears_on_missing_or_duplicate_anchor() {
+    fn replay_anchor_mismatch_is_non_destructive() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         for text in [
             "different conversation without the expected summary".to_string(),
             format!("{SUMMARY} and {SUMMARY}"),
         ] {
             clear_all_compactions_for_tests();
-            let attempt = stored_compaction(
-                "session",
-                vec![ResponsesInputItem::Compaction {
-                    encrypted_content: "opaque".to_string(),
-                }],
-            );
-            activate_compaction(
-                Some("session"),
-                Some(attempt),
-                "gpt-5.6-sol",
-                &output(SUMMARY),
-            );
+            let lease = stage("session", "operation-anchor", "opaque");
+            activate_compaction(Some(&lease), "gpt-5.6-sol", &output(SUMMARY));
             let changed = request(json!([
                 {"type":"message","role":"user","content":[{"type":"input_text","text":text}]},
                 {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
             ]));
-            assert!(apply_compaction_replay(Some("session"), &changed).is_none());
-            assert!(apply_compaction_replay(Some("session"), &changed).is_none());
+            assert!(apply_compaction_replay(Some("session"), &changed, "mismatch").is_none());
+            let matching = request(json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+            ]));
+            let replay = apply_compaction_replay(Some("session"), &matching, "probe").unwrap();
+            assert!(request_contains_compaction(&replay.request));
         }
     }
 
@@ -902,54 +1281,455 @@ mod tests {
     }
 
     #[test]
-    fn failed_replay_clears_anchored_state() {
+    fn dropped_build_lease_cleans_only_its_exact_current_state() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        let attempt = stored_compaction(
-            "failed-replay",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "opaque".to_string(),
-            }],
-        );
-        activate_compaction(
-            Some("failed-replay"),
-            Some(attempt),
+        let stale = begin_compaction(Some("dropped-build"), "gpt-5.6-sol", "stale").unwrap();
+        let current = begin_compaction(Some("dropped-build"), "gpt-5.6-sol", "current").unwrap();
+
+        drop(stale);
+        {
+            let guard = REGISTRY.lock().unwrap();
+            let state = guard.as_ref().unwrap().states.get("dropped-build").unwrap();
+            assert_eq!(state.operation_id, "current");
+            assert_eq!(state.revision, current.revision);
+        }
+
+        drop(current);
+        let guard = REGISTRY.lock().unwrap();
+        let registry = guard.as_ref().unwrap();
+        assert!(!registry.states.contains_key("dropped-build"));
+        assert!(!registry.lane_start_orders.contains_key("dropped-build"));
+    }
+
+    #[test]
+    fn dropped_replay_lease_cleans_its_active_replay() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let build = stage("dropped-replay", "build", "opaque");
+        assert!(activate_compaction(
+            Some(&build),
             "gpt-5.6-sol",
-            &output(SUMMARY),
-        );
+            &output(SUMMARY)
+        ));
         let next = request(json!([
             {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
         ]));
-        let replay = apply_compaction_replay(Some("failed-replay"), &next).unwrap();
+        let replay =
+            apply_compaction_replay(Some("dropped-replay"), &next, "cancelled-replay").unwrap();
 
-        abort_compaction_attempt(Some("failed-replay"), Some(replay.attempt));
+        drop(replay);
 
-        assert!(apply_compaction_replay(Some("failed-replay"), &next).is_none());
+        let guard = REGISTRY.lock().unwrap();
+        let registry = guard.as_ref().unwrap();
+        assert!(!registry.states.contains_key("dropped-replay"));
+        assert!(!registry.lane_start_orders.contains_key("dropped-replay"));
     }
 
     #[test]
-    fn replay_clears_on_model_change() {
+    fn replay_cleanup_waits_for_last_lease_clone() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
-        let attempt = stored_compaction(
-            "session",
-            vec![ResponsesInputItem::Compaction {
-                encrypted_content: "opaque".to_string(),
-            }],
-        );
-        activate_compaction(
-            Some("session"),
-            Some(attempt),
+        let build = stage("cloned-replay", "build", "opaque");
+        assert!(activate_compaction(
+            Some(&build),
             "gpt-5.6-sol",
-            &output(SUMMARY),
-        );
-        let mut changed = request(json!([
+            &output(SUMMARY)
+        ));
+        let next = request(json!([
             {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
         ]));
+        let replay =
+            apply_compaction_replay(Some("cloned-replay"), &next, "cancelled-replay").unwrap();
+        let final_owner = replay.lease.clone();
+
+        drop(replay);
+        {
+            let guard = REGISTRY.lock().unwrap();
+            let state = guard.as_ref().unwrap().states.get("cloned-replay").unwrap();
+            let CompactionPhase::Anchored { active_replays, .. } = &state.phase else {
+                panic!("expected anchored compaction");
+            };
+            assert!(active_replays.contains("cancelled-replay"));
+        }
+
+        drop(final_owner);
+        let guard = REGISTRY.lock().unwrap();
+        assert!(!guard.as_ref().unwrap().states.contains_key("cloned-replay"));
+    }
+
+    #[test]
+    fn failed_replay_clears_anchored_state() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let lease = stage("failed-replay", "operation-failed-replay", "opaque");
+        activate_compaction(Some(&lease), "gpt-5.6-sol", &output(SUMMARY));
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay =
+            apply_compaction_replay(Some("failed-replay"), &next, "failed-attempt").unwrap();
+
+        abort_compaction_attempt(Some(&replay.lease));
+
+        assert!(apply_compaction_replay(Some("failed-replay"), &next, "failed-attempt").is_none());
+    }
+
+    #[test]
+    fn concurrent_replay_failure_cannot_delete_peer_success() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let lease = stage("concurrent", "build", "opaque");
+        assert!(activate_compaction(
+            Some(&lease),
+            "gpt-5.6-sol",
+            &output(SUMMARY)
+        ));
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay_a = apply_compaction_replay(Some("concurrent"), &next, "replay-a").unwrap();
+        let replay_b = apply_compaction_replay(Some("concurrent"), &next, "replay-b").unwrap();
+        assert_ne!(replay_a.lease.operation_id, replay_b.lease.operation_id);
+        assert_eq!(replay_a.lease.revision, replay_b.lease.revision);
+
+        assert!(activate_compaction(
+            Some(&replay_a.lease),
+            "gpt-5.6-sol",
+            &output("ok")
+        ));
+        abort_compaction_attempt(Some(&replay_b.lease));
+
+        let probe = apply_compaction_replay(Some("concurrent"), &next, "probe").unwrap();
+        assert!(request_contains_compaction(&probe.request));
+    }
+
+    #[test]
+    fn replay_failure_before_peer_success_cannot_delete_state() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let lease = stage("failure-first", "build", "opaque");
+        assert!(activate_compaction(
+            Some(&lease),
+            "gpt-5.6-sol",
+            &output(SUMMARY)
+        ));
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay_a = apply_compaction_replay(Some("failure-first"), &next, "replay-a").unwrap();
+        let replay_b = apply_compaction_replay(Some("failure-first"), &next, "replay-b").unwrap();
+
+        abort_compaction_attempt(Some(&replay_b.lease));
+        assert!(activate_compaction(
+            Some(&replay_a.lease),
+            "gpt-5.6-sol",
+            &output("ok")
+        ));
+
+        let probe = apply_compaction_replay(Some("failure-first"), &next, "probe").unwrap();
+        assert!(request_contains_compaction(&probe.request));
+    }
+
+    #[test]
+    fn all_failed_concurrent_replays_delete_current_revision() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let lease = stage("all-failed", "build", "opaque");
+        assert!(activate_compaction(
+            Some(&lease),
+            "gpt-5.6-sol",
+            &output(SUMMARY)
+        ));
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay_a = apply_compaction_replay(Some("all-failed"), &next, "replay-a").unwrap();
+        let replay_b = apply_compaction_replay(Some("all-failed"), &next, "replay-b").unwrap();
+
+        abort_compaction_attempt(Some(&replay_a.lease));
+        abort_compaction_attempt(Some(&replay_b.lease));
+
+        assert!(apply_compaction_replay(Some("all-failed"), &next, "probe").is_none());
+    }
+
+    #[test]
+    fn stale_summary_mismatch_cannot_delete_newer_revision() {
+        const NEW_SUMMARY: &str =
+            "newer portable summary with enough detail to identify the current conversation";
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let old = stage("newer-revision", "old-build", "opaque-old");
+        assert!(activate_compaction(
+            Some(&old),
+            "gpt-5.6-sol",
+            &output(SUMMARY)
+        ));
+        let new = stage("newer-revision", "new-build", "opaque-new");
+        assert!(activate_compaction(
+            Some(&new),
+            "gpt-5.6-sol",
+            &output(NEW_SUMMARY)
+        ));
+
+        let old_request = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        assert!(apply_compaction_replay(Some("newer-revision"), &old_request, "stale").is_none());
+        let new_request = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":NEW_SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay =
+            apply_compaction_replay(Some("newer-revision"), &new_request, "probe").unwrap();
+        let serialized = serde_json::to_string(&replay.request.input).unwrap();
+        assert!(serialized.contains("opaque-new"));
+        assert!(!serialized.contains("opaque-old"));
+    }
+
+    #[test]
+    fn replay_model_mismatch_is_non_destructive() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let lease = stage("session", "operation-model-change", "opaque");
+        activate_compaction(Some(&lease), "gpt-5.6-sol", &output(SUMMARY));
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let mut changed = next.clone();
         changed.model = "gpt-5.4".to_string();
-        assert!(apply_compaction_replay(Some("session"), &changed).is_none());
+        assert!(apply_compaction_replay(Some("session"), &changed, "mismatch").is_none());
+        let replay = apply_compaction_replay(Some("session"), &next, "probe").unwrap();
+        assert!(request_contains_compaction(&replay.request));
+    }
+
+    #[test]
+    fn stale_operations_cannot_publish_activate_or_abort_newer_state() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let stale = begin_compaction(Some("lane"), "gpt-5.6-sol", "operation-stale").unwrap();
+        let current = begin_compaction(Some("lane"), "gpt-5.6-sol", "operation-current").unwrap();
+
+        assert!(!store_compaction(
+            &stale,
+            "gpt-5.6-sol",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "stale".to_string(),
+            }],
+        ));
+        assert!(store_compaction(
+            &current,
+            "gpt-5.6-sol",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "current".to_string(),
+            }],
+        ));
+        assert!(!activate_compaction(
+            Some(&stale),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+        assert!(activate_compaction(
+            Some(&current),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+        abort_compaction_attempt(Some(&stale));
+
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay = apply_compaction_replay(Some("lane"), &next, "lane-replay").unwrap();
+        assert!(replay.request.input.iter().any(|item| matches!(
+            item,
+            ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "current"
+        )));
+    }
+
+    #[test]
+    fn delayed_older_reservation_cannot_replace_newer_anchor() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let older = reserve_compaction_start(Some("lane"), "operation-older").unwrap();
+        let newer = reserve_compaction_start(Some("lane"), "operation-newer").unwrap();
+        let newer_lease =
+            begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", newer).unwrap();
+        assert!(store_compaction(
+            &newer_lease,
+            "gpt-5.6-sol",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "newer".to_string(),
+            }],
+        ));
+        assert!(activate_compaction(
+            Some(&newer_lease),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+
+        assert!(begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", older).is_none());
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay = apply_compaction_replay(Some("bound"), &next, "replay").unwrap();
+        assert!(replay.request.input.iter().any(|item| matches!(
+            item,
+            ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "newer"
+        )));
+    }
+
+    #[test]
+    fn aborted_newer_start_still_rejects_older_pending_permit() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let older = reserve_compaction_start(Some("ordered-lane"), "operation-older").unwrap();
+        let newer = reserve_compaction_start(Some("ordered-lane"), "operation-newer").unwrap();
+        let newer_order = newer.start_order;
+        let newer_lease =
+            begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", newer).unwrap();
+
+        abort_compaction_attempt(Some(&newer_lease));
+        {
+            let guard = REGISTRY.lock().unwrap();
+            let registry = guard.as_ref().unwrap();
+            assert_eq!(
+                registry.lane_start_orders.get("ordered-lane"),
+                Some(&newer_order)
+            );
+            assert!(!registry.states.contains_key("bound"));
+        }
+
+        assert!(begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", older).is_none());
+        let guard = REGISTRY.lock().unwrap();
+        let registry = guard.as_ref().unwrap();
+        assert!(registry.pending_starts.is_empty());
+        assert!(!registry.lane_start_orders.contains_key("ordered-lane"));
+    }
+
+    #[test]
+    fn independent_lanes_never_cross_compaction_artifacts() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let lane_a = stage("lane-a", "operation-a", "opaque-a");
+        let lane_b = stage("lane-b", "operation-b", "opaque-b");
+        assert!(activate_compaction(
+            Some(&lane_b),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+        assert!(activate_compaction(
+            Some(&lane_a),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+
+        for (lane, expected, rejected) in [
+            ("lane-a", "opaque-a", "opaque-b"),
+            ("lane-b", "opaque-b", "opaque-a"),
+        ] {
+            let replay = apply_compaction_replay(Some(lane), &next, "lane-replay").unwrap();
+            let serialized = serde_json::to_string(&replay.request.input).unwrap();
+            assert!(serialized.contains(expected));
+            assert!(!serialized.contains(rejected));
+        }
+    }
+
+    #[test]
+    fn lane_cleanup_removes_all_route_bindings_only_for_that_lane() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let lane_a_route_1 = begin_compaction_for_lane(
+            Some("bound-a-1"),
+            Some("lane-a"),
+            "gpt-5.6-sol",
+            "operation-a-1",
+        )
+        .unwrap();
+        let lane_a_route_2 = begin_compaction_for_lane(
+            Some("bound-a-2"),
+            Some("lane-a"),
+            "gpt-5.6-sol",
+            "operation-a-2",
+        )
+        .unwrap();
+        let lane_b = begin_compaction_for_lane(
+            Some("bound-b"),
+            Some("lane-b"),
+            "gpt-5.6-sol",
+            "operation-b",
+        )
+        .unwrap();
+        for (lease, encrypted) in [
+            (&lane_a_route_1, "opaque-a-1"),
+            (&lane_a_route_2, "opaque-a-2"),
+            (&lane_b, "opaque-b"),
+        ] {
+            assert!(store_compaction(
+                lease,
+                "gpt-5.6-sol",
+                vec![ResponsesInputItem::Compaction {
+                    encrypted_content: encrypted.to_string(),
+                }],
+            ));
+            assert!(activate_compaction(
+                Some(lease),
+                "gpt-5.6-sol",
+                &output(SUMMARY),
+            ));
+        }
+
+        clear_compactions_for_lane("lane-a");
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        assert!(apply_compaction_replay(Some("bound-a-1"), &next, "probe-a-1").is_none());
+        assert!(apply_compaction_replay(Some("bound-a-2"), &next, "probe-a-2").is_none());
+        let replay_b = apply_compaction_replay(Some("bound-b"), &next, "probe-b").unwrap();
+        assert!(
+            serde_json::to_string(&replay_b.request.input)
+                .unwrap()
+                .contains("opaque-b")
+        );
+    }
+
+    #[test]
+    fn lane_cleanup_revokes_compaction_started_before_cleanup() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let stale = reserve_compaction_start(Some("lane-a"), "operation-stale").unwrap();
+        let unaffected = reserve_compaction_start(Some("lane-b"), "operation-b").unwrap();
+
+        clear_compactions_for_lane("lane-a");
+
+        assert!(begin_compaction_with_permit(Some("bound-a"), "gpt-5.6-sol", stale).is_none());
+        assert!(begin_compaction_with_permit(Some("bound-b"), "gpt-5.6-sol", unaffected).is_some());
+        let fresh = reserve_compaction_start(Some("lane-a"), "operation-fresh").unwrap();
+        assert!(begin_compaction_with_permit(Some("bound-a"), "gpt-5.6-sol", fresh).is_some());
+    }
+
+    #[test]
+    fn failed_bound_session_releases_start_reservation() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let permit = reserve_compaction_start(Some("lane-a"), "operation-a").unwrap();
+
+        assert!(begin_compaction_with_permit(None, "gpt-5.6-sol", permit).is_none());
+        assert!(reserve_compaction_start(Some("lane-a"), "operation-a").is_some());
     }
 
     #[test]

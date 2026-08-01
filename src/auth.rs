@@ -360,6 +360,7 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn set_mode(path: &std::path::Path, mode: u32) {
     #[cfg(unix)]
     {

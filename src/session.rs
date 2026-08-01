@@ -1,5 +1,6 @@
 use crate::config::AliasProvider;
 use crate::registry::normalize_incoming_model;
+use crate::request_identity::AgentLaneKey;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
 
@@ -15,8 +16,8 @@ pub struct SessionState {
 
 #[derive(Default)]
 struct SessionStore {
-    map: HashMap<String, SessionState>,
-    order: VecDeque<String>,
+    map: HashMap<AgentLaneKey, SessionState>,
+    order: VecDeque<AgentLaneKey>,
 }
 
 static SESSIONS: LazyLock<Mutex<SessionStore>> =
@@ -31,12 +32,17 @@ fn now_millis() -> u64 {
 }
 
 pub fn existing_session(session_id: Option<&str>, now: u64) -> Option<SessionState> {
-    let id = session_id?;
+    let lane = session_id.map(AgentLaneKey::main);
+    existing_session_for_lane(lane.as_ref(), now)
+}
+
+pub fn existing_session_for_lane(lane: Option<&AgentLaneKey>, now: u64) -> Option<SessionState> {
+    let lane = lane?;
     let mut store = SESSIONS.lock().expect("session lock");
-    let state = store.map.get(id).cloned()?;
+    let state = store.map.get(lane).cloned()?;
     if now.saturating_sub(state.last_seen) > SESSION_IDLE_TTL_MS {
-        store.map.remove(id);
-        store.order.retain(|item| item != id);
+        store.map.remove(lane);
+        store.order.retain(|item| item != lane);
         return None;
     }
     Some(state)
@@ -64,15 +70,47 @@ pub(crate) fn record_session_request_with_affinity_update(
     update_affinity: bool,
     now: u64,
 ) -> Option<SessionState> {
-    let id = session_id?;
+    let lane = session_id.map(AgentLaneKey::main);
+    record_session_request_for_lane(
+        lane.as_ref(),
+        prior,
+        provider_name,
+        model,
+        update_affinity,
+        now,
+    )
+}
+
+pub(crate) fn record_session_request_for_lane(
+    lane: Option<&AgentLaneKey>,
+    prior: Option<&SessionState>,
+    provider_name: &str,
+    model: &str,
+    update_affinity: bool,
+    now: u64,
+) -> Option<SessionState> {
+    let lane = lane?;
+    if !update_affinity {
+        let store = SESSIONS.lock().expect("session lock");
+        return store
+            .map
+            .get(lane)
+            .filter(|state| now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS)
+            .cloned()
+            .or_else(|| {
+                prior
+                    .filter(|state| now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS)
+                    .cloned()
+            });
+    }
     let mut store = SESSIONS.lock().expect("session lock");
     let stored = store
         .map
-        .get(id)
+        .get(lane)
         .cloned()
         .filter(|state| now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS);
-    if stored.is_none() && store.map.remove(id).is_some() {
-        store.order.retain(|item| item != id);
+    if stored.is_none() && store.map.remove(lane).is_some() {
+        store.order.retain(|item| item != lane);
     }
     let mut next = stored
         .or_else(|| {
@@ -98,10 +136,10 @@ pub(crate) fn record_session_request_with_affinity_update(
         });
     }
 
-    if !store.map.contains_key(id) {
-        store.order.push_back(id.to_string());
+    if !store.map.contains_key(lane) {
+        store.order.push_back(lane.clone());
     }
-    store.map.insert(id.to_string(), next.clone());
+    store.map.insert(lane.clone(), next.clone());
 
     while store.order.len() > MAX_SESSIONS {
         if let Some(evict) = store.order.pop_front() {
@@ -163,7 +201,53 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_request_does_not_change_session_affinity() {
+    fn agent_lanes_keep_affinity_and_sequence_independent() {
+        reset_sessions_for_test();
+        let lane_a = AgentLaneKey::Agent {
+            session_id: "shared-session".to_string(),
+            agent_id: "agent-a".to_string(),
+        };
+        let lane_b = AgentLaneKey::Agent {
+            session_id: "shared-session".to_string(),
+            agent_id: "agent-b".to_string(),
+        };
+
+        let a =
+            record_session_request_for_lane(Some(&lane_a), None, "codex", "gpt-5.6-sol", true, 1)
+                .unwrap();
+        let b = record_session_request_for_lane(
+            Some(&lane_b),
+            None,
+            "kimi",
+            "kimi-for-coding",
+            true,
+            2,
+        )
+        .unwrap();
+        let a2 = record_session_request_for_lane(
+            Some(&lane_a),
+            Some(&a),
+            "codex",
+            "gpt-5.6-sol",
+            true,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(a2.seq, 2);
+        assert_eq!(a2.affinity_provider, Some(AliasProvider::Codex));
+        assert_eq!(b.seq, 1);
+        assert_eq!(b.affinity_provider, Some(AliasProvider::Kimi));
+        assert_eq!(
+            existing_session_for_lane(Some(&lane_b), 4)
+                .unwrap()
+                .affinity_provider,
+            Some(AliasProvider::Kimi)
+        );
+    }
+
+    #[test]
+    fn auxiliary_request_does_not_mutate_session_state() {
         let session_id = "session-affinity-auxiliary-request-test";
         let initial = record_session_request(Some(session_id), None, "codex", "gpt-5.6-sol", 1)
             .expect("initial session");
@@ -177,8 +261,10 @@ mod tests {
             false,
             2,
         )
-        .expect("updated session");
-        assert_eq!(after_review.seq, 2);
+        .expect("existing session");
+        assert_eq!(after_review.seq, 1);
+        assert_eq!(after_review.last_seen, 1);
         assert_eq!(after_review.affinity_provider, Some(AliasProvider::Codex));
+        assert_eq!(existing_session(Some(session_id), 2).unwrap().last_seen, 1);
     }
 }

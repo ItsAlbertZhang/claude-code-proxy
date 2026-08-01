@@ -12,6 +12,7 @@ use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIG
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
 use super::search::{SearchRequest, SearchResponse};
+use super::state::{ConversationBinding, ProtocolLane, SocketPoolKey};
 use super::translate::request::ResponsesRequest;
 
 // ---------------------------------------------------------------------------
@@ -142,7 +143,7 @@ pub fn build_codex_headers(
         headers.insert("session_id", header_value("session_id", session_id)?);
         headers.insert(
             "x-client-request-id",
-            header_value("x-client-request-id", session_id)?,
+            header_value("x-client-request-id", &ctx.req_id)?,
         );
         let window_id = format!("{session_id}:0");
         headers.insert(
@@ -229,10 +230,10 @@ pub fn build_codex_image_headers(
             header_value("ChatGPT-Account-Id", account_id)?,
         );
     }
-    if let Some(session_id) = ctx.session_id.as_deref() {
+    if ctx.session_id.is_some() {
         headers.insert(
             "x-client-request-id",
-            header_value("x-client-request-id", session_id)?,
+            header_value("x-client-request-id", &ctx.req_id)?,
         );
     }
     let user_agent = config::codex_user_agent(&default_user_agent(false));
@@ -265,10 +266,10 @@ pub fn build_codex_transcription_headers(
             header_value("ChatGPT-Account-Id", account_id)?,
         );
     }
-    if let Some(session_id) = ctx.session_id.as_deref() {
+    if ctx.session_id.is_some() {
         headers.insert(
             "x-client-request-id",
-            header_value("x-client-request-id", session_id)?,
+            header_value("x-client-request-id", &ctx.req_id)?,
         );
     }
     let user_agent = config::codex_user_agent(&default_user_agent(false));
@@ -348,6 +349,28 @@ pub struct CodexResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub transport: ActualTransport,
+    pub socket_id: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct CodexConversationRoute {
+    auth: StoredAuth,
+    binding: ConversationBinding,
+    protocol_lane: ProtocolLane,
+}
+
+impl CodexConversationRoute {
+    pub fn bind_lane(&self, lane_token: &str) -> String {
+        self.binding.bind_lane(lane_token)
+    }
+
+    fn matches_request(&self, body: &ResponsesRequest) -> bool {
+        self.matches_protocol(body.client_metadata.is_some())
+    }
+
+    fn matches_protocol(&self, use_responses_lite: bool) -> bool {
+        self.protocol_lane == ProtocolLane::from_responses_lite(use_responses_lite)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,8 +379,143 @@ pub struct CodexResponse {
 
 const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
+const MAX_NATIVE_FAILURE_EVENT_BYTES: usize = 64 * 1024;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
+
+struct NativeFailureDetector {
+    kind: NativeResponseBodyKind,
+    buffer: Vec<u8>,
+    delimiter_tail: Vec<u8>,
+    oversized: bool,
+    finished: bool,
+}
+
+#[derive(Clone, Copy)]
+enum NativeResponseBodyKind {
+    Sse,
+    Json,
+}
+
+impl NativeFailureDetector {
+    fn new(stream: bool) -> Self {
+        Self {
+            kind: if stream {
+                NativeResponseBodyKind::Sse
+            } else {
+                NativeResponseBodyKind::Json
+            },
+            buffer: Vec::new(),
+            delimiter_tail: Vec::with_capacity(4),
+            oversized: false,
+            finished: false,
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) -> bool {
+        if self.finished {
+            return false;
+        }
+        match self.kind {
+            NativeResponseBodyKind::Sse => self.observe_sse(chunk),
+            NativeResponseBodyKind::Json => self.observe_json(chunk),
+        }
+    }
+
+    fn finish(&mut self) -> bool {
+        if self.finished {
+            return false;
+        }
+        self.finished = true;
+        if self.oversized {
+            return false;
+        }
+        match self.kind {
+            NativeResponseBodyKind::Sse => contains_in_band_unauthorized(&self.buffer),
+            NativeResponseBodyKind::Json => {
+                serde_json::from_slice::<serde_json::Value>(&self.buffer)
+                    .ok()
+                    .as_ref()
+                    .is_some_and(is_in_band_unauthorized)
+            }
+        }
+    }
+
+    fn abort(&mut self) {
+        self.finished = true;
+        self.buffer.clear();
+        self.delimiter_tail.clear();
+    }
+
+    fn observe_sse(&mut self, chunk: &[u8]) -> bool {
+        for &byte in chunk {
+            if !self.oversized {
+                if self.buffer.len() < MAX_NATIVE_FAILURE_EVENT_BYTES {
+                    self.buffer.push(byte);
+                } else {
+                    self.buffer.clear();
+                    self.oversized = true;
+                }
+            }
+
+            if self.delimiter_tail.len() == 4 {
+                self.delimiter_tail.remove(0);
+            }
+            self.delimiter_tail.push(byte);
+            if !sse_event_is_complete(&self.delimiter_tail) {
+                continue;
+            }
+
+            let unauthorized = !self.oversized && contains_in_band_unauthorized(&self.buffer);
+            self.buffer.clear();
+            self.delimiter_tail.clear();
+            self.oversized = false;
+            if unauthorized {
+                self.finished = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn observe_json(&mut self, chunk: &[u8]) -> bool {
+        let Some(next_len) = self.buffer.len().checked_add(chunk.len()) else {
+            self.finished = true;
+            self.oversized = true;
+            self.buffer.clear();
+            return false;
+        };
+        if next_len > MAX_NATIVE_FAILURE_EVENT_BYTES {
+            self.finished = true;
+            self.oversized = true;
+            self.buffer.clear();
+            return false;
+        }
+        self.buffer.extend_from_slice(chunk);
+        false
+    }
+}
+
+fn sse_event_is_complete(tail: &[u8]) -> bool {
+    tail.ends_with(b"\n\n")
+        || tail.ends_with(b"\n\r")
+        || tail.ends_with(b"\r\r")
+        || tail.ends_with(b"\r\n\n")
+        || tail.ends_with(b"\r\n\r")
+}
+
+fn contains_in_band_unauthorized(body: &[u8]) -> bool {
+    parse_sse_events(body).into_iter().any(|event| {
+        serde_json::from_str::<serde_json::Value>(&event.data)
+            .ok()
+            .as_ref()
+            .is_some_and(is_in_band_unauthorized)
+    })
+}
+
+fn is_in_band_unauthorized(payload: &serde_json::Value) -> bool {
+    super::events::classify_event_failure(payload).is_some_and(|failure| failure.status == 401)
+}
 
 #[derive(Clone)]
 struct ProxyEnvironment {
@@ -527,7 +685,9 @@ pub struct CodexHttpClient {
     websocket_client: reqwest::Client,
     websocket_proxy_config: super::websocket::WebSocketProxyConfig,
     auto_http_fallback_enabled: bool,
-    auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
+    auth_manager: Arc<CodexAuthManager<DefaultCodexAuthStore>>,
+    #[cfg(test)]
+    native_rejection_refreshes: Option<Arc<std::sync::atomic::AtomicUsize>>,
     base_url: String,
     header_timeout_ms: u64,
     body_idle_timeout_ms: u64,
@@ -554,7 +714,9 @@ impl CodexHttpClient {
             websocket_client: websocket_http_client(&proxy_environment),
             websocket_proxy_config: proxy_environment.websocket_proxy_config(),
             auto_http_fallback_enabled: true,
-            auth_manager: CodexAuthManager::new(file_store()),
+            auth_manager: Arc::new(CodexAuthManager::new(file_store())),
+            #[cfg(test)]
+            native_rejection_refreshes: None,
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
@@ -577,7 +739,9 @@ impl CodexHttpClient {
             websocket_proxy_config,
             auto_http_fallback_enabled,
             client,
-            auth_manager,
+            auth_manager: Arc::new(auth_manager),
+            #[cfg(test)]
+            native_rejection_refreshes: None,
             base_url,
             header_timeout_ms: 60_000,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
@@ -599,7 +763,8 @@ impl CodexHttpClient {
             websocket_proxy_config: super::websocket::WebSocketProxyConfig::direct(),
             auto_http_fallback_enabled: true,
             client,
-            auth_manager: CodexAuthManager::new(file_store()),
+            auth_manager: Arc::new(CodexAuthManager::new(file_store())),
+            native_rejection_refreshes: None,
             base_url,
             header_timeout_ms,
             body_idle_timeout_ms,
@@ -700,6 +865,37 @@ impl CodexHttpClient {
         })
     }
 
+    pub async fn conversation_route(
+        &self,
+        use_responses_lite: bool,
+    ) -> Result<CodexConversationRoute, CodexError> {
+        let auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|error| CodexError {
+                status: 401,
+                message: "Auth error".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            })?;
+        let protocol_lane = ProtocolLane::from_responses_lite(use_responses_lite);
+        let binding = ConversationBinding::for_request(&self.base_url, &auth, protocol_lane);
+        Ok(CodexConversationRoute {
+            auth,
+            binding,
+            protocol_lane,
+        })
+    }
+
+    pub async fn conversation_binding(
+        &self,
+        use_responses_lite: bool,
+    ) -> Result<ConversationBinding, CodexError> {
+        Ok(self.conversation_route(use_responses_lite).await?.binding)
+    }
+
     pub(crate) async fn post_image_json(
         &self,
         base_url: &str,
@@ -792,14 +988,7 @@ impl CodexHttpClient {
         use_responses_lite: bool,
         stream: bool,
     ) -> Result<reqwest::Response, CodexError> {
-        let body_json = serde_json::to_string(body).map_err(|err| CodexError {
-            status: 500,
-            message: "Failed to serialize native Responses request".to_string(),
-            detail: Some(err.to_string()),
-            retry_after: None,
-            origin: CodexErrorOrigin::Http,
-        })?;
-        let mut auth = self
+        let auth = self
             .auth_manager
             .get_auth()
             .await
@@ -810,6 +999,56 @@ impl CodexHttpClient {
                 retry_after: None,
                 origin: CodexErrorOrigin::Auth,
             })?;
+        self.post_native_responses_with_auth(body, ctx, use_responses_lite, stream, auth, true)
+            .await
+    }
+
+    pub async fn post_native_responses_bound(
+        &self,
+        route: &CodexConversationRoute,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+        stream: bool,
+    ) -> Result<reqwest::Response, CodexError> {
+        let use_responses_lite = body
+            .get("client_metadata")
+            .is_some_and(|metadata| !metadata.is_null());
+        if !route.matches_protocol(use_responses_lite) {
+            return Err(CodexError {
+                status: 500,
+                message: "Codex route protocol mismatch".to_string(),
+                detail: None,
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            });
+        }
+        self.post_native_responses_with_auth(
+            body,
+            ctx,
+            use_responses_lite,
+            stream,
+            route.auth.clone(),
+            false,
+        )
+        .await
+    }
+
+    async fn post_native_responses_with_auth(
+        &self,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+        use_responses_lite: bool,
+        stream: bool,
+        mut auth: StoredAuth,
+        allow_auth_refresh: bool,
+    ) -> Result<reqwest::Response, CodexError> {
+        let body_json = serde_json::to_string(body).map_err(|err| CodexError {
+            status: 500,
+            message: "Failed to serialize native Responses request".to_string(),
+            detail: Some(err.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
         let mut refresh_attempted = false;
 
         loop {
@@ -825,20 +1064,96 @@ impl CodexHttpClient {
             let status = response.status().as_u16();
             if status == 401 && !refresh_attempted {
                 refresh_attempted = true;
-                drop(response);
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
-                continue;
+                if allow_auth_refresh {
+                    drop(response);
+                    auth = self
+                        .auth_manager
+                        .force_refresh(&auth.access)
+                        .await
+                        .map_err(auth_refresh_error)?;
+                    continue;
+                }
+                // Preserve this request's immutable route. Refresh or observed
+                // rotation is available only when the next route binds.
+                let _ = self.auth_manager.refresh_after_rejection(&auth).await;
             }
 
             if let Some(traffic) = ctx.traffic.as_deref() {
                 write_live_upstream_response_headers(traffic, &response, started_at.elapsed());
             }
-            return Ok(response);
+            return Ok(self.wrap_native_response_body(response, auth, stream));
         }
+    }
+
+    fn wrap_native_response_body(
+        &self,
+        response: reqwest::Response,
+        auth: StoredAuth,
+        stream: bool,
+    ) -> reqwest::Response {
+        if response.status() != reqwest::StatusCode::OK {
+            return response;
+        }
+
+        use reqwest::ResponseBuilderExt;
+
+        let url = response.url().clone();
+        let response: http::Response<reqwest::Body> = response.into();
+        let (mut parts, body) = response.into_parts();
+        let url_response = http::Response::builder()
+            .url(url)
+            .body(())
+            .expect("response URL extension must be valid");
+        let (url_parts, ()) = url_response.into_parts();
+        parts.extensions.extend(url_parts.extensions);
+
+        let source = http_body_util::BodyDataStream::new(body);
+        let detector = NativeFailureDetector::new(stream);
+        let auth_manager = self.auth_manager.clone();
+        #[cfg(test)]
+        let refreshes = self.native_rejection_refreshes.clone();
+        let body_stream = futures_util::stream::unfold(
+            (source, detector, auth_manager, auth),
+            move |(mut source, mut detector, auth_manager, auth)| {
+                #[cfg(test)]
+                let refreshes = refreshes.clone();
+                async move {
+                    match futures_util::StreamExt::next(&mut source).await {
+                        Some(item) => {
+                            let unauthorized = match &item {
+                                Ok(chunk) => detector.observe(chunk),
+                                Err(_) => {
+                                    detector.abort();
+                                    false
+                                }
+                            };
+                            if unauthorized {
+                                let _ = auth_manager.refresh_after_rejection(&auth).await;
+                                #[cfg(test)]
+                                if let Some(refreshes) = refreshes.as_ref() {
+                                    refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                            Some((item, (source, detector, auth_manager, auth)))
+                        }
+                        None => {
+                            if detector.finish() {
+                                let _ = auth_manager.refresh_after_rejection(&auth).await;
+                                #[cfg(test)]
+                                if let Some(refreshes) = refreshes.as_ref() {
+                                    refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                            None
+                        }
+                    }
+                }
+            },
+        );
+        reqwest::Response::from(http::Response::from_parts(
+            parts,
+            reqwest::Body::wrap_stream(body_stream),
+        ))
     }
 
     async fn attempt_native_responses(
@@ -885,18 +1200,83 @@ impl CodexHttpClient {
             .await
     }
 
+    pub async fn post_codex_bound(
+        &self,
+        route: &CodexConversationRoute,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+    ) -> Result<CodexResponse, CodexError> {
+        self.post_codex_bound_with_transport(
+            route,
+            body,
+            ctx,
+            continuation,
+            crate::config::codex_transport(),
+        )
+        .await
+    }
+
+    async fn post_codex_bound_with_transport(
+        &self,
+        route: &CodexConversationRoute,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+        transport: crate::config::CodexTransport,
+    ) -> Result<CodexResponse, CodexError> {
+        if !route.matches_request(body) {
+            return Err(CodexError {
+                status: 500,
+                message: "Codex route protocol mismatch".to_string(),
+                detail: None,
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            });
+        }
+        self.post_codex_with_transport_auth(
+            body,
+            ctx,
+            continuation,
+            transport,
+            route.auth.clone(),
+            false,
+        )
+        .await
+    }
+
     pub async fn post_search(
         &self,
         body: &SearchRequest,
         ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
             retry_after: None,
             origin: CodexErrorOrigin::Auth,
         })?;
+        self.post_search_with_auth(body, ctx, auth, true).await
+    }
+
+    pub async fn post_search_bound(
+        &self,
+        route: &CodexConversationRoute,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+    ) -> Result<SearchResponse, CodexError> {
+        self.post_search_with_auth(body, ctx, route.auth.clone(), false)
+            .await
+    }
+
+    async fn post_search_with_auth(
+        &self,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+        mut auth: StoredAuth,
+        allow_auth_refresh: bool,
+    ) -> Result<SearchResponse, CodexError> {
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
             status: 500,
             message: "Failed to serialize search request".to_string(),
@@ -911,12 +1291,21 @@ impl CodexHttpClient {
             let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
             if response.status == 401 && !auth_refresh_attempted {
                 auth_refresh_attempted = true;
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
-                continue;
+                match self.auth_manager.refresh_after_rejection(&auth).await {
+                    Ok(new_auth) if allow_auth_refresh => {
+                        auth = new_auth;
+                        continue;
+                    }
+                    Ok(_) | Err(_) if !allow_auth_refresh => {
+                        // Keep this search on its immutable route. Any refresh or
+                        // observed rotation is available when the next route binds.
+                    }
+                    Err(error) => return Err(auth_refresh_error(error)),
+                    Ok(_) => unreachable!("refresh-enabled branch handled above"),
+                }
+            }
+            if response.status == 401 {
+                return Err(codex_status_error(response));
             }
             if should_retry_codex_status(response.status)
                 && retries < MAX_BUFFERED_TRANSPORT_RETRIES
@@ -954,22 +1343,37 @@ impl CodexHttpClient {
         continuation: Option<&super::continuation::ContinuationCandidate>,
         transport: crate::config::CodexTransport,
     ) -> Result<CodexResponse, CodexError> {
-        use crate::config::CodexTransport;
-
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
             retry_after: None,
             origin: CodexErrorOrigin::Auth,
         })?;
+        self.post_codex_with_transport_auth(body, ctx, continuation, transport, auth, true)
+            .await
+    }
 
-        let initial_pool_key = websocket_pool_key(ctx, continuation);
+    async fn post_codex_with_transport_auth(
+        &self,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+        transport: crate::config::CodexTransport,
+        mut auth: StoredAuth,
+        allow_auth_refresh: bool,
+    ) -> Result<CodexResponse, CodexError> {
+        use crate::config::CodexTransport;
+
+        let use_responses_lite = body.client_metadata.is_some();
+        let initial_pool_key =
+            websocket_pool_key(ctx, continuation, &auth, &self.base_url, use_responses_lite);
         if should_reset_websocket_pool(continuation)
-            && let Some(key) = initial_pool_key
+            && let Some(key) = initial_pool_key.as_ref()
         {
             super::websocket::invalidate_codex_websocket_pool_turn(
-                key,
+                key.as_str(),
+                ctx.session_id.as_deref(),
                 continuation.and_then(|candidate| candidate.turn_id),
             );
         }
@@ -979,7 +1383,14 @@ impl CodexHttpClient {
         let mut auth_refresh_attempted = false;
         let mut transport_failures = 0u32;
         loop {
-            let pool_key = websocket_pool_key(ctx, active_continuation.as_ref());
+            let pool_key = websocket_pool_key(
+                ctx,
+                active_continuation.as_ref(),
+                &auth,
+                &self.base_url,
+                use_responses_lite,
+            );
+            let pool_key = pool_key.as_ref().map(SocketPoolKey::as_str);
             let result = match transport {
                 CodexTransport::Http => {
                     let body_json = serde_json::to_string(body).map_err(|e| CodexError {
@@ -1038,7 +1449,12 @@ impl CodexHttpClient {
                     match ws_result {
                         Ok(response) => Ok(response),
                         Err(err)
-                            if self.auto_http_fallback_enabled && should_fallback_to_http(&err) =>
+                            if self.auto_http_fallback_enabled
+                                && should_fallback_to_http(&err)
+                                && !should_retry_without_continuation(
+                                    &err,
+                                    active_continuation.as_ref(),
+                                ) =>
                         {
                             // Fall back to HTTP only if WebSocket failed before sending
                             let body_json =
@@ -1062,17 +1478,35 @@ impl CodexHttpClient {
                 }
             };
 
-            if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
+            let buffered_unauthorized = result.as_ref().ok().and_then(|response| {
+                (200..300)
+                    .contains(&response.status)
+                    .then(|| super::events::first_failure_with_status(&response.body, 401))
+                    .flatten()
+                    .map(|failure| (failure, response.transport))
+            });
+            if (buffered_unauthorized.is_some()
+                || should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport))
+                && !auth_refresh_attempted
+            {
                 auth_refresh_attempted = true;
-                match self.auth_manager.force_refresh(&auth.access).await {
-                    Ok(new_auth) => {
+                if let Some(key) = pool_key {
+                    super::websocket::invalidate_codex_websocket_pool_turn(
+                        key,
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                    );
+                }
+                match self.auth_manager.refresh_after_rejection(&auth).await {
+                    Ok(new_auth) if allow_auth_refresh => {
                         auth = new_auth;
-                        if let Some(key) = pool_key {
-                            super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
-                        }
                         active_continuation =
                             full_context_continuation(active_continuation.as_ref());
                         continue;
+                    }
+                    Ok(_) | Err(_) if !allow_auth_refresh => {
+                        // Keep this request on its immutable route. The refresh or
+                        // observed rotation is available when the next route binds.
                     }
                     Err(e) => {
                         return Err(CodexError {
@@ -1083,7 +1517,21 @@ impl CodexHttpClient {
                             origin: CodexErrorOrigin::Http,
                         });
                     }
+                    Ok(_) => unreachable!("refresh-enabled branch handled above"),
                 }
+            }
+
+            if let Some((failure, actual_transport)) = buffered_unauthorized {
+                return Err(CodexError {
+                    status: 401,
+                    message: failure.message.clone(),
+                    detail: Some(failure.message),
+                    retry_after: failure.retry_after,
+                    origin: match actual_transport {
+                        ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
+                        ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
+                    },
+                });
             }
 
             if let Ok(response) = &result
@@ -1246,7 +1694,11 @@ impl CodexHttpClient {
                     if should_retry_without_continuation(&err, active_continuation.as_ref()) =>
                 {
                     if let Some(key) = pool_key {
-                        super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+                        super::websocket::invalidate_codex_websocket_pool_turn(
+                            key,
+                            ctx.session_id.as_deref(),
+                            turn_id,
+                        );
                     }
                     active_continuation = full_context_continuation(active_continuation.as_ref());
                     continue;
@@ -1301,13 +1753,61 @@ impl CodexHttpClient {
             retry_after: None,
             origin: CodexErrorOrigin::Auth,
         })?;
+        self.stream_codex_websocket_events_with_auth(body, ctx, continuation, auth, true)
+            .await
+    }
 
+    pub async fn stream_codex_websocket_events_bound(
+        self: &Arc<Self>,
+        route: &CodexConversationRoute,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+    ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
+        if !route.matches_request(body) {
+            return Err(CodexError {
+                status: 500,
+                message: "Codex route protocol mismatch".to_string(),
+                detail: None,
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            });
+        }
+        self.stream_codex_websocket_events_with_auth(
+            body,
+            ctx,
+            continuation,
+            route.auth.clone(),
+            false,
+        )
+        .await
+    }
+
+    async fn stream_codex_websocket_events_with_auth(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+        auth: StoredAuth,
+        allow_auth_refresh: bool,
+    ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
         let turn_id = continuation.and_then(|candidate| candidate.turn_id);
-        let pool_key = websocket_pool_key(ctx, continuation).map(str::to_string);
+        let pool_key = websocket_pool_key(
+            ctx,
+            continuation,
+            &auth,
+            &self.base_url,
+            body.client_metadata.is_some(),
+        )
+        .map(|key| key.as_str().to_string());
         if should_reset_websocket_pool(continuation)
             && let Some(key) = pool_key.as_deref()
         {
-            super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+            super::websocket::invalidate_codex_websocket_pool_turn(
+                key,
+                ctx.session_id.as_deref(),
+                turn_id,
+            );
         }
 
         let client = self.clone();
@@ -1315,24 +1815,38 @@ impl CodexHttpClient {
         let ctx = ctx.clone();
         let continuation = continuation.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (rx, socket_id_publisher) = super::websocket::CodexWebSocketEventReceiver::pending(rx);
         tokio::spawn(async move {
             client
-                .coordinate_live_websocket_events(body, ctx, continuation, auth, pool_key, tx)
+                .coordinate_live_websocket_events(
+                    body,
+                    ctx,
+                    continuation,
+                    auth,
+                    pool_key,
+                    tx,
+                    socket_id_publisher,
+                    allow_auth_refresh,
+                )
                 .await;
         });
 
         Ok(rx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn coordinate_live_websocket_events(
         &self,
         body: ResponsesRequest,
         ctx: RequestContext,
         mut continuation: Option<super::continuation::ContinuationCandidate>,
         mut auth: StoredAuth,
-        pool_key: Option<String>,
+        initial_pool_key: Option<String>,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
+        socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
+        allow_auth_refresh: bool,
     ) {
+        let mut pool_key = initial_pool_key;
         let turn_id = continuation
             .as_ref()
             .and_then(|candidate| candidate.turn_id);
@@ -1344,6 +1858,7 @@ impl CodexHttpClient {
         let mut forwarded_any = false;
 
         'attempt: loop {
+            socket_id_publisher.publish(None);
             let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
             {
                 Ok(headers) => super::websocket::codex_websocket_headers(&headers),
@@ -1370,7 +1885,11 @@ impl CodexHttpClient {
                 _ = tx.closed() => {
                     super::continuation::abort_continuation(ctx.session_id.as_deref(), turn_id);
                     if let Some(key) = pool_key.as_deref() {
-                        super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+                        super::websocket::invalidate_codex_websocket_pool_turn(
+                                key,
+                                ctx.session_id.as_deref(),
+                                turn_id,
+                            );
                     }
                     return;
                 }
@@ -1379,28 +1898,48 @@ impl CodexHttpClient {
                     Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
                         auth_refresh_attempted = true;
                         if let Some(key) = pool_key.as_deref() {
-                            super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+                            super::websocket::invalidate_codex_websocket_pool_turn(
+                                key,
+                                ctx.session_id.as_deref(),
+                                turn_id,
+                            );
                         }
-                        let refresh = self.auth_manager.force_refresh(&auth.access);
-                        auth = match refresh.await {
-                            Ok(auth) => {
+                        match self.auth_manager.refresh_after_rejection(&auth).await {
+                            Ok(new_auth) if allow_auth_refresh => {
                                 if tx.is_closed() {
                                     return;
                                 }
-                                auth
-                            },
+                                auth = new_auth;
+                                pool_key = websocket_pool_key(
+                                    &ctx,
+                                    continuation.as_ref(),
+                                    &auth,
+                                    &self.base_url,
+                                    body.client_metadata.is_some(),
+                                )
+                                .map(|key| key.as_str().to_string());
+                                continuation = full_context_continuation(continuation.as_ref());
+                                continue 'attempt;
+                            }
+                            Ok(_) | Err(_) if !allow_auth_refresh => {
+                                let _ = tx.send(Err(err)).await;
+                                return;
+                            }
                             Err(refresh_err) => {
                                 let _ = tx.send(Err(auth_refresh_error(refresh_err))).await;
                                 return;
                             }
-                        };
-                        continuation = full_context_continuation(continuation.as_ref());
-                        continue 'attempt;
+                            Ok(_) => unreachable!("refresh-enabled branch handled above"),
+                        }
                     }
                     Err(err) if continuation_retry_available && is_continuation_retry_error(&err) => {
                         continuation_retry_available = false;
                         if let Some(key) = pool_key.as_deref() {
-                            super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+                            super::websocket::invalidate_codex_websocket_pool_turn(
+                                key,
+                                ctx.session_id.as_deref(),
+                                turn_id,
+                            );
                         }
                         continuation = full_context_continuation(continuation.as_ref());
                         continue 'attempt;
@@ -1411,12 +1950,17 @@ impl CodexHttpClient {
                     }
                 }
             };
+            socket_id_publisher.publish(stream.socket_id());
 
             loop {
                 let item = tokio::select! {
                     _ = tx.closed() => {
                         if let Some(key) = pool_key.as_deref() {
-                            super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+                            super::websocket::invalidate_codex_websocket_pool_turn(
+                                key,
+                                ctx.session_id.as_deref(),
+                                turn_id,
+                            );
                         }
                         return;
                     }
@@ -1433,22 +1977,50 @@ impl CodexHttpClient {
                 if unauthorized && !auth_refresh_attempted && !forwarded_any {
                     auth_refresh_attempted = true;
                     if let Some(key) = pool_key.as_deref() {
-                        super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+                        super::websocket::invalidate_codex_websocket_pool_turn(
+                            key,
+                            ctx.session_id.as_deref(),
+                            turn_id,
+                        );
                     }
-                    let refresh = self.auth_manager.force_refresh(&auth.access);
-                    auth = match refresh.await {
-                        Ok(auth) => {
+                    match self.auth_manager.refresh_after_rejection(&auth).await {
+                        Ok(new_auth) if allow_auth_refresh => {
                             if tx.is_closed() {
                                 return;
                             }
-                            auth
+                            auth = new_auth;
+                            pool_key = websocket_pool_key(
+                                &ctx,
+                                continuation.as_ref(),
+                                &auth,
+                                &self.base_url,
+                                body.client_metadata.is_some(),
+                            )
+                            .map(|key| key.as_str().to_string());
+                            continuation = full_context_continuation(continuation.as_ref());
+                            continuation_retry_available = false;
+                            continue 'attempt;
+                        }
+                        Ok(_) | Err(_) if !allow_auth_refresh => {
+                            let error = match item {
+                                Err(err) => err,
+                                Ok(payload) => CodexError {
+                                    status: 401,
+                                    message: "Unauthorized".to_string(),
+                                    detail: Some(payload.to_string()),
+                                    retry_after: None,
+                                    origin: CodexErrorOrigin::WebSocket,
+                                },
+                            };
+                            let _ = tx.send(Err(error)).await;
+                            return;
                         }
                         Err(refresh_err) => {
                             let _ = tx.send(Err(auth_refresh_error(refresh_err))).await;
                             return;
                         }
-                    };
-                    continue 'attempt;
+                        Ok(_) => unreachable!("refresh-enabled branch handled above"),
+                    }
                 }
 
                 if let Err(err) = &item
@@ -1458,7 +2030,11 @@ impl CodexHttpClient {
                 {
                     continuation_retry_available = false;
                     if let Some(key) = pool_key.as_deref() {
-                        super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+                        super::websocket::invalidate_codex_websocket_pool_turn(
+                            key,
+                            ctx.session_id.as_deref(),
+                            turn_id,
+                        );
                     }
                     continuation = full_context_continuation(continuation.as_ref());
                     continue 'attempt;
@@ -1470,7 +2046,11 @@ impl CodexHttpClient {
                 if tx.send(item).await.is_err() {
                     super::continuation::abort_continuation(ctx.session_id.as_deref(), turn_id);
                     if let Some(key) = pool_key.as_deref() {
-                        super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+                        super::websocket::invalidate_codex_websocket_pool_turn(
+                            key,
+                            ctx.session_id.as_deref(),
+                            turn_id,
+                        );
                     }
                     return;
                 }
@@ -1595,6 +2175,7 @@ impl CodexHttpClient {
             status,
             headers,
             transport: ActualTransport::Http,
+            socket_id: None,
         })
     }
 
@@ -1696,6 +2277,7 @@ impl CodexHttpClient {
             status,
             headers,
             transport: ActualTransport::Http,
+            socket_id: None,
         })
     }
 }
@@ -2026,6 +2608,7 @@ fn full_context_continuation(
     continuation.map(|candidate| super::continuation::ContinuationCandidate {
         turn_id: candidate.turn_id,
         previous_response_id: None,
+        socket_id: None,
         input_delta: None,
         input_delta_count: candidate.input_delta_count,
         disabled_reason: Some("full_context_retry".to_string()),
@@ -2043,21 +2626,30 @@ fn is_continuation_retry_error(err: &CodexError) -> bool {
     matches!(
         err.detail.as_deref(),
         Some("previous_response_not_found")
+            | Some(super::websocket::WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL)
             | Some(super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
             | Some(super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL)
     )
 }
 
-fn websocket_pool_key<'a>(
-    ctx: &'a RequestContext,
+fn websocket_pool_key(
+    ctx: &RequestContext,
     continuation: Option<&super::continuation::ContinuationCandidate>,
-) -> Option<&'a str> {
-    let session_id = ctx.session_id.as_deref()?;
+    auth: &StoredAuth,
+    base_url: &str,
+    use_responses_lite: bool,
+) -> Option<SocketPoolKey> {
+    let lane_token = ctx.session_id.as_deref()?;
     let continuation = continuation?;
     if continuation.disabled_reason.as_deref() == Some("disabled") {
         return None;
     }
-    Some(session_id)
+    Some(SocketPoolKey::for_request(
+        lane_token,
+        base_url,
+        auth,
+        ProtocolLane::from_responses_lite(use_responses_lite),
+    ))
 }
 
 fn should_reset_websocket_pool(
@@ -2072,8 +2664,10 @@ fn should_reset_websocket_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
 
     #[test]
     fn normalizes_supported_proxy_urls() {
@@ -2207,6 +2801,351 @@ mod tests {
                 return request;
             }
         }
+    }
+
+    async fn write_http_chunk(stream: &mut tokio::net::TcpStream, chunk: &[u8]) {
+        stream
+            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(chunk).await.unwrap();
+        stream.write_all(b"\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_route_uses_one_auth_snapshot_and_refreshes_only_the_next_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "token-a".into(),
+            refresh: "refresh-a".into(),
+            account_id: Some("acct-a".into()),
+            expires: u64::MAX,
+        });
+        let route_a = client.conversation_route(false).await.unwrap();
+        let bound_a = route_a.bind_lane("lane");
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "token-b".into(),
+            refresh: "refresh-b".into(),
+            account_id: Some("acct-b".into()),
+            expires: u64::MAX,
+        });
+
+        let (no_retry_tx, no_retry_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut first).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("authorization: Bearer token-a"));
+            assert!(request.contains("chatgpt-account-id: acct-a"));
+            assert!(request.contains(&format!("session_id: {bound_a}")));
+            assert!(request.contains("x-client-request-id: route-a"));
+            first
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err(),
+                "the A-bound request must not retry with rotated auth"
+            );
+            no_retry_tx.send(()).unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut second).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("authorization: Bearer token-b"));
+            assert!(request.contains("chatgpt-account-id: acct-b"));
+            assert!(request.contains("x-client-request-id: route-b"));
+            assert!(!request.contains("authorization: Bearer token-a"));
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut ctx_a = http_test_context();
+        ctx_a.req_id = "route-a".into();
+        ctx_a.session_id = Some(route_a.bind_lane("lane"));
+        let err = match client
+            .post_codex_bound_with_transport(
+                &route_a,
+                &buffered_test_request(),
+                &ctx_a,
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("expected the A-bound request to preserve its 401"),
+        };
+        assert_eq!(err.status, 401);
+        no_retry_rx.await.unwrap();
+
+        let route_b = client.conversation_route(false).await.unwrap();
+        let bound_b = route_b.bind_lane("lane");
+        assert_ne!(ctx_a.session_id.as_deref(), Some(bound_b.as_str()));
+        let mut ctx_b = http_test_context();
+        ctx_b.req_id = "route-b".into();
+        ctx_b.session_id = Some(bound_b);
+        let response = client
+            .post_codex_bound_with_transport(
+                &route_b,
+                &buffered_test_request(),
+                &ctx_b,
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_search_preserves_auth_snapshot_and_refreshes_only_next_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "search-token-a".into(),
+            refresh: "search-refresh-a".into(),
+            account_id: Some("search-acct-a".into()),
+            expires: u64::MAX,
+        });
+        let route_a = client.conversation_route(false).await.unwrap();
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "search-token-b".into(),
+            refresh: "search-refresh-b".into(),
+            account_id: Some("search-acct-b".into()),
+            expires: u64::MAX,
+        });
+
+        let (no_retry_tx, no_retry_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let request = String::from_utf8_lossy(&read_http_request(&mut first).await).to_string();
+            assert!(request.starts_with("POST /alpha/search "));
+            assert!(request.contains("authorization: Bearer search-token-a"));
+            assert!(request.contains("chatgpt-account-id: search-acct-a"));
+            first
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err(),
+                "the A-bound search must not retry with rotated auth"
+            );
+            no_retry_tx.send(()).unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_http_request(&mut second).await).to_string();
+            assert!(request.contains("authorization: Bearer search-token-b"));
+            assert!(request.contains("chatgpt-account-id: search-acct-b"));
+            assert!(!request.contains("authorization: Bearer search-token-a"));
+            let response = serde_json::to_vec(&serde_json::json!({
+                "encrypted_output": "opaque",
+                "output": "search output",
+                "results": []
+            }))
+            .unwrap();
+            second
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            second.write_all(&response).await.unwrap();
+        });
+
+        let request = super::super::search::SearchRequest {
+            id: "search-session".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+            reasoning: None,
+            input: None,
+            commands: super::super::search::SearchCommands {
+                search_query: vec![super::super::search::SearchQuery {
+                    q: "find Codex".to_string(),
+                }],
+            },
+            settings: super::super::search::SearchSettings {
+                filters: None,
+                allowed_callers: vec!["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: 2_500,
+        };
+        let error = client
+            .post_search_bound(&route_a, &request, &http_test_context())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 401);
+        no_retry_rx.await.unwrap();
+
+        let route_b = client.conversation_route(false).await.unwrap();
+        let response = client
+            .post_search_bound(&route_b, &request, &http_test_context())
+            .await
+            .unwrap();
+        assert_eq!(response.output, "search output");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_buffered_in_band_unauthorized_refreshes_only_next_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "buffered-token-a".into(),
+            refresh: "buffered-refresh-a".into(),
+            account_id: Some("buffered-acct-a".into()),
+            expires: u64::MAX,
+        });
+        let route = client.conversation_route(false).await.unwrap();
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "buffered-token-b".into(),
+            refresh: "buffered-refresh-b".into(),
+            account_id: Some("buffered-acct-b".into()),
+            expires: u64::MAX,
+        });
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_http_request(&mut stream).await).to_string();
+            assert!(request.contains("authorization: Bearer buffered-token-a"));
+            let body = b"data: {\"type\":\"response.failed\",\"status_code\":401,\"response\":{\"error\":{\"message\":\"expired\"}}}\n\n";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err(),
+                "bound buffered request must not retry with rotated auth"
+            );
+        });
+
+        let error = match client
+            .post_codex_bound_with_transport(
+                &route,
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expected buffered in-band unauthorized failure"),
+        };
+        assert_eq!(error.status, 401);
+        assert_eq!(error.origin, CodexErrorOrigin::BufferedHttp);
+        assert_eq!(
+            client.auth_manager().get_auth().await.unwrap().access,
+            "buffered-token-b"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_live_unauthorized_event_preserves_401_without_auth_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 100));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "live-token-a".into(),
+            refresh: "live-refresh-a".into(),
+            account_id: Some("live-acct-a".into()),
+            expires: u64::MAX,
+        });
+        let route = client.conversation_route(false).await.unwrap();
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "live-token-b".into(),
+            refresh: "live-refresh-b".into(),
+            account_id: Some("live-acct-b".into()),
+            expires: u64::MAX,
+        });
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(
+                websocket.next().await.is_some(),
+                "missing Responses request"
+            );
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "response.failed",
+                        "status_code": 401,
+                        "response": {"error": {"status": 401, "message": "unauthorized"}}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err(),
+                "the bound live route must not reconnect with rotated auth"
+            );
+        });
+
+        let mut ctx = http_test_context();
+        ctx.req_id = "bound-live-401".into();
+        ctx.session_id = Some(route.bind_lane("live-lane"));
+        let mut events = client
+            .stream_codex_websocket_events_bound(&route, &buffered_test_request(), &ctx, None)
+            .await
+            .unwrap();
+        let item = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .expect("missing unauthorized event");
+        let err = match item {
+            Err(err) => err,
+            Ok(payload) => panic!("unauthorized payload leaked downstream: {payload}"),
+        };
+        assert_eq!(err.status, 401);
+        assert_eq!(err.origin, CodexErrorOrigin::WebSocket);
+        assert_eq!(
+            client.auth_manager().get_auth().await.unwrap().access,
+            "live-token-b"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2380,6 +3319,402 @@ mod tests {
             response.bytes().await.unwrap(),
             br#"{"id":"resp_native","object":"response"}"#.as_slice()
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_native_sse_401_refreshes_next_route_without_changing_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = authenticated_http_test_client(format!("http://{addr}/v1/responses"));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "stream-token-a".into(),
+            refresh: "stream-refresh-a".into(),
+            account_id: Some("stream-acct-a".into()),
+            expires: u64::MAX,
+        });
+        let route_a = client.conversation_route(false).await.unwrap();
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        client.native_rejection_refreshes = Some(refreshes.clone());
+        let client = Arc::new(client);
+        let server_client = client.clone();
+
+        let chunks: Vec<&'static [u8]> = vec![
+            b"data: {\"type\":\"response.failed\",\"status_co",
+            b"de\":4",
+            b"01,\"response\":{\"error\":{\"message\":\"expired\"}}}\r\n",
+            b"\r\n",
+            b"data: {\"type\":\"response.failed\",\"status_code\":401,\"response\":{\"error\":{\"message\":\"duplicate\"}}}\n\n",
+        ];
+        let expected = chunks.concat();
+        let server_chunks = chunks.clone();
+        let (prefix_tx, prefix_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let (no_retry_tx, no_retry_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let request = String::from_utf8_lossy(&read_http_request(&mut first).await).to_string();
+            assert!(request.contains("authorization: Bearer stream-token-a"));
+            assert!(request.contains("chatgpt-account-id: stream-acct-a"));
+            server_client.auth_manager().set_test_auth(StoredAuth {
+                access: "stream-token-b".into(),
+                refresh: "stream-refresh-b".into(),
+                account_id: Some("stream-acct-b".into()),
+                expires: u64::MAX,
+            });
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nx-native-test: preserved\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            write_http_chunk(&mut first, server_chunks[0]).await;
+            prefix_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+            for chunk in &server_chunks[1..] {
+                write_http_chunk(&mut first, chunk).await;
+            }
+            first.write_all(b"0\r\n\r\n").await.unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err(),
+                "the bound native stream must not retry after an in-band 401"
+            );
+            no_retry_tx.send(()).unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_http_request(&mut second).await).to_string();
+            assert!(request.contains("authorization: Bearer stream-token-b"));
+            assert!(request.contains("chatgpt-account-id: stream-acct-b"));
+            assert!(!request.contains("authorization: Bearer stream-token-a"));
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut response = client
+            .post_native_responses_bound(
+                &route_a,
+                &serde_json::json!({"model":"gpt-5.4","input":"hello","stream":true}),
+                &http_test_context(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["x-native-test"], "preserved");
+        assert_eq!(
+            response.url().as_str(),
+            format!("http://{addr}/v1/responses")
+        );
+
+        prefix_rx.await.unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(50), response.chunk())
+            .await
+            .expect("an incomplete event chunk must stream without waiting")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.as_ref(), chunks[0]);
+        continue_tx.send(()).unwrap();
+
+        let mut received = first.to_vec();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received, expected);
+        assert_eq!(
+            refreshes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "duplicate unauthorized events must refresh the rejected snapshot once"
+        );
+        no_retry_rx.await.unwrap();
+
+        let route_b = client.conversation_route(false).await.unwrap();
+        let response = client
+            .post_native_responses_bound(
+                &route_b,
+                &serde_json::json!({"model":"gpt-5.4","input":"next"}),
+                &http_test_context(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap(), b"{}".as_slice());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unbound_native_json_401_is_detected_across_chunks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = authenticated_http_test_client(format!("http://{addr}/v1/responses"));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "json-token-a".into(),
+            refresh: "json-refresh-a".into(),
+            account_id: Some("json-acct-a".into()),
+            expires: u64::MAX,
+        });
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        client.native_rejection_refreshes = Some(refreshes.clone());
+        let client = Arc::new(client);
+        let server_client = client.clone();
+        let chunks: Vec<&'static [u8]> = vec![
+            b"{\"type\":\"response.failed\",\"status_",
+            b"code\":40",
+            b"1,\"response\":{\"error\":{\"message\":\"expired\"}}}",
+        ];
+        let expected = chunks.concat();
+        let server_chunks = chunks.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_http_request(&mut stream).await).to_string();
+            assert!(request.contains("authorization: Bearer json-token-a"));
+            server_client.auth_manager().set_test_auth(StoredAuth {
+                access: "json-token-b".into(),
+                refresh: "json-refresh-b".into(),
+                account_id: Some("json-acct-b".into()),
+                expires: u64::MAX,
+            });
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in server_chunks {
+                write_http_chunk(&mut stream, chunk).await;
+            }
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+
+        let response = client
+            .post_native_responses(
+                &serde_json::json!({"model":"gpt-5.4","input":"hello"}),
+                &http_test_context(),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap(), expected);
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            client.conversation_route(false).await.unwrap().auth.access,
+            "json-token-b"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn native_failure_detector_bounds_oversized_sse_frames() {
+        let mut detector = NativeFailureDetector::new(true);
+        assert!(!detector.observe(&vec![b'x'; MAX_NATIVE_FAILURE_EVENT_BYTES + 1]));
+        assert!(detector.buffer.len() <= MAX_NATIVE_FAILURE_EVENT_BYTES);
+        assert!(!detector.observe(b"\n\n"));
+        assert!(detector.observe(
+            b"data: {\"type\":\"response.failed\",\"status_code\":401,\"response\":{\"error\":{\"message\":\"expired\"}}}\n\n"
+        ));
+    }
+
+    #[test]
+    fn native_failure_detector_accepts_all_sse_blank_line_endings() {
+        const EVENT: &[u8] = b"data: {\"type\":\"response.failed\",\"status_code\":401,\"response\":{\"error\":{\"message\":\"expired\"}}}";
+        let delimiters: &[&[u8]] = &[
+            b"\n\n",
+            b"\n\r",
+            b"\n\r\n",
+            b"\r\r",
+            b"\r\r\n",
+            b"\r\n\n",
+            b"\r\n\r",
+            b"\r\n\r\n",
+        ];
+
+        for delimiter in delimiters {
+            let mut frame = EVENT.to_vec();
+            frame.extend_from_slice(delimiter);
+            for split in 0..=frame.len() {
+                let mut detector = NativeFailureDetector::new(true);
+                let detected =
+                    detector.observe(&frame[..split]) || detector.observe(&frame[split..]);
+                assert!(
+                    detected,
+                    "delimiter {delimiter:?} was not detected with split at {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_failure_detector_parses_bounded_json_only_at_eof() {
+        let unauthorized =
+            b"{\"type\":\"response.failed\",\"status_code\":401,\"response\":{\"error\":{\"message\":\"expired\"}}}";
+        let mut detector = NativeFailureDetector::new(false);
+        assert!(!detector.observe(&unauthorized[..32]));
+        assert!(!detector.observe(&unauthorized[32..]));
+        assert!(detector.finish());
+        assert!(!detector.finish(), "a response is detected at most once");
+
+        let mut invalid = NativeFailureDetector::new(false);
+        assert!(!invalid.observe(unauthorized));
+        assert!(!invalid.observe(b" trailing-garbage"));
+        assert!(!invalid.finish(), "a valid JSON prefix is not a valid body");
+
+        let mut interrupted = NativeFailureDetector::new(false);
+        assert!(!interrupted.observe(unauthorized));
+        interrupted.abort();
+        assert!(
+            !interrupted.finish(),
+            "an interrupted body is not complete JSON"
+        );
+
+        let mut oversized = NativeFailureDetector::new(false);
+        assert!(!oversized.observe(&vec![b'x'; MAX_NATIVE_FAILURE_EVENT_BYTES + 1]));
+        assert!(oversized.buffer.len() <= MAX_NATIVE_FAILURE_EVENT_BYTES);
+        assert!(!oversized.finish());
+    }
+
+    #[tokio::test]
+    async fn bound_native_responses_validates_route_against_payload_metadata() {
+        let client = authenticated_http_test_client("http://127.0.0.1:1/responses".to_string());
+        let ctx = http_test_context();
+        let full_route = client.conversation_route(false).await.unwrap();
+        let full_error = match client
+            .post_native_responses_bound(
+                &full_route,
+                &serde_json::json!({
+                    "model":"gpt-5.4",
+                    "input":"hello",
+                    "client_metadata":{"lite":"true"}
+                }),
+                &ctx,
+                false,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("Lite payload must not use a Full route"),
+        };
+        assert_eq!(full_error.status, 500);
+
+        let lite_route = client.conversation_route(true).await.unwrap();
+        let lite_error = match client
+            .post_native_responses_bound(
+                &lite_route,
+                &serde_json::json!({"model":"gpt-5.6-sol","input":"hello"}),
+                &ctx,
+                false,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("Full payload must not use a Lite route"),
+        };
+        assert_eq!(lite_error.status, 500);
+    }
+
+    #[tokio::test]
+    async fn bound_native_responses_preserves_route_identity_and_does_not_retry_401() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/v1/responses"
+        )));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "native-token-a".into(),
+            refresh: "native-refresh-a".into(),
+            account_id: Some("native-acct-a".into()),
+            expires: u64::MAX,
+        });
+        let route_a = client.conversation_route(false).await.unwrap();
+        let bound_a = route_a.bind_lane("native-raw-lane");
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "native-token-b".into(),
+            refresh: "native-refresh-b".into(),
+            account_id: Some("native-acct-b".into()),
+            expires: u64::MAX,
+        });
+
+        let (no_retry_tx, no_retry_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut first).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("authorization: Bearer native-token-a"));
+            assert!(request.contains("chatgpt-account-id: native-acct-a"));
+            assert!(request.contains(&format!("session_id: {bound_a}")));
+            assert!(request.contains(&format!("x-codex-window-id: {bound_a}:0")));
+            assert!(request.contains("x-client-request-id: native-route-a"));
+            assert!(!request.contains("session_id: native-raw-lane"));
+            first
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err(),
+                "the bound native request must not retry with rotated auth"
+            );
+            no_retry_tx.send(()).unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut second).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("authorization: Bearer native-token-b"));
+            assert!(request.contains("chatgpt-account-id: native-acct-b"));
+            assert!(request.contains("x-client-request-id: native-route-b"));
+            assert!(!request.contains("authorization: Bearer native-token-a"));
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut ctx_a = http_test_context();
+        ctx_a.req_id = "native-route-a".into();
+        ctx_a.session_id = Some(route_a.bind_lane("native-raw-lane"));
+        let response = client
+            .post_native_responses_bound(
+                &route_a,
+                &serde_json::json!({"model":"gpt-5.4","input":"hello"}),
+                &ctx_a,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        no_retry_rx.await.unwrap();
+
+        let route_b = client.conversation_route(false).await.unwrap();
+        let bound_b = route_b.bind_lane("native-raw-lane");
+        assert_ne!(ctx_a.session_id.as_deref(), Some(bound_b.as_str()));
+        let mut ctx_b = http_test_context();
+        ctx_b.req_id = "native-route-b".into();
+        ctx_b.session_id = Some(bound_b);
+        let response = client
+            .post_native_responses_bound(
+                &route_b,
+                &serde_json::json!({"model":"gpt-5.4","input":"hello"}),
+                &ctx_b,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
         server.await.unwrap();
     }
 
@@ -2708,6 +4043,7 @@ mod tests {
             status: 400,
             headers: Vec::new(),
             transport: ActualTransport::WebSocket,
+            socket_id: Some(1),
         });
 
         assert_eq!(error.status, 400);
@@ -3060,6 +4396,7 @@ mod tests {
         let disabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("disabled".into()),
@@ -3067,6 +4404,7 @@ mod tests {
         let first_enabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("missing_state".into()),
@@ -3074,17 +4412,46 @@ mod tests {
         let append = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: Some("resp_1".into()),
+            socket_id: Some(1),
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: None,
         };
 
-        assert_eq!(websocket_pool_key(&ctx, Some(&disabled)), None);
-        assert_eq!(
-            websocket_pool_key(&ctx, Some(&first_enabled)),
-            Some("session")
+        let auth = StoredAuth {
+            access: "token".into(),
+            refresh: String::new(),
+            account_id: Some("account".into()),
+            expires: u64::MAX,
+        };
+        assert!(
+            websocket_pool_key(
+                &ctx,
+                Some(&disabled),
+                &auth,
+                "https://example.test/responses",
+                false,
+            )
+            .is_none()
         );
-        assert_eq!(websocket_pool_key(&ctx, Some(&append)), Some("session"));
+        let first_key = websocket_pool_key(
+            &ctx,
+            Some(&first_enabled),
+            &auth,
+            "https://example.test/responses",
+            false,
+        )
+        .unwrap();
+        let append_key = websocket_pool_key(
+            &ctx,
+            Some(&append),
+            &auth,
+            "https://example.test/responses",
+            false,
+        )
+        .unwrap();
+        assert_eq!(first_key, append_key);
+        assert!(!first_key.as_str().contains("session"));
     }
 
     #[test]
@@ -3092,6 +4459,7 @@ mod tests {
         let missing_state = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("missing_state".into()),
@@ -3099,6 +4467,7 @@ mod tests {
         let disabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("disabled".into()),
@@ -3106,6 +4475,7 @@ mod tests {
         let prompt_changed = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("prompt_changed".into()),
@@ -3162,6 +4532,7 @@ mod tests {
             status: 401,
             headers: Vec::new(),
             transport: ActualTransport::Http,
+            socket_id: None,
         });
         let websocket_unauthorized = Err(CodexError {
             status: 401,
@@ -3241,6 +4612,7 @@ mod tests {
         let append = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: Some("resp_1".into()),
+            socket_id: Some(1),
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: None,
@@ -3248,6 +4620,7 @@ mod tests {
         let initial = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("missing_state".into()),

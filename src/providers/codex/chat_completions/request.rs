@@ -124,9 +124,11 @@ fn translate_request_with_override(
         ("store".to_string(), json!(false)),
         ("stream".to_string(), json!(true)),
         ("parallel_tool_calls".to_string(), json!(false)),
-        ("client_metadata".to_string(), json!({"lite":"true"})),
         ("text".to_string(), Value::Object(text)),
     ]);
+    if use_responses_lite {
+        upstream.insert("client_metadata".to_string(), json!({"lite":"true"}));
+    }
     if let Some(tier) = resolved.service_tier {
         upstream.insert(
             "service_tier".to_string(),
@@ -455,6 +457,7 @@ mod tests {
         assert_eq!(translated.upstream["stream"], true);
         assert_eq!(translated.upstream["reasoning"]["effort"], "medium");
         assert_eq!(translated.upstream["reasoning"]["context"], "all_turns");
+        assert_eq!(translated.upstream["client_metadata"]["lite"], "true");
     }
 
     #[test]
@@ -545,5 +548,6 @@ mod tests {
         let translated = translate_request(full).unwrap();
         assert_eq!(translated.upstream["temperature"], 0.2);
         assert_eq!(translated.upstream["top_p"], 0.9);
+        assert!(translated.upstream.get("client_metadata").is_none());
     }
 }

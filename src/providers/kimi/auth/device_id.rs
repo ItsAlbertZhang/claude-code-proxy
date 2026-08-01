@@ -42,6 +42,7 @@ pub fn get_device_id() -> Result<String, anyhow::Error> {
     Ok(id)
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn set_mode(path: &std::path::Path, mode: u32) {
     #[cfg(unix)]
     {

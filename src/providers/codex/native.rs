@@ -40,19 +40,39 @@ impl CodexNativeBackend {
         }
     }
 
-    pub async fn handle(&self, mut body: Value, ctx: RequestContext) -> Response {
+    #[cfg(test)]
+    fn with_client(client: CodexHttpClient) -> Self {
+        Self {
+            client: Arc::new(client),
+        }
+    }
+
+    pub async fn handle(&self, mut body: Value, mut ctx: RequestContext) -> Response {
         let resolved = match shape_native_request(&mut body) {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
+        }
+        let route = match self
+            .client
+            .conversation_route(resolved.use_responses_lite)
+            .await
+        {
+            Ok(route) => route,
+            Err(error) => return local_codex_error(error),
+        };
+        if let Some(lane_token) = ctx.session_id.as_deref() {
+            ctx.session_id = Some(route.bind_lane(lane_token));
+        }
+        if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
 
         let upstream = match self
             .client
-            .post_native_responses(&body, &ctx, resolved.use_responses_lite, resolved.stream)
+            .post_native_responses_bound(&route, &body, &ctx, resolved.stream)
             .await
         {
             Ok(response) => response,
@@ -124,13 +144,19 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     if hosted_web_search {
         model = full_lane_web_search_model(&model).to_string();
     }
+    let use_responses_lite = uses_responses_lite(&model) && !hosted_web_search;
     object.insert("model".to_string(), Value::String(model.clone()));
+    if use_responses_lite {
+        object.insert("client_metadata".to_string(), json!({"lite":"true"}));
+    } else {
+        object.remove("client_metadata");
+    }
     if priority && !object.contains_key("service_tier") {
         object.insert("service_tier".to_string(), json!("priority"));
     }
 
     Ok(NativeResolved {
-        use_responses_lite: uses_responses_lite(&model) && !hosted_web_search,
+        use_responses_lite,
         model,
         stream: object
             .get("stream")
@@ -603,6 +629,11 @@ fn retain_boundary_prefix(bytes: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::codex::auth::token_store::StoredAuth;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn request(body: Value) -> Value {
         body
@@ -616,6 +647,109 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: None,
+        }
+    }
+
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return request;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_backend_route_binds_sibling_agent_lanes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await;
+                let header_end = request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap();
+                captured.push(String::from_utf8_lossy(&request[..header_end]).into_owned());
+                let body = br#"{"id":"resp_native","object":"response","status":"completed"}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+            captured
+        });
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "native-test-token".into(),
+            refresh: String::new(),
+            account_id: Some("native-test-account".into()),
+            expires: u64::MAX,
+        });
+        let backend = CodexNativeBackend::with_client(client);
+
+        for (index, lane) in ["raw-agent-lane-a", "raw-agent-lane-b"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut ctx = observer_context();
+            ctx.req_id = format!("native-agent-{index}");
+            ctx.session_id = Some(lane.to_string());
+            let response = backend
+                .handle(
+                    json!({"model":"gpt-5.4","input":"hello","stream":false}),
+                    ctx,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+
+        let captured = server.await.unwrap();
+        let sessions: Vec<&str> = captured
+            .iter()
+            .map(|headers| {
+                headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("session_id: "))
+                    .unwrap()
+            })
+            .collect();
+        assert_ne!(sessions[0], sessions[1]);
+        for (index, headers) in captured.iter().enumerate() {
+            assert!(!headers.contains("raw-agent-lane-a"));
+            assert!(!headers.contains("raw-agent-lane-b"));
+            assert!(headers.contains(&format!("x-codex-window-id: {}:0", sessions[index])));
+            assert!(headers.contains(&format!("x-client-request-id: native-agent-{index}")));
         }
     }
 
@@ -696,11 +830,17 @@ mod tests {
         assert_eq!(resolved.model, "gpt-5.6-sol");
         assert_eq!(body["model"], "gpt-5.6-sol");
         assert!(resolved.use_responses_lite);
+        assert_eq!(body["client_metadata"]["lite"], "true");
 
-        let mut fast = request(json!({"model":"gpt-5.4-fast","input":[]}));
+        let mut fast = request(json!({
+            "model":"gpt-5.4-fast",
+            "input":[],
+            "client_metadata":{"lite":"true"}
+        }));
         let resolved = shape_native_request(&mut fast).unwrap();
         assert_eq!(resolved.model, "gpt-5.4");
         assert_eq!(fast["service_tier"], "priority");
+        assert!(fast.get("client_metadata").is_none());
     }
 
     #[test]
@@ -720,11 +860,13 @@ mod tests {
             let mut body = request(json!({
                 "model":"gpt-5.6-luna",
                 "tools":[{"type":tool_type}],
-                "input":[]
+                "input":[],
+                "client_metadata":{"lite":"true"}
             }));
             let resolved = shape_native_request(&mut body).unwrap();
             assert_eq!(resolved.model, "gpt-5.6-sol");
             assert!(!resolved.use_responses_lite);
+            assert!(body.get("client_metadata").is_none());
         }
     }
 

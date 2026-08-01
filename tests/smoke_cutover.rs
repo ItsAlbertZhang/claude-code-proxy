@@ -61,6 +61,14 @@ impl EnvGuard {
         }
         Self { key, previous }
     }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -85,17 +93,38 @@ async fn call_messages(model: &str) -> Response {
 }
 
 async fn call_messages_body(body: Value) -> Response {
+    call_messages_body_for_session(body, "smoke-session").await
+}
+
+async fn call_messages_body_for_session(body: Value, session_id: &str) -> Response {
+    call_messages_body_for_agent(body, session_id, None).await
+}
+
+async fn call_messages_body_for_agent(
+    body: Value,
+    session_id: &str,
+    agent_id: Option<&str>,
+) -> Response {
+    call_messages_body_for_uri_and_agent(body, "/v1/messages", session_id, agent_id).await
+}
+
+async fn call_messages_body_for_uri_and_agent(
+    body: Value,
+    uri: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", session_id);
+    if let Some(agent_id) = agent_id {
+        request = request.header("x-claude-code-agent-id", agent_id);
+    }
     app(Arc::new(Registry::with_default_alias()))
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .header("x-claude-code-session-id", "smoke-session")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap()
 }
@@ -368,6 +397,105 @@ async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> 
                 }
                 handled += 1;
             }
+        }
+    });
+
+    addr_str
+}
+
+#[derive(Debug, Clone)]
+struct CapturedWebSocketRequest {
+    socket_ordinal: usize,
+    body: Value,
+}
+
+fn last_input_text(body: &Value) -> String {
+    body.get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+        .and_then(|item| item.get("content"))
+        .and_then(Value::as_array)
+        .and_then(|parts| parts.last())
+        .and_then(|part| part.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("response")
+        .to_string()
+}
+
+async fn spawn_websocket_agent_lane_upstream(
+    captured: Arc<Mutex<Vec<CapturedWebSocketRequest>>>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+    let next_socket = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let captured = captured.clone();
+            let socket_ordinal = next_socket.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                loop {
+                    let Some(message) = ws.next().await else {
+                        return;
+                    };
+                    let text = match message {
+                        Ok(Message::Text(text)) => text,
+                        Ok(Message::Ping(data)) => {
+                            let _ = ws.send(Message::Pong(data)).await;
+                            continue;
+                        }
+                        Ok(Message::Pong(_)) | Ok(_) => continue,
+                        Err(_) => return,
+                    };
+                    let Ok(body) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    let marker = last_input_text(&body);
+                    let response_id = format!("resp_{}", marker.replace('-', "_"));
+                    let _ = captured.lock().map(|mut requests| {
+                        requests.push(CapturedWebSocketRequest {
+                            socket_ordinal,
+                            body,
+                        })
+                    });
+                    let events = [
+                        json!({
+                            "type":"response.output_item.added",
+                            "output_index":0,
+                            "item":{"type":"message","id":format!("msg_{response_id}")}
+                        }),
+                        json!({
+                            "type":"response.output_text.delta",
+                            "output_index":0,
+                            "delta":marker
+                        }),
+                        json!({
+                            "type":"response.output_item.done",
+                            "output_index":0,
+                            "item":{"type":"message"}
+                        }),
+                        json!({
+                            "type":"response.completed",
+                            "response":{
+                                "id":response_id,
+                                "usage":{"input_tokens":5,"output_tokens":2}
+                            }
+                        }),
+                    ];
+                    for event in events {
+                        if ws.send(Message::Text(event.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
         }
     });
 
@@ -1220,8 +1348,22 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
     .unwrap();
     assert_eq!(value["content"][0]["text"], "compacted ok");
 
+    let second_replay = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "current instructions",
+        "messages": [
+            {"role":"user","content":"<summary>portable summary with enough detail to anchor the compacted conversation</summary>"},
+            {"role":"user","content":"continue"},
+            {"role":"assistant","content":"compacted ok"},
+            {"role":"user","content":"continue again"}
+        ]
+    }))
+    .await;
+    assert_eq!(second_replay.status(), StatusCode::OK);
+
     let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert_eq!(requests[0]["model"], "gpt-5.6-sol");
     assert!(requests[0].get("client_metadata").is_some());
     assert_eq!(
@@ -1248,7 +1390,161 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
         .unwrap();
     assert_eq!(compaction["encrypted_content"], "opaque-history");
     assert!(replay.iter().any(|item| item["role"] == "user"));
+    assert!(
+        requests[3].to_string().contains("opaque-history"),
+        "a successful short replay must keep the native artifact active"
+    );
     clear_all_compactions_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_http_same_session_agents_keep_compaction_artifacts_isolated() {
+    let _guard = env_lock();
+    clear_all_compactions_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let body_text = body.to_string();
+            let lane = if body_text.contains("agent-a-old")
+                || body_text.contains("portable-agent-a")
+                || body_text.contains("continue-agent-a")
+            {
+                "agent-a"
+            } else if body_text.contains("agent-b-old")
+                || body_text.contains("portable-agent-b")
+                || body_text.contains("continue-agent-b")
+            {
+                "agent-b"
+            } else {
+                panic!("unable to identify compacted agent lane: {body_text}");
+            };
+            let is_compaction = body["input"].as_array().is_some_and(|input| {
+                input.last().and_then(|item| item["type"].as_str())
+                    == Some("compaction_trigger")
+            });
+            captured.lock().unwrap().push(body);
+
+            if is_compaction {
+                if lane == "agent-a" {
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                let encrypted_content = format!("opaque-{lane}");
+                format!(
+                    "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"compaction\",\"encrypted_content\":\"{encrypted_content}\"}}}}\n\n\
+                     data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-compact-{lane}\",\"usage\":{{\"input_tokens\":100,\"output_tokens\":1}}}}}}\n\n"
+                )
+                .into_bytes()
+            } else {
+                let is_summary = body_text.contains("Your task is to create a detailed summary");
+                let text = if is_summary {
+                    format!(
+                        "portable-{lane} summary with enough detail to anchor compacted conversation"
+                    )
+                } else {
+                    format!("replay-{lane}")
+                };
+                format!(
+                    "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg-{lane}\"}}}}\n\n\
+                     data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"{text}\"}}\n\n\
+                     data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"message\"}}}}\n\n\
+                     data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-{lane}\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":2}}}}}}\n\n"
+                )
+                .into_bytes()
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+    let _previous_response_env = EnvGuard::remove("CCP_CODEX_PREVIOUS_RESPONSE_ID");
+
+    let compact_body = |lane: &str| {
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "system": "You are Claude Code.",
+            "messages": [
+                {"role":"user","content":format!("{lane}-old")},
+                {"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}
+            ]
+        })
+    };
+    let (compact_a, compact_b) = tokio::join!(
+        call_messages_body_for_agent(
+            compact_body("agent-a"),
+            "shared-compaction-session",
+            Some("agent-a"),
+        ),
+        call_messages_body_for_agent(
+            compact_body("agent-b"),
+            "shared-compaction-session",
+            Some("agent-b"),
+        )
+    );
+    assert_eq!(compact_a.status(), StatusCode::OK);
+    assert_eq!(compact_b.status(), StatusCode::OK);
+    let _ = tokio::join!(
+        axum::body::to_bytes(compact_a.into_body(), usize::MAX),
+        axum::body::to_bytes(compact_b.into_body(), usize::MAX)
+    );
+
+    let replay_body = |lane: &str| {
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "system": "current instructions",
+            "messages": [
+                {"role":"user","content":format!("<summary>portable-{lane} summary with enough detail to anchor compacted conversation</summary>")},
+                {"role":"user","content":format!("continue-{lane}")}
+            ]
+        })
+    };
+    let (replay_a, replay_b) = tokio::join!(
+        call_messages_body_for_agent(
+            replay_body("agent-a"),
+            "shared-compaction-session",
+            Some("agent-a"),
+        ),
+        call_messages_body_for_agent(
+            replay_body("agent-b"),
+            "shared-compaction-session",
+            Some("agent-b"),
+        )
+    );
+    assert_eq!(replay_a.status(), StatusCode::OK);
+    assert_eq!(replay_b.status(), StatusCode::OK);
+    let _ = tokio::join!(
+        axum::body::to_bytes(replay_a.into_body(), usize::MAX),
+        axum::body::to_bytes(replay_b.into_body(), usize::MAX)
+    );
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    let replay_a = requests
+        .iter()
+        .find(|request| request.to_string().contains("continue-agent-a"))
+        .expect("agent A replay request");
+    let replay_b = requests
+        .iter()
+        .find(|request| request.to_string().contains("continue-agent-b"))
+        .expect("agent B replay request");
+    assert!(replay_a.to_string().contains("opaque-agent-a"));
+    assert!(!replay_a.to_string().contains("opaque-agent-b"));
+    assert!(replay_b.to_string().contains("opaque-agent-b"));
+    assert!(!replay_b.to_string().contains("opaque-agent-a"));
+
+    drop(requests);
+    clear_all_compactions_for_tests();
+    clear_all_continuations_for_tests();
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1748,6 +2044,308 @@ async fn smoke_codex_websocket_stream_uses_previous_response_id() {
     );
     assert_eq!(guard[1]["input"][0]["role"], "user");
     assert_eq!(guard[1]["input"][0]["content"][0]["text"], "two");
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_same_session_agents_keep_independent_chains() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+    clear_all_compactions_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_websocket_agent_lane_upstream(captured.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+
+    let (a1, b1) = tokio::join!(
+        call_messages_body_for_agent(
+            json!({
+                "model": "gpt-5.5",
+                "max_tokens": 64,
+                "messages": [{"role":"user","content":"agent-a-one"}]
+            }),
+            "shared-agent-session",
+            Some("agent-a"),
+        ),
+        call_messages_body_for_agent(
+            json!({
+                "model": "gpt-5.5",
+                "max_tokens": 64,
+                "messages": [{"role":"user","content":"agent-b-one"}]
+            }),
+            "shared-agent-session",
+            Some("agent-b"),
+        )
+    );
+    assert_eq!(a1.status(), StatusCode::OK);
+    assert_eq!(b1.status(), StatusCode::OK);
+    let _ = tokio::join!(
+        axum::body::to_bytes(a1.into_body(), usize::MAX),
+        axum::body::to_bytes(b1.into_body(), usize::MAX)
+    );
+
+    let (a2, b2) = tokio::join!(
+        call_messages_body_for_agent(
+            json!({
+                "model": "gpt-5.5",
+                "max_tokens": 64,
+                "messages": [
+                    {"role":"user","content":"agent-a-one"},
+                    {"role":"assistant","content":"agent-a-one"},
+                    {"role":"user","content":"agent-a-two"}
+                ]
+            }),
+            "shared-agent-session",
+            Some("agent-a"),
+        ),
+        call_messages_body_for_agent(
+            json!({
+                "model": "gpt-5.5",
+                "max_tokens": 64,
+                "messages": [
+                    {"role":"user","content":"agent-b-one"},
+                    {"role":"assistant","content":"agent-b-one"},
+                    {"role":"user","content":"agent-b-two"}
+                ]
+            }),
+            "shared-agent-session",
+            Some("agent-b"),
+        )
+    );
+    assert_eq!(a2.status(), StatusCode::OK);
+    assert_eq!(b2.status(), StatusCode::OK);
+    let _ = tokio::join!(
+        axum::body::to_bytes(a2.into_body(), usize::MAX),
+        axum::body::to_bytes(b2.into_body(), usize::MAX)
+    );
+
+    let guard = captured.lock().unwrap();
+    assert_eq!(guard.len(), 4, "expected two turns for each agent lane");
+    let request = |marker: &str| {
+        guard
+            .iter()
+            .find(|request| last_input_text(&request.body) == marker)
+            .unwrap_or_else(|| panic!("missing upstream request for {marker}"))
+    };
+    let a1 = request("agent-a-one");
+    let a2 = request("agent-a-two");
+    let b1 = request("agent-b-one");
+    let b2 = request("agent-b-two");
+
+    assert_eq!(a2.body["previous_response_id"], "resp_agent_a_one");
+    assert_eq!(b2.body["previous_response_id"], "resp_agent_b_one");
+    assert_eq!(a2.body["input"].as_array().map(Vec::len), Some(1));
+    assert_eq!(b2.body["input"].as_array().map(Vec::len), Some(1));
+    assert_eq!(a1.socket_ordinal, a2.socket_ordinal);
+    assert_eq!(b1.socket_ordinal, b2.socket_ordinal);
+    assert_ne!(a1.socket_ordinal, b1.socket_ordinal);
+
+    drop(guard);
+    clear_all_compactions_for_tests();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_auxiliary_requests_do_not_disturb_agent_continuation() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_websocket_agent_lane_upstream(captured.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+    let _review_model_env = EnvGuard::remove("CCP_AUTO_REVIEW_MODEL");
+
+    let first = call_messages_body_for_agent(
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{"role":"user","content":"aux-agent-one"}]
+        }),
+        "aux-agent-session",
+        Some("agent-a"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let count_tokens = call_messages_body_for_uri_and_agent(
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{"role":"user","content":"count-only"}]
+        }),
+        "/v1/messages/count_tokens",
+        "aux-agent-session",
+        Some("agent-a"),
+    )
+    .await;
+    assert_eq!(count_tokens.status(), StatusCode::OK);
+
+    let classifier = call_messages_body_for_agent(
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "stream": false,
+            "system": [{
+                "type": "text",
+                "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"
+            }],
+            "messages": [{"role":"user","content":"review this Bash command"}],
+            "tools": []
+        }),
+        "aux-agent-session",
+        Some("agent-a"),
+    )
+    .await;
+    assert_eq!(classifier.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(classifier.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let second = call_messages_body_for_agent(
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [
+                {"role":"user","content":"aux-agent-one"},
+                {"role":"assistant","content":"aux-agent-one"},
+                {"role":"user","content":"aux-agent-two"}
+            ]
+        }),
+        "aux-agent-session",
+        Some("agent-a"),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let guard = captured.lock().unwrap();
+    assert_eq!(guard.len(), 3, "count_tokens must not call Codex upstream");
+    let request = |marker: &str| {
+        guard
+            .iter()
+            .find(|request| last_input_text(&request.body) == marker)
+            .unwrap_or_else(|| panic!("missing upstream request for {marker}"))
+    };
+    let first = request("aux-agent-one");
+    let classifier = request("review this Bash command");
+    let second = request("aux-agent-two");
+    assert!(classifier.body.get("previous_response_id").is_none());
+    assert_ne!(classifier.socket_ordinal, first.socket_ordinal);
+    assert_eq!(second.socket_ordinal, first.socket_ordinal);
+    assert_eq!(second.body["previous_response_id"], "resp_aux_agent_one");
+    assert_eq!(second.body["input"].as_array().map(Vec::len), Some(1));
+
+    drop(guard);
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_missing_origin_socket_retries_full_context() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_websocket_agent_lane_upstream(captured.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+
+    for transport in ["websocket", "auto"] {
+        let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", transport);
+        for (label, stream) in [("buffered", false), ("stream", true)] {
+            clear_codex_websocket_pool_for_tests();
+            clear_all_continuations_for_tests();
+            let first_marker = format!("socket-{transport}-{label}-one");
+            let second_marker = format!("socket-{transport}-{label}-two");
+            let session = format!("socket-retry-{transport}-{label}");
+
+            let first = call_messages_body_for_agent(
+                json!({
+                    "model": "gpt-5.5",
+                    "max_tokens": 64,
+                    "stream": stream,
+                    "messages": [{"role":"user","content":first_marker}]
+                }),
+                &session,
+                Some("agent-a"),
+            )
+            .await;
+            assert_eq!(first.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap();
+
+            clear_codex_websocket_pool_for_tests();
+
+            let second = call_messages_body_for_agent(
+                json!({
+                    "model": "gpt-5.5",
+                    "max_tokens": 64,
+                    "stream": stream,
+                    "messages": [
+                        {"role":"user","content":first_marker},
+                        {"role":"assistant","content":first_marker},
+                        {"role":"user","content":second_marker}
+                    ]
+                }),
+                &session,
+                Some("agent-a"),
+            )
+            .await;
+            assert_eq!(second.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(second.into_body(), usize::MAX)
+                .await
+                .unwrap();
+
+            let guard = captured.lock().unwrap();
+            let first = guard
+                .iter()
+                .find(|request| last_input_text(&request.body) == first_marker)
+                .unwrap();
+            let second = guard
+                .iter()
+                .find(|request| last_input_text(&request.body) == second_marker)
+                .unwrap();
+            assert_ne!(first.socket_ordinal, second.socket_ordinal);
+            assert!(second.body.get("previous_response_id").is_none());
+            assert_eq!(
+                second.body["input"].as_array().map(Vec::len),
+                Some(3),
+                "missing originating socket must force a full-context retry"
+            );
+            drop(guard);
+        }
+    }
 
     clear_all_continuations_for_tests();
     clear_codex_websocket_pool_for_tests();

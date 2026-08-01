@@ -439,6 +439,7 @@ fn redact_traffic_value(value: &Value) -> Value {
     }
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn set_mode(path: &Path, mode: u32) {
     #[cfg(unix)]
     {

@@ -4,7 +4,7 @@ use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
 
 use super::reducer::{
-    ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic, reduce_upstream_bytes,
+    ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic, reduce_upstream_bytes_in_scope,
 };
 use super::web_search_compat::build_web_search_compat_blocks;
 
@@ -264,7 +264,25 @@ pub fn translate_stream_bytes_with_traffic(
     estimated_input_tokens: u64,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let events = match reduce_upstream_bytes(upstream) {
+    translate_stream_bytes_with_traffic_in_scope(
+        upstream,
+        message_id,
+        model,
+        estimated_input_tokens,
+        traffic,
+        Some("legacy"),
+    )
+}
+
+pub fn translate_stream_bytes_with_traffic_in_scope(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    estimated_input_tokens: u64,
+    traffic: Option<&TrafficCapture>,
+    rewrite_scope: Option<&str>,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let events = match reduce_upstream_bytes_in_scope(upstream, rewrite_scope) {
         Ok(events) => events,
         Err(err) => {
             write_reducer_error_capture(traffic, &err);

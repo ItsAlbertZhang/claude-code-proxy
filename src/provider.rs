@@ -1,5 +1,6 @@
 use crate::anthropic::schema::MessagesRequest;
 use crate::monitor::MonitorHandle;
+use crate::request_identity::RequestScope;
 use crate::traffic::TrafficCapture;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -28,6 +29,24 @@ pub trait Provider: Send + Sync {
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 
+    async fn handle_messages_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        _scope: RequestScope,
+    ) -> Response {
+        self.handle_messages(body, ctx).await
+    }
+
+    async fn handle_count_tokens_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        _scope: RequestScope,
+    ) -> Response {
+        self.handle_count_tokens(body, ctx).await
+    }
+
     async fn generate_anthropic_stream(
         &self,
         _body: MessagesRequest,
@@ -41,6 +60,15 @@ pub trait Provider: Send + Sync {
                 self.name()
             ),
         ))
+    }
+
+    async fn generate_anthropic_stream_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        _scope: RequestScope,
+    ) -> Result<Generation, ProviderError> {
+        self.generate_anthropic_stream(body, ctx).await
     }
 }
 

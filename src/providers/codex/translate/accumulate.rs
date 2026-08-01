@@ -4,7 +4,7 @@ use crate::traffic::TrafficCapture;
 
 use super::reducer::{
     AnthropicUsage, ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic,
-    reduce_upstream_bytes,
+    reduce_upstream_bytes_in_scope,
 };
 use super::web_search_compat::{WebSearchCompatContent, build_web_search_compat_blocks};
 
@@ -22,7 +22,17 @@ pub fn accumulate_response_with_traffic(
     model: &str,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Value, anyhow::Error> {
-    let events = match reduce_upstream_bytes(upstream) {
+    accumulate_response_with_traffic_in_scope(upstream, message_id, model, traffic, Some("legacy"))
+}
+
+pub fn accumulate_response_with_traffic_in_scope(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+    rewrite_scope: Option<&str>,
+) -> Result<Value, anyhow::Error> {
+    let events = match reduce_upstream_bytes_in_scope(upstream, rewrite_scope) {
         Ok(events) => events,
         Err(err) => {
             write_reducer_error_capture(traffic, &err);

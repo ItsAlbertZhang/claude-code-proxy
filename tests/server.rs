@@ -8,13 +8,14 @@ use claude_code_proxy::{
     monitor::{MonitorHandle, RequestStatus},
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
+    request_identity::{AgentLaneKey, RequestPurpose, RequestScope},
     server::{
         AppFeatures, app, app_with_features, app_with_monitor, app_with_options,
         bind_proxy_listener,
     },
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::util::ServiceExt;
 
 fn body_string(json: &str) -> Body {
@@ -95,6 +96,93 @@ impl Provider for FakeProvider {
     }
 }
 
+struct ScopeCaptureProvider {
+    scopes: Arc<Mutex<Vec<RequestScope>>>,
+    contexts: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait]
+impl Provider for ScopeCaptureProvider {
+    fn name(&self) -> &'static str {
+        "kimi"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["kimi-k2.6".to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unscoped messages").into_response()
+    }
+
+    async fn handle_messages_scoped(
+        &self,
+        _body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> axum::response::Response {
+        self.contexts.lock().unwrap().push(ctx.session_id);
+        self.scopes.lock().unwrap().push(scope);
+        (StatusCode::OK, "ok").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unscoped count tokens").into_response()
+    }
+
+    async fn handle_count_tokens_scoped(
+        &self,
+        _body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> axum::response::Response {
+        self.contexts.lock().unwrap().push(ctx.session_id);
+        self.scopes.lock().unwrap().push(scope);
+        (StatusCode::OK, "ok").into_response()
+    }
+
+    async fn generate_anthropic_stream_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> Result<Generation, ProviderError> {
+        self.contexts.lock().unwrap().push(ctx.session_id);
+        self.scopes.lock().unwrap().push(scope);
+        let model = body.model.unwrap_or_else(|| "kimi-k2.6".to_string());
+        let sse = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_scope\",\"model\":{model:?},\"usage\":{{\"input_tokens\":1}}}}}}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"ok\"}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        Ok(Generation {
+            body: GenerationBody::BufferedSse(sse.into()),
+            resolved_model: model,
+        })
+    }
+
+    async fn generate_anthropic_stream(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> Result<Generation, ProviderError> {
+        Ok(Generation {
+            body: GenerationBody::BufferedSse(Vec::new().into()),
+            resolved_model: "kimi-k2.6".to_string(),
+        })
+    }
+}
+
 fn routed_registry() -> Arc<Registry> {
     Arc::new(Registry::from_providers(
         AliasProvider::Kimi,
@@ -166,6 +254,205 @@ async fn healthz_returns_ok() {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap();
     assert_eq!(body, json!({"ok": true}));
+}
+
+#[tokio::test]
+async fn messages_ingress_preserves_agent_identity_and_auxiliary_purpose() {
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(Registry::from_providers(
+        AliasProvider::Kimi,
+        vec![Arc::new(ScopeCaptureProvider {
+            scopes: scopes.clone(),
+            contexts: contexts.clone(),
+        }) as Arc<dyn Provider>],
+    ));
+    let app = app(registry);
+    let body =
+        r#"{"model":"kimi-k2.6","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
+
+    let nested = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "shared-session")
+                .header("x-claude-code-agent-id", "child-agent")
+                .header("x-claude-code-parent-agent-id", "parent-agent")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nested.status(), StatusCode::OK);
+
+    let main = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "shared-session")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(main.status(), StatusCode::OK);
+
+    let ambiguous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-agent-id", "orphan-agent")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ambiguous.status(), StatusCode::OK);
+
+    let count_tokens = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "shared-session")
+                .header("x-claude-code-agent-id", "child-agent")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count_tokens.status(), StatusCode::OK);
+
+    let scopes = scopes.lock().unwrap();
+    assert_eq!(scopes.len(), 4);
+    assert_eq!(scopes[0].purpose, RequestPurpose::Conversation);
+    assert_eq!(scopes[0].identity.parent_agent_id(), Some("parent-agent"));
+    assert!(matches!(
+        scopes[0].lane(),
+        Some(AgentLaneKey::Agent {
+            session_id,
+            agent_id,
+        }) if session_id == "shared-session" && agent_id == "child-agent"
+    ));
+    assert!(matches!(
+        scopes[1].lane(),
+        Some(AgentLaneKey::Main { session_id }) if session_id == "shared-session"
+    ));
+    assert!(scopes[2].lane().is_none());
+    assert_eq!(scopes[3].purpose, RequestPurpose::CountTokens);
+    assert!(scopes[3].lane().is_some());
+    assert!(scopes[3].conversational_lane().is_none());
+    assert_eq!(
+        *contexts.lock().unwrap(),
+        vec![
+            Some("shared-session".to_string()),
+            Some("shared-session".to_string()),
+            None,
+            None,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn openai_ingress_restores_legacy_identity_without_bypassing_claude_validation() {
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(Registry::from_providers(
+        AliasProvider::Kimi,
+        vec![Arc::new(ScopeCaptureProvider {
+            scopes: scopes.clone(),
+            contexts: contexts.clone(),
+        }) as Arc<dyn Provider>],
+    ));
+    let app = app_with_options(registry, None, true);
+
+    for (endpoint, body) in [
+        ("/v1/responses", r#"{"model":"kimi-k2.6","input":"hello"}"#),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}]}"#,
+        ),
+    ] {
+        for headers in [
+            vec![("session_id", "legacy-session")],
+            vec![("x-client-request-id", "legacy-request")],
+            vec![
+                ("x-claude-code-session-id", "shared-session"),
+                ("x-claude-code-agent-id", "child-agent"),
+                ("session_id", "ignored-legacy"),
+            ],
+            vec![
+                ("x-claude-code-agent-id", "orphan-agent"),
+                ("session_id", "must-not-fallback"),
+            ],
+            vec![
+                ("x-claude-code-session-id", "duplicate-one"),
+                ("x-claude-code-session-id", "duplicate-two"),
+                ("x-client-request-id", "must-not-fallback-either"),
+            ],
+        ] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri(endpoint)
+                .header("content-type", "application/json");
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(body_string(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "endpoint={endpoint}");
+        }
+    }
+
+    let scopes = scopes.lock().unwrap();
+    assert_eq!(scopes.len(), 10);
+    for offset in [0, 5] {
+        assert!(matches!(
+            scopes[offset].lane(),
+            Some(AgentLaneKey::Main { session_id }) if session_id == "legacy-session"
+        ));
+        assert!(matches!(
+            scopes[offset + 1].lane(),
+            Some(AgentLaneKey::Main { session_id }) if session_id == "legacy-request"
+        ));
+        assert!(matches!(
+            scopes[offset + 2].lane(),
+            Some(AgentLaneKey::Agent {
+                session_id,
+                agent_id,
+            }) if session_id == "shared-session" && agent_id == "child-agent"
+        ));
+        assert!(scopes[offset + 3].lane().is_none());
+        assert!(scopes[offset + 4].lane().is_none());
+    }
+    assert_eq!(
+        *contexts.lock().unwrap(),
+        vec![
+            Some("legacy-session".to_string()),
+            Some("legacy-request".to_string()),
+            Some("shared-session".to_string()),
+            None,
+            None,
+            Some("legacy-session".to_string()),
+            Some("legacy-request".to_string()),
+            Some("shared-session".to_string()),
+            None,
+            None,
+        ]
+    );
 }
 
 #[tokio::test]
@@ -929,7 +1216,7 @@ async fn monitor_records_successful_request_events() {
         state.recent[0].session_id.as_deref(),
         Some("project-session")
     );
-    assert!(state.recent[0].session_seq.is_some());
+    assert!(state.recent[0].session_seq.is_none());
     assert_eq!(state.recent[0].project.as_deref(), Some("example"));
     assert_eq!(state.sessions[0].project.as_deref(), Some("example"));
     assert_eq!(state.recent[0].provider.as_deref(), Some("codex"));

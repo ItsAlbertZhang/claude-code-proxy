@@ -9,6 +9,7 @@ pub mod images;
 pub mod native;
 pub mod request_summary;
 pub mod search;
+pub mod state;
 pub mod transcription;
 pub mod translate;
 pub mod websocket;
@@ -30,6 +31,7 @@ use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::registry;
+use crate::request_identity::RequestScope;
 use crate::retry::{compute_backoff_delay, sleep};
 
 use self::auth::browser_login::run_browser_login;
@@ -38,20 +40,20 @@ use self::auth::manager::CodexAuthManager;
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
 use self::compaction::{
-    CompactionAttempt, abort_compaction_attempt, activate_compaction, apply_compaction_replay,
-    begin_compaction, request_compaction, store_compaction,
+    CompactionLease, abort_compaction_attempt, activate_compaction, apply_compaction_replay,
+    begin_compaction_with_permit, request_compaction, reserve_compaction_start, store_compaction,
 };
 use self::continuation::{
     ContinuationCandidate, abort_continuation, continuation_candidate, record_continuation,
 };
 use self::count_tokens::count_translated_tokens;
-use self::translate::accumulate::accumulate_response_with_traffic;
+use self::translate::accumulate::accumulate_response_with_traffic_in_scope;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
     uses_responses_lite,
 };
-use self::translate::reducer::finish_metadata_from_upstream;
+use self::translate::reducer::finish_metadata_from_upstream_in_scope;
 use self::translate::request::{
     TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
 };
@@ -59,14 +61,14 @@ use self::translate::request::{
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
-use self::translate::stream::translate_stream_bytes_with_traffic;
+use self::translate::stream::translate_stream_bytes_with_traffic_in_scope;
 
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
 
-pub(crate) fn clear_session_compaction(session_id: &str) {
-    compaction::clear_compaction(session_id);
+pub(crate) fn clear_lane_compactions(lane_token: &str) {
+    compaction::clear_compactions_for_lane(lane_token);
 }
 
 pub struct CodexProvider {
@@ -83,6 +85,13 @@ impl CodexProvider {
     pub fn new() -> Self {
         Self {
             client: Arc::new(CodexHttpClient::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_client(client: CodexHttpClient) -> Self {
+        Self {
+            client: Arc::new(client),
         }
     }
 }
@@ -110,7 +119,7 @@ impl Provider for CodexProvider {
         &CODEX_CLI
     }
 
-    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+    async fn handle_messages(&self, body: MessagesRequest, mut ctx: RequestContext) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
@@ -131,7 +140,8 @@ impl Provider for CodexProvider {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.model_resolved(&ctx.req_id, &resolved.model);
             }
-            let (search_request, query) = match search::build_search_request(
+            let lane_token = ctx.session_id.clone();
+            let (mut search_request, query) = match search::build_search_request(
                 &body,
                 &resolved.model,
                 ctx.session_id.as_deref(),
@@ -145,6 +155,15 @@ impl Provider for CodexProvider {
                     );
                 }
             };
+            let route = match self.client.conversation_route(false).await {
+                Ok(route) => route,
+                Err(error) => return map_codex_error_to_response(&error),
+            };
+            if let Some(lane_token) = lane_token.as_deref() {
+                let bound_lane = route.bind_lane(lane_token);
+                search_request.id = bound_lane.clone();
+                ctx.session_id = Some(bound_lane);
+            }
             let log = create_logger("codex");
             let started_at = Instant::now();
             log.info(
@@ -158,7 +177,11 @@ impl Provider for CodexProvider {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.upstream_started(&ctx.req_id);
             }
-            let search_response = match self.client.post_search(&search_request, &ctx).await {
+            let search_response = match self
+                .client
+                .post_search_bound(&route, &search_request, &ctx)
+                .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     log.warn(
@@ -210,6 +233,19 @@ impl Provider for CodexProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
+        let lane_token = ctx.session_id.clone();
+        let compact_boundary = is_compact_messages_request(&body);
+        let server_compaction_enabled = config::codex_server_compaction();
+        let compaction_start = (server_compaction_enabled && compact_boundary)
+            .then(|| reserve_compaction_start(lane_token.as_deref(), &ctx.req_id))
+            .flatten();
+        let route = match self.client.conversation_route(use_responses_lite).await {
+            Ok(route) => route,
+            Err(error) => return map_codex_error_to_response(&error),
+        };
+        if let Some(lane_token) = lane_token.as_deref() {
+            ctx.session_id = Some(route.bind_lane(lane_token));
+        }
 
         let mut translated = match translate_request(
             &body,
@@ -230,63 +266,66 @@ impl Provider for CodexProvider {
             }
         };
 
-        let compact_boundary = is_compact_messages_request(&body);
-        let server_compaction_enabled = config::codex_server_compaction();
-        let mut compaction_attempt = None;
+        let mut compaction_lease = None;
         if !server_compaction_enabled && let Some(session_id) = ctx.session_id.as_deref() {
             compaction::clear_compaction(session_id);
         }
-        if server_compaction_enabled
-            && compact_boundary
-            && let Some(session_id) = ctx.session_id.as_deref()
-        {
-            let attempt = begin_compaction(session_id, &translated.model);
-            compaction_attempt = Some(attempt);
-            log_compaction_event(
-                "server_compaction_triggered",
-                &ctx,
-                translated.input.len(),
-                None,
-            );
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.compaction_started(&ctx.req_id);
-            }
-            let mut compaction_ctx = ctx.clone();
-            compaction_ctx.monitor = None;
-            match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
-                Ok(native_history) => {
-                    if store_compaction(session_id, attempt, native_history) {
-                        log_compaction_event(
-                            "server_compaction_completed",
-                            &ctx,
-                            translated.input.len(),
-                            None,
-                        );
-                    } else {
+        if server_compaction_enabled && compact_boundary {
+            if let Some(lease) = compaction_start.and_then(|permit| {
+                begin_compaction_with_permit(ctx.session_id.as_deref(), &translated.model, permit)
+            }) {
+                log_compaction_event(
+                    "server_compaction_triggered",
+                    &ctx,
+                    translated.input.len(),
+                    None,
+                );
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.compaction_started(&ctx.req_id);
+                }
+                let mut compaction_ctx = ctx.clone();
+                compaction_ctx.monitor = None;
+                match request_compaction(self.client.as_ref(), &route, &translated, &compaction_ctx)
+                    .await
+                {
+                    Ok(native_history) => {
+                        if store_compaction(&lease, &translated.model, native_history) {
+                            log_compaction_event(
+                                "server_compaction_completed",
+                                &ctx,
+                                translated.input.len(),
+                                None,
+                            );
+                            compaction_lease = Some(lease);
+                        } else {
+                            abort_compaction_attempt(Some(&lease));
+                            log_compaction_event(
+                                "server_compaction_failed",
+                                &ctx,
+                                translated.input.len(),
+                                Some(
+                                    "compaction state was superseded or exceeded the in-memory limit",
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        abort_compaction_attempt(Some(&lease));
                         log_compaction_event(
                             "server_compaction_failed",
                             &ctx,
                             translated.input.len(),
-                            Some("compaction state was superseded or exceeded the in-memory limit"),
+                            Some(&error.to_string()),
                         );
                     }
                 }
-                Err(error) => {
-                    abort_compaction_attempt(Some(session_id), Some(attempt));
-                    log_compaction_event(
-                        "server_compaction_failed",
-                        &ctx,
-                        translated.input.len(),
-                        Some(&error.to_string()),
-                    );
-                }
             }
         } else if server_compaction_enabled
-            && !compact_boundary
-            && let Some(replay) = apply_compaction_replay(ctx.session_id.as_deref(), &translated)
+            && let Some(replay) =
+                apply_compaction_replay(ctx.session_id.as_deref(), &translated, &ctx.req_id)
         {
             translated = replay.request;
-            compaction_attempt = Some(replay.attempt);
+            compaction_lease = Some(replay.lease);
         }
 
         // Check continuation
@@ -307,15 +346,13 @@ impl Provider for CodexProvider {
             let stream_request = translated.clone();
             return live_stream_response(
                 client,
+                route,
                 message_id,
                 model,
                 ctx,
                 stream_request,
                 continuation,
-                LiveStreamCompaction {
-                    compact_boundary,
-                    attempt: compaction_attempt,
-                },
+                compaction_lease,
             )
             .await;
         }
@@ -324,12 +361,12 @@ impl Provider for CodexProvider {
         let mut attempt = 0_u32;
         let upstream = loop {
             let response = match client
-                .post_codex(&translated, &ctx, continuation.as_ref())
+                .post_codex_bound(&route, &translated, &ctx, continuation.as_ref())
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                    abort_compaction_attempt(compaction_lease.as_ref());
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_error_to_response(&e);
                 }
@@ -342,13 +379,13 @@ impl Provider for CodexProvider {
             let error = empty_buffered_completion_error();
             drop_live_continuation_for_retry(&mut continuation);
             if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
-                abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                abort_compaction_attempt(compaction_lease.as_ref());
                 abort_continuation(ctx.session_id.as_deref(), turn_id);
                 return map_codex_error_to_response(&error);
             }
             let delay = compute_backoff_delay(attempt, None);
             if delay.exceeds_budget {
-                abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                abort_compaction_attempt(compaction_lease.as_ref());
                 abort_continuation(ctx.session_id.as_deref(), turn_id);
                 return map_codex_error_to_response(&error);
             }
@@ -358,16 +395,17 @@ impl Provider for CodexProvider {
 
         if want_stream {
             let estimated_input_tokens = count_translated_tokens(&translated);
-            let sse_bytes = match translate_stream_bytes_with_traffic(
+            let sse_bytes = match translate_stream_bytes_with_traffic_in_scope(
                 &upstream.body,
                 &message_id,
                 model,
                 estimated_input_tokens,
                 ctx.traffic.as_deref(),
+                ctx.session_id.as_deref(),
             ) {
                 Ok(b) => b,
                 Err(e) => {
-                    abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                    abort_compaction_attempt(compaction_lease.as_ref());
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_failure_to_response(&format!(
                         "Stream translation error: {e}"
@@ -387,10 +425,10 @@ impl Provider for CodexProvider {
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
                 turn_id,
-                compaction_attempt,
                 &translated,
                 &upstream.body,
-                compact_boundary,
+                upstream.socket_id,
+                compaction_lease.as_ref(),
             );
 
             let headers = [
@@ -400,11 +438,12 @@ impl Provider for CodexProvider {
             ];
             (headers, sse_bytes).into_response()
         } else {
-            match accumulate_response_with_traffic(
+            match accumulate_response_with_traffic_in_scope(
                 &upstream.body,
                 &message_id,
                 model,
                 ctx.traffic.as_deref(),
+                ctx.session_id.as_deref(),
             ) {
                 Ok(json) => {
                     if let Some(monitor) = ctx.monitor.as_ref() {
@@ -418,20 +457,30 @@ impl Provider for CodexProvider {
                     update_continuation_from_upstream(
                         ctx.session_id.as_deref(),
                         turn_id,
-                        compaction_attempt,
                         &translated,
                         &upstream.body,
-                        compact_boundary,
+                        upstream.socket_id,
+                        compaction_lease.as_ref(),
                     );
                     (StatusCode::OK, Json(json)).into_response()
                 }
                 Err(e) => {
-                    abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                    abort_compaction_attempt(compaction_lease.as_ref());
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     map_codex_failure_to_response(&format!("Accumulation error: {e}"))
                 }
             }
         }
+    }
+
+    async fn handle_messages_scoped(
+        &self,
+        body: MessagesRequest,
+        mut ctx: RequestContext,
+        scope: RequestScope,
+    ) -> Response {
+        ctx.session_id = scope.lane_token("codex-conversation");
+        self.handle_messages(body, ctx).await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -522,9 +571,10 @@ fn log_compaction_event(
 fn abort_request_state(
     session_id: Option<&str>,
     turn_id: Option<u64>,
-    compaction_attempt: Option<CompactionAttempt>,
+    compaction_lease: Option<&CompactionLease>,
+    _request: &translate::request::ResponsesRequest,
 ) {
-    abort_compaction_attempt(session_id, compaction_attempt);
+    abort_compaction_attempt(compaction_lease);
     abort_continuation(session_id, turn_id);
 }
 
@@ -533,20 +583,16 @@ enum LiveStreamStart {
     Retry { error: client::CodexError },
 }
 
-#[derive(Clone, Copy)]
-struct LiveStreamCompaction {
-    compact_boundary: bool,
-    attempt: Option<CompactionAttempt>,
-}
-
+#[allow(clippy::too_many_arguments)]
 async fn live_stream_response(
     client: Arc<CodexHttpClient>,
+    route: client::CodexConversationRoute,
     message_id: String,
     model: &str,
     ctx: RequestContext,
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationCandidate,
-    compaction: LiveStreamCompaction,
+    compaction_lease: Option<CompactionLease>,
 ) -> Response {
     let model = model.to_string();
     let turn_id = continuation.turn_id;
@@ -555,7 +601,7 @@ async fn live_stream_response(
 
     loop {
         let upstream_events = match client
-            .stream_codex_websocket_events(&request_body, &ctx, continuation.as_ref())
+            .stream_codex_websocket_events_bound(&route, &request_body, &ctx, continuation.as_ref())
             .await
         {
             Ok(events) => events,
@@ -566,12 +612,22 @@ async fn live_stream_response(
                     continue;
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compaction_lease.as_ref(),
+                        &request_body,
+                    );
                     return map_codex_error_to_response(&err);
                 }
                 let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
                 if delay.exceeds_budget {
-                    abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compaction_lease.as_ref(),
+                        &request_body,
+                    );
                     return map_codex_error_to_response(&err);
                 }
                 attempt += 1;
@@ -579,7 +635,12 @@ async fn live_stream_response(
                 continue;
             }
             Err(err) => {
-                abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                abort_request_state(
+                    ctx.session_id.as_deref(),
+                    turn_id,
+                    compaction_lease.as_ref(),
+                    &request_body,
+                );
                 return map_codex_error_to_response(&err);
             }
         };
@@ -591,7 +652,7 @@ async fn live_stream_response(
             ctx.clone(),
             turn_id,
             request_body.clone(),
-            compaction,
+            compaction_lease.clone(),
         )
         .await
         {
@@ -603,12 +664,22 @@ async fn live_stream_response(
                     continue;
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compaction_lease.as_ref(),
+                        &request_body,
+                    );
                     return map_codex_error_to_response(&error);
                 }
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
-                    abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compaction_lease.as_ref(),
+                        &request_body,
+                    );
                     return map_codex_error_to_response(&error);
                 }
                 attempt += 1;
@@ -625,14 +696,15 @@ async fn live_stream_response_once(
     ctx: RequestContext,
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
-    compaction: LiveStreamCompaction,
+    compaction_lease: Option<CompactionLease>,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
         message_id,
         model.to_string(),
         estimated_input_tokens,
-    );
+    )
+    .with_read_rewrite_scope(ctx.session_id.clone());
     let mut upstream_sse_body = Vec::new();
     // Keep protocol framing private until real output makes a transparent retry unsafe.
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.
@@ -646,7 +718,12 @@ async fn live_stream_response_once(
                 if retryable_live_start_codex_error(&err) {
                     return LiveStreamStart::Retry { error: err };
                 }
-                abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                abort_request_state(
+                    ctx.session_id.as_deref(),
+                    turn_id,
+                    compaction_lease.as_ref(),
+                    &request_body,
+                );
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
@@ -694,7 +771,12 @@ async fn live_stream_response_once(
                         },
                     };
                 }
-                abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                abort_request_state(
+                    ctx.session_id.as_deref(),
+                    turn_id,
+                    compaction_lease.as_ref(),
+                    &request_body,
+                );
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
@@ -714,10 +796,10 @@ async fn live_stream_response_once(
                 update_continuation_from_upstream(
                     ctx.session_id.as_deref(),
                     turn_id,
-                    compaction.attempt,
                     &request_body,
                     &upstream_sse_body,
-                    compaction.compact_boundary,
+                    upstream_events.socket_id(),
+                    compaction_lease.as_ref(),
                 );
                 return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
             }
@@ -729,17 +811,17 @@ async fn live_stream_response_once(
                 turn_id,
                 request_body,
                 upstream_sse_body,
-                compaction,
+                compaction_lease,
             ));
         }
         if terminal {
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
                 turn_id,
-                compaction.attempt,
                 &request_body,
                 &upstream_sse_body,
-                compaction.compact_boundary,
+                upstream_events.socket_id(),
+                compaction_lease.as_ref(),
             );
             if pending_chunk.is_empty() {
                 return LiveStreamStart::Response(empty_live_stream_response());
@@ -838,12 +920,17 @@ fn remaining_live_stream_response(
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
-    compaction: LiveStreamCompaction,
+    compaction_lease: Option<CompactionLease>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
-            abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+            abort_request_state(
+                ctx.session_id.as_deref(),
+                turn_id,
+                compaction_lease.as_ref(),
+                &request_body,
+            );
             return;
         }
         while let Some(item) = upstream_events.recv().await {
@@ -860,7 +947,8 @@ fn remaining_live_stream_response(
                             abort_request_state(
                                 ctx.session_id.as_deref(),
                                 turn_id,
-                                compaction.attempt,
+                                compaction_lease.as_ref(),
+                                &request_body,
                             );
                             let chunk = translator.error_chunk(
                                 &message,
@@ -880,7 +968,8 @@ fn remaining_live_stream_response(
                             abort_request_state(
                                 ctx.session_id.as_deref(),
                                 turn_id,
-                                compaction.attempt,
+                                compaction_lease.as_ref(),
+                                &request_body,
                             );
                             return;
                         }
@@ -889,16 +978,21 @@ fn remaining_live_stream_response(
                         update_continuation_from_upstream(
                             ctx.session_id.as_deref(),
                             turn_id,
-                            compaction.attempt,
                             &request_body,
                             &upstream_sse_body,
-                            compaction.compact_boundary,
+                            upstream_events.socket_id(),
+                            compaction_lease.as_ref(),
                         );
                         return;
                     }
                 }
                 Err(err) => {
-                    abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compaction_lease.as_ref(),
+                        &request_body,
+                    );
                     let chunk =
                         translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
                     if !chunk.is_empty() {
@@ -921,7 +1015,12 @@ fn remaining_live_stream_response(
             }
         }
 
-        abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+        abort_request_state(
+            ctx.session_id.as_deref(),
+            turn_id,
+            compaction_lease.as_ref(),
+            &request_body,
+        );
         let chunk = translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
@@ -1097,31 +1196,25 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
 fn update_continuation_from_upstream(
     session_id: Option<&str>,
     turn_id: Option<u64>,
-    compaction_attempt: Option<CompactionAttempt>,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
-    compact_boundary: bool,
+    socket_id: Option<u64>,
+    compaction_lease: Option<&CompactionLease>,
 ) {
-    match finish_metadata_from_upstream(upstream_body) {
+    match finish_metadata_from_upstream_in_scope(upstream_body, session_id) {
         Ok(Some(finish)) if finish.continuation_eligible => {
-            if compact_boundary {
-                activate_compaction(
-                    session_id,
-                    compaction_attempt,
-                    &request_body.model,
-                    &finish.output_items,
-                );
-            }
+            activate_compaction(compaction_lease, &request_body.model, &finish.output_items);
             record_continuation(
                 session_id,
                 turn_id,
                 request_body,
                 finish.response_id.as_deref(),
+                socket_id,
                 &finish.output_items,
             );
         }
         _ => {
-            abort_compaction_attempt(session_id, compaction_attempt);
+            abort_compaction_attempt(compaction_lease);
             abort_continuation(session_id, turn_id);
         }
     }
@@ -1310,6 +1403,11 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::codex::auth::token_store::StoredAuth;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn upstream_sse(events: &[serde_json::Value]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1317,6 +1415,137 @@ mod tests {
             bytes.extend_from_slice(format!("data: {event}\n\n").as_bytes());
         }
         bytes
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return request;
+            }
+        }
+    }
+
+    fn standalone_search_request() -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.4",
+            "max_tokens": 1024,
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": "Perform a web search for the query: route binding"
+            }],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search"
+            }],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        }))
+        .unwrap()
+    }
+
+    fn search_context(req_id: &str, session_id: Option<&str>) -> RequestContext {
+        RequestContext {
+            req_id: req_id.to_string(),
+            session_id: session_id.map(str::to_string),
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_search_route_binds_stateful_identity_and_keeps_stateless_random() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                let header_end = request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap();
+                let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end + 4..]).unwrap();
+                captured.push((headers, body));
+                let response = br#"{"output":"search answer","results":[]}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(response).await.unwrap();
+            }
+            captured
+        });
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "search-token".into(),
+            refresh: String::new(),
+            account_id: Some("search-account".into()),
+            expires: u64::MAX,
+        });
+        let provider = CodexProvider::with_client(client);
+
+        for (req_id, lane) in [
+            ("stateful-search", Some("raw-search-lane")),
+            ("stateless-search", None),
+        ] {
+            let response = provider
+                .handle_messages(standalone_search_request(), search_context(req_id, lane))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+
+        let captured = server.await.unwrap();
+        let (stateful_headers, stateful_body) = &captured[0];
+        assert!(stateful_headers.starts_with("POST /v1/alpha/search HTTP/1.1"));
+        let bound_id = stateful_body["id"].as_str().unwrap();
+        assert_ne!(bound_id, "raw-search-lane");
+        assert!(!stateful_headers.contains("raw-search-lane"));
+        assert!(stateful_headers.contains(&format!("session_id: {bound_id}")));
+        assert!(stateful_headers.contains(&format!("x-codex-window-id: {bound_id}:0")));
+        assert!(stateful_headers.contains("x-client-request-id: stateful-search"));
+
+        let (stateless_headers, stateless_body) = &captured[1];
+        assert!(
+            stateless_body["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("search-"))
+        );
+        assert!(!stateless_headers.contains("\nsession_id: "));
+        assert!(!stateless_headers.contains("x-codex-window-id:"));
+        assert!(!stateless_headers.contains("x-client-request-id:"));
     }
 
     #[test]
