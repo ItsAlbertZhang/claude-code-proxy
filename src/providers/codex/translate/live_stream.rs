@@ -1424,6 +1424,44 @@ mod tests {
     }
 
     #[test]
+    fn live_output_records_read_rewrite_in_stable_scope() {
+        let mut translator = LiveStreamTranslator::new("msg_live_read", "gpt-5.5")
+            .with_read_rewrite_scope(Some("stable-live-read".to_string()));
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"function_call","call_id":"call_live_read","name":"Read"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"file_path\":\"/tmp/live\",\"offset\":1300003}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type":"function_call",
+                    "call_id":"call_live_read",
+                    "name":"Read",
+                    "arguments":"{\"file_path\":\"/tmp/live\",\"offset\":1300003}"
+                }
+            }),
+        ] {
+            translator.accept(&event, None).unwrap();
+        }
+
+        let rewrite = super::super::read_rewrite::read_offset_rewrite_in_scope(
+            "stable-live-read",
+            "call_live_read",
+        )
+        .expect("stable-scope rewrite");
+        assert_eq!(rewrite.offset, 1_300_003);
+        assert_eq!(rewrite.file_path.as_deref(), Some("/tmp/live"));
+    }
+
+    #[test]
     fn repairs_whitespace_stalled_read_args_as_tool_use_finish() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
         let mut out = Vec::new();

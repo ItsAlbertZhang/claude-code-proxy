@@ -193,6 +193,23 @@ mod tests {
     }
 
     #[test]
+    fn token_only_rotation_changes_conversation_binding_and_socket_pool_key() {
+        let endpoint = "https://example.test/responses";
+        let protocol = ProtocolLane::ResponsesLite;
+        let before = auth(Some("acct-a"), "token-before");
+        let after = auth(Some("acct-a"), "token-after");
+
+        assert_ne!(
+            ConversationBinding::for_request(endpoint, &before, protocol),
+            ConversationBinding::for_request(endpoint, &after, protocol),
+        );
+        assert_ne!(
+            SocketPoolKey::for_request("lane-a", endpoint, &before, protocol),
+            SocketPoolKey::for_request("lane-a", endpoint, &after, protocol),
+        );
+    }
+
+    #[test]
     fn bound_conversation_key_fits_upstream_prompt_cache_limit() {
         let key = ConversationBinding::for_request(
             "https://example.test/responses",

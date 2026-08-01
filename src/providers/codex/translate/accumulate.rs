@@ -362,6 +362,56 @@ mod tests {
     }
 
     #[test]
+    fn buffered_nonstreaming_records_read_rewrite_in_stable_scope() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_buffered_nonstream","name":"Read"}
+                })
+            ),
+            sse_event(
+                "response.function_call_arguments.delta",
+                json!({
+                    "output_index":0,"delta":"{\"file_path\":\"/tmp/nonstream\",\"offset\":1300001}"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_buffered_nonstream","name":"Read","arguments":"{\"file_path\":\"/tmp/nonstream\",\"offset\":1300001}"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_nonstream","usage":{"input_tokens":3}}
+                })
+            ),
+        );
+
+        accumulate_response_with_traffic_in_scope(
+            upstream.as_bytes(),
+            "msg_nonstream",
+            "gpt-5.5",
+            None,
+            Some("stable-buffered-nonstream"),
+        )
+        .unwrap();
+
+        let rewrite = super::super::read_rewrite::read_offset_rewrite_in_scope(
+            "stable-buffered-nonstream",
+            "call_buffered_nonstream",
+        )
+        .expect("stable-scope rewrite");
+        assert_eq!(rewrite.offset, 1_300_001);
+        assert_eq!(rewrite.file_path.as_deref(), Some("/tmp/nonstream"));
+    }
+
+    #[test]
     fn accumulate_web_search_response() {
         let upstream = format!(
             "{}{}{}{}{}{}{}{}",

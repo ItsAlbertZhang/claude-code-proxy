@@ -256,6 +256,7 @@ pub struct ResponsesWebSearchFilters {
 
 pub struct TranslateOptions {
     pub session_id: Option<String>,
+    pub read_rewrite_scope: Option<String>,
     pub service_tier: Option<ServiceTier>,
     pub model: String,
     pub use_responses_lite: bool,
@@ -430,7 +431,7 @@ pub fn translate_request(
 ) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
-    let input = build_input(req, opts.session_id.as_deref());
+    let input = build_input(req, opts.read_rewrite_scope.as_deref());
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
     let parallel_tool_calls = !disable_parallel_tool_use(req);
@@ -1122,6 +1123,7 @@ mod tests {
     fn opts() -> TranslateOptions {
         TranslateOptions {
             session_id: None,
+            read_rewrite_scope: None,
             service_tier: None,
             model: "gpt-5.5".to_string(),
             use_responses_lite: false,
@@ -1204,6 +1206,7 @@ mod tests {
             translate_request(
                 &req,
                 TranslateOptions {
+                    read_rewrite_scope: None,
                     model: "gpt-5.6-luna".to_string(),
                     use_responses_lite: true,
                     ..opts()
@@ -1234,6 +1237,7 @@ mod tests {
             &req,
             TranslateOptions {
                 session_id: Some("s".into()),
+                read_rewrite_scope: None,
                 service_tier: None,
                 model: "gpt-5.5".to_string(),
                 use_responses_lite: false,
@@ -1389,6 +1393,7 @@ mod tests {
             &req,
             TranslateOptions {
                 session_id: None,
+                read_rewrite_scope: None,
                 service_tier: None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: true,
@@ -1422,6 +1427,7 @@ mod tests {
             &req,
             TranslateOptions {
                 session_id: None,
+                read_rewrite_scope: None,
                 service_tier: None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: false,
@@ -1912,11 +1918,32 @@ mod tests {
     }
 
     #[test]
-    fn translate_rewritten_read_result_adds_proxy_note() {
+    fn read_rewrite_lookup_survives_route_rollover_without_crossing_lanes() {
+        use crate::providers::codex::auth::token_store::StoredAuth;
+        use crate::providers::codex::state::{ConversationBinding, ProtocolLane};
+
+        let stable_lane = "lane-rewritten-read";
+        let bound_route = |access: &str| {
+            ConversationBinding::for_request(
+                "https://example.test/responses",
+                &StoredAuth {
+                    access: access.to_string(),
+                    refresh: "refresh".to_string(),
+                    expires: 1,
+                    account_id: Some("acct-a".to_string()),
+                },
+                ProtocolLane::ResponsesLite,
+            )
+            .bind_lane(stable_lane)
+        };
+        let route_a = bound_route("token-a");
+        let route_b = bound_route("token-b");
+        assert_ne!(route_a, route_b);
+
         crate::providers::codex::translate::read_rewrite::sanitize_read_args_in_scope(
             "Read",
             r#"{"file_path":"/tmp/a","offset":1300000,"limit":20}"#,
-            Some("lane-rewritten-read"),
+            Some(stable_lane),
             Some("tu_rewritten_read"),
         );
         let req: MessagesRequest = serde_json::from_value(json!({
@@ -1937,8 +1964,10 @@ mod tests {
         }))
         .unwrap();
         let mut options = opts();
-        options.session_id = Some("lane-rewritten-read".to_string());
+        options.session_id = Some(route_b.clone());
+        options.read_rewrite_scope = Some(stable_lane.to_string());
         let out = translate_request(&req, options).unwrap();
+        assert_eq!(out.prompt_cache_key.as_deref(), Some(route_b.as_str()));
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
             let output = output.as_text().expect("text tool output");
@@ -1946,6 +1975,21 @@ mod tests {
             assert!(output.contains("Proxy Read offset note:"));
             assert!(output.contains("1300000"));
             assert!(output.contains("/tmp/a"));
+        } else {
+            panic!("expected FunctionCallOutput");
+        }
+
+        let mut sibling_options = opts();
+        sibling_options.session_id = Some(route_b);
+        sibling_options.read_rewrite_scope = Some("lane-rewritten-read-sibling".to_string());
+        let sibling = translate_request(&req, sibling_options).unwrap();
+        if let ResponsesInputItem::FunctionCallOutput { output, .. } = &sibling.input[1] {
+            assert!(
+                !output
+                    .as_text()
+                    .expect("text tool output")
+                    .contains("Proxy Read offset note:")
+            );
         } else {
             panic!("expected FunctionCallOutput");
         }
@@ -2144,6 +2188,7 @@ mod tests {
         let out = translate_request(
             &req,
             TranslateOptions {
+                read_rewrite_scope: None,
                 model: "gpt-5.6-luna".to_string(),
                 use_responses_lite: true,
                 ..opts()
@@ -2164,6 +2209,7 @@ mod tests {
         let out = translate_request(
             &req,
             TranslateOptions {
+                read_rewrite_scope: None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: true,
                 ..opts()
@@ -2185,6 +2231,7 @@ mod tests {
         let out = translate_request(
             &req,
             TranslateOptions {
+                read_rewrite_scope: None,
                 model: "gpt-5.6-luna".to_string(),
                 use_responses_lite: true,
                 ..opts()
@@ -2218,6 +2265,7 @@ mod tests {
         let out = translate_request(
             &req,
             TranslateOptions {
+                read_rewrite_scope: None,
                 model: "gpt-5.6-luna".to_string(),
                 use_responses_lite: true,
                 ..opts()
@@ -2242,6 +2290,7 @@ mod tests {
         let out = translate_request(
             &req,
             TranslateOptions {
+                read_rewrite_scope: None,
                 model: "gpt-5.6-luna".to_string(),
                 use_responses_lite: true,
                 ..opts()
@@ -2264,6 +2313,7 @@ mod tests {
         let out = translate_request(
             &req,
             TranslateOptions {
+                read_rewrite_scope: None,
                 model: "gpt-5.4".to_string(),
                 ..opts()
             },

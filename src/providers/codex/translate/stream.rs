@@ -553,6 +553,57 @@ mod tests {
     }
 
     #[test]
+    fn buffered_streaming_records_read_rewrite_in_stable_scope() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_buffered_stream","name":"Read"}
+                })
+            ),
+            sse_event(
+                "response.function_call_arguments.delta",
+                serde_json::json!({
+                    "output_index":0,"delta":"{\"file_path\":\"/tmp/stream\",\"offset\":1300002}"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_buffered_stream","name":"Read","arguments":"{\"file_path\":\"/tmp/stream\",\"offset\":1300002}"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({
+                    "response":{"id":"resp_stream","usage":{"input_tokens":3}}
+                })
+            ),
+        );
+
+        translate_stream_bytes_with_traffic_in_scope(
+            upstream.as_bytes(),
+            "msg_stream",
+            "gpt-5.5",
+            3,
+            None,
+            Some("stable-buffered-stream"),
+        )
+        .unwrap();
+
+        let rewrite = super::super::read_rewrite::read_offset_rewrite_in_scope(
+            "stable-buffered-stream",
+            "call_buffered_stream",
+        )
+        .expect("stable-scope rewrite");
+        assert_eq!(rewrite.offset, 1_300_002);
+        assert_eq!(rewrite.file_path.as_deref(), Some("/tmp/stream"));
+    }
+
+    #[test]
     fn stream_translates_web_search_response() {
         let upstream = format!(
             "{}{}{}{}{}{}{}{}",

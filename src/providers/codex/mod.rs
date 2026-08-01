@@ -234,6 +234,7 @@ impl Provider for CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
         let lane_token = ctx.session_id.clone();
+        let read_rewrite_scope = lane_token.clone();
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
         let compaction_start = (server_compaction_enabled && compact_boundary)
@@ -251,6 +252,7 @@ impl Provider for CodexProvider {
             &body,
             TranslateOptions {
                 session_id: ctx.session_id.clone(),
+                read_rewrite_scope: read_rewrite_scope.clone(),
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
                 use_responses_lite,
@@ -353,6 +355,7 @@ impl Provider for CodexProvider {
                 stream_request,
                 continuation,
                 compaction_lease,
+                read_rewrite_scope,
             )
             .await;
         }
@@ -371,7 +374,7 @@ impl Provider for CodexProvider {
                     return map_codex_error_to_response(&e);
                 }
             };
-            if !is_empty_codex_success_completion(&response.body) {
+            if !is_empty_codex_success_completion(&response.body, read_rewrite_scope.as_deref()) {
                 break response;
             }
             // A successful terminal event with no output would translate into
@@ -401,7 +404,7 @@ impl Provider for CodexProvider {
                 model,
                 estimated_input_tokens,
                 ctx.traffic.as_deref(),
-                ctx.session_id.as_deref(),
+                read_rewrite_scope.as_deref(),
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -424,6 +427,7 @@ impl Provider for CodexProvider {
             }
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
+                read_rewrite_scope.as_deref(),
                 turn_id,
                 &translated,
                 &upstream.body,
@@ -443,7 +447,7 @@ impl Provider for CodexProvider {
                 &message_id,
                 model,
                 ctx.traffic.as_deref(),
-                ctx.session_id.as_deref(),
+                read_rewrite_scope.as_deref(),
             ) {
                 Ok(json) => {
                     if let Some(monitor) = ctx.monitor.as_ref() {
@@ -456,6 +460,7 @@ impl Provider for CodexProvider {
                     }
                     update_continuation_from_upstream(
                         ctx.session_id.as_deref(),
+                        read_rewrite_scope.as_deref(),
                         turn_id,
                         &translated,
                         &upstream.body,
@@ -506,6 +511,7 @@ impl Provider for CodexProvider {
             &body,
             TranslateOptions {
                 session_id: None,
+                read_rewrite_scope: None,
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
                 use_responses_lite,
@@ -593,6 +599,7 @@ async fn live_stream_response(
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationCandidate,
     compaction_lease: Option<CompactionLease>,
+    read_rewrite_scope: Option<String>,
 ) -> Response {
     let model = model.to_string();
     let turn_id = continuation.turn_id;
@@ -653,6 +660,7 @@ async fn live_stream_response(
             turn_id,
             request_body.clone(),
             compaction_lease.clone(),
+            read_rewrite_scope.clone(),
         )
         .await
         {
@@ -697,6 +705,7 @@ async fn live_stream_response_once(
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
     compaction_lease: Option<CompactionLease>,
+    read_rewrite_scope: Option<String>,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -704,7 +713,7 @@ async fn live_stream_response_once(
         model.to_string(),
         estimated_input_tokens,
     )
-    .with_read_rewrite_scope(ctx.session_id.clone());
+    .with_read_rewrite_scope(read_rewrite_scope.clone());
     let mut upstream_sse_body = Vec::new();
     // Keep protocol framing private until real output makes a transparent retry unsafe.
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.
@@ -795,6 +804,7 @@ async fn live_stream_response_once(
             if terminal {
                 update_continuation_from_upstream(
                     ctx.session_id.as_deref(),
+                    read_rewrite_scope.as_deref(),
                     turn_id,
                     &request_body,
                     &upstream_sse_body,
@@ -812,11 +822,13 @@ async fn live_stream_response_once(
                 request_body,
                 upstream_sse_body,
                 compaction_lease,
+                read_rewrite_scope,
             ));
         }
         if terminal {
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
+                read_rewrite_scope.as_deref(),
                 turn_id,
                 &request_body,
                 &upstream_sse_body,
@@ -921,6 +933,7 @@ fn remaining_live_stream_response(
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
     compaction_lease: Option<CompactionLease>,
+    read_rewrite_scope: Option<String>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -977,6 +990,7 @@ fn remaining_live_stream_response(
                     if terminal {
                         update_continuation_from_upstream(
                             ctx.session_id.as_deref(),
+                            read_rewrite_scope.as_deref(),
                             turn_id,
                             &request_body,
                             &upstream_sse_body,
@@ -1081,10 +1095,15 @@ fn empty_buffered_completion_error() -> client::CodexError {
 
 /// True when the buffered upstream body ended in a successful terminal event
 /// without ever producing semantic output (text, thinking, tool, web search).
-fn is_empty_codex_success_completion(upstream_sse: &[u8]) -> bool {
+fn is_empty_codex_success_completion(
+    upstream_sse: &[u8],
+    read_rewrite_scope: Option<&str>,
+) -> bool {
     use self::translate::reducer::{ReducerEvent, TERM_COMPLETED, TERM_DONE};
 
-    let Ok(events) = self::translate::reducer::reduce_upstream_bytes(upstream_sse) else {
+    let Ok(events) =
+        self::translate::reducer::reduce_upstream_bytes_in_scope(upstream_sse, read_rewrite_scope)
+    else {
         return false;
     };
     let mut saw_success_terminal = false;
@@ -1195,13 +1214,14 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
 
 fn update_continuation_from_upstream(
     session_id: Option<&str>,
+    read_rewrite_scope: Option<&str>,
     turn_id: Option<u64>,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
     socket_id: Option<u64>,
     compaction_lease: Option<&CompactionLease>,
 ) {
-    match finish_metadata_from_upstream_in_scope(upstream_body, session_id) {
+    match finish_metadata_from_upstream_in_scope(upstream_body, read_rewrite_scope) {
         Ok(Some(finish)) if finish.continuation_eligible => {
             activate_compaction(compaction_lease, &request_body.model, &finish.output_items);
             record_continuation(
@@ -1554,7 +1574,7 @@ mod tests {
             "type": "response.completed",
             "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {"input_tokens": 5, "output_tokens": 0}}
         })]);
-        assert!(is_empty_codex_success_completion(&body));
+        assert!(is_empty_codex_success_completion(&body, None));
     }
 
     #[test]
@@ -1563,7 +1583,7 @@ mod tests {
             "type": "response.done",
             "response": {"id": "resp_1", "usage": {}}
         })]);
-        assert!(is_empty_codex_success_completion(&body));
+        assert!(is_empty_codex_success_completion(&body, None));
     }
 
     #[test]
@@ -1584,7 +1604,7 @@ mod tests {
                 "response": {"id": "resp_1", "usage": {}}
             }),
         ]);
-        assert!(is_empty_codex_success_completion(&body));
+        assert!(is_empty_codex_success_completion(&body, None));
     }
 
     #[test]
@@ -1610,7 +1630,7 @@ mod tests {
                 "response": {"id": "resp_1", "usage": {}}
             }),
         ]);
-        assert!(!is_empty_codex_success_completion(&body));
+        assert!(!is_empty_codex_success_completion(&body, None));
     }
 
     #[test]
@@ -1631,7 +1651,7 @@ mod tests {
                 "response": {"id": "resp_1", "usage": {}}
             }),
         ]);
-        assert!(!is_empty_codex_success_completion(&body));
+        assert!(!is_empty_codex_success_completion(&body, None));
     }
 
     #[test]
@@ -1640,12 +1660,12 @@ mod tests {
             "type": "response.incomplete",
             "response": {"id": "resp_1", "incomplete_details": {"reason": "max_output_tokens"}, "usage": {}}
         })]);
-        assert!(!is_empty_codex_success_completion(&body));
+        assert!(!is_empty_codex_success_completion(&body, None));
     }
 
     #[test]
     fn upstream_without_terminal_event_is_not_empty_completion() {
-        assert!(!is_empty_codex_success_completion(&upstream_sse(&[])));
+        assert!(!is_empty_codex_success_completion(&upstream_sse(&[]), None));
     }
 
     fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
