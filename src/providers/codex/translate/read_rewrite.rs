@@ -13,16 +13,31 @@ pub struct ReadOffsetRewrite {
     pub file_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RewriteKey {
+    scope: String,
+    call_id: String,
+}
+
 #[derive(Debug, Default)]
 struct RewriteStore {
-    order: VecDeque<String>,
-    entries: HashMap<String, ReadOffsetRewrite>,
+    order: VecDeque<RewriteKey>,
+    entries: HashMap<RewriteKey, ReadOffsetRewrite>,
 }
 
 static READ_OFFSET_REWRITES: Lazy<Mutex<RewriteStore>> =
     Lazy::new(|| Mutex::new(RewriteStore::default()));
 
 pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> String {
+    sanitize_read_args_in_scope(name, args, Some("legacy"), call_id)
+}
+
+pub fn sanitize_read_args_in_scope(
+    name: &str,
+    args: &str,
+    scope: Option<&str>,
+    call_id: Option<&str>,
+) -> String {
     if name != "Read" || args.is_empty() {
         return args.to_string();
     }
@@ -53,8 +68,12 @@ pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> Stri
     {
         sanitized.remove("offset");
         changed = true;
-        if let Some(call_id) = call_id.filter(|id| !id.is_empty()) {
+        if let Some((scope, call_id)) = scope
+            .filter(|scope| !scope.is_empty())
+            .zip(call_id.filter(|id| !id.is_empty()))
+        {
             record_read_offset_rewrite(
+                scope,
                 call_id,
                 ReadOffsetRewrite {
                     offset,
@@ -75,21 +94,33 @@ pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> Stri
 }
 
 pub fn read_offset_rewrite(call_id: &str) -> Option<ReadOffsetRewrite> {
+    read_offset_rewrite_in_scope("legacy", call_id)
+}
+
+pub fn read_offset_rewrite_in_scope(scope: &str, call_id: &str) -> Option<ReadOffsetRewrite> {
+    let key = RewriteKey {
+        scope: scope.to_string(),
+        call_id: call_id.to_string(),
+    };
     READ_OFFSET_REWRITES
         .lock()
         .ok()
-        .and_then(|store| store.entries.get(call_id).cloned())
+        .and_then(|store| store.entries.get(&key).cloned())
 }
 
-fn record_read_offset_rewrite(call_id: &str, note: ReadOffsetRewrite) {
+fn record_read_offset_rewrite(scope: &str, call_id: &str, note: ReadOffsetRewrite) {
     let Ok(mut store) = READ_OFFSET_REWRITES.lock() else {
         return;
     };
 
-    if !store.entries.contains_key(call_id) {
-        store.order.push_back(call_id.to_string());
+    let key = RewriteKey {
+        scope: scope.to_string(),
+        call_id: call_id.to_string(),
+    };
+    if !store.entries.contains_key(&key) {
+        store.order.push_back(key.clone());
     }
-    store.entries.insert(call_id.to_string(), note);
+    store.entries.insert(key, note);
 
     while store.entries.len() > MAX_REWRITE_NOTES {
         let Some(oldest) = store.order.pop_front() else {
@@ -126,6 +157,36 @@ mod tests {
         let note = read_offset_rewrite("call_rewrite_test").unwrap();
         assert_eq!(note.offset, 1_300_000);
         assert_eq!(note.file_path.as_deref(), Some("/tmp/a"));
+    }
+
+    #[test]
+    fn rewrite_notes_are_scoped_for_sibling_agents() {
+        let args_a = r#"{"file_path":"/tmp/a","offset":1300000}"#;
+        let args_b = r#"{"file_path":"/tmp/b","offset":1400000}"#;
+        sanitize_read_args_in_scope("Read", args_a, Some("lane-a"), Some("call_shared"));
+        sanitize_read_args_in_scope("Read", args_b, Some("lane-b"), Some("call_shared"));
+
+        assert_eq!(
+            read_offset_rewrite_in_scope("lane-a", "call_shared")
+                .unwrap()
+                .file_path
+                .as_deref(),
+            Some("/tmp/a")
+        );
+        assert_eq!(
+            read_offset_rewrite_in_scope("lane-b", "call_shared")
+                .unwrap()
+                .file_path
+                .as_deref(),
+            Some("/tmp/b")
+        );
+    }
+
+    #[test]
+    fn stateless_rewrite_does_not_record_a_note() {
+        let args = r#"{"file_path":"/tmp/a","offset":1300000}"#;
+        sanitize_read_args_in_scope("Read", args, None, Some("call_stateless"));
+        assert!(read_offset_rewrite_in_scope("lane-a", "call_stateless").is_none());
     }
 
     #[test]

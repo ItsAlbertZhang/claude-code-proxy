@@ -58,11 +58,19 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             return Ok(stored);
         }
 
-        self.refresh(false, None).await
+        self.refresh(false, None, None).await
     }
 
     pub async fn force_refresh(&self, rejected_access: &str) -> Result<StoredAuth, anyhow::Error> {
-        self.refresh(true, Some(rejected_access)).await
+        self.refresh(true, Some(rejected_access), None).await
+    }
+
+    pub async fn refresh_after_rejection(
+        &self,
+        rejected: &StoredAuth,
+    ) -> Result<StoredAuth, anyhow::Error> {
+        self.refresh(true, Some(&rejected.access), Some(&rejected.account_id))
+            .await
     }
 
     fn load_auth(&self) -> Result<Option<StoredAuth>, anyhow::Error> {
@@ -83,6 +91,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         &self,
         force: bool,
         rejected_access: Option<&str>,
+        rejected_account_id: Option<&Option<String>>,
     ) -> Result<StoredAuth, anyhow::Error> {
         let _refresh_guard = self.refresh_lock.lock().await;
 
@@ -95,6 +104,8 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
 
         if (!force && current.expires > Self::now_ms() + REFRESH_MARGIN_MS)
             || rejected_access.is_some_and(|access| current.access != access)
+            || rejected_account_id
+                .is_some_and(|account_id| current.account_id.as_ref() != account_id.as_ref())
         {
             return Ok(current);
         }
@@ -290,6 +301,34 @@ mod tests {
 
         let auth = manager.force_refresh("rejected").await.unwrap();
         assert_eq!(auth.access, "rotated");
+        assert_eq!(auth.refresh, "rotated-refresh");
+    }
+
+    #[tokio::test]
+    async fn rejected_snapshot_observes_account_only_rotation() {
+        let store = test_store();
+        store
+            .save_auth(StoredAuth {
+                access: "shared-access".into(),
+                refresh: "rotated-refresh".into(),
+                expires: u64::MAX,
+                account_id: Some("acct-b".into()),
+            })
+            .unwrap();
+        let manager = CodexAuthManager::new_with_token_endpoint(
+            store,
+            "http://127.0.0.1:1/should-not-be-called".into(),
+        );
+        let rejected = StoredAuth {
+            access: "shared-access".into(),
+            refresh: "stale-refresh".into(),
+            expires: u64::MAX,
+            account_id: Some("acct-a".into()),
+        };
+
+        let auth = manager.refresh_after_rejection(&rejected).await.unwrap();
+        assert_eq!(auth.access, "shared-access");
+        assert_eq!(auth.account_id.as_deref(), Some("acct-b"));
         assert_eq!(auth.refresh, "rotated-refresh");
     }
 

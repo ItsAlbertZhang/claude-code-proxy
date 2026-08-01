@@ -54,7 +54,11 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Encrypted reasoning and compaction items remain provider continuation data and are not exposed as raw chain of thought.
 - Hosted web search supports mapped domain filters, but the Anthropic `max_uses` value is not enforced because Codex exposes no equivalent limit.
 - Strict JSON schema output is translated. Other Anthropic-only output settings can be omitted.
-- `previous_response_id` and server compaction state are in memory and require stable session routing.
+- `previous_response_id`, server compaction, WebSocket pools, prompt-cache identities, and provider affinity are isolated between Main and same-session child Agents when Claude Code supplies valid session and Agent headers.
+- Continuation IDs are valid only on the exact WebSocket that produced them. A missing or replacement socket forces full-context replay.
+- Codex state is also bound to endpoint, account, credential generation, and full/lite protocol. Route rollover starts a fresh state lane instead of reusing incompatible state.
+- A 401 on a bound conversational route is returned for that request. Refreshed or externally rotated credentials take effect on the next request so new auth is never mixed with old continuation state.
+- Missing, malformed, or ambiguous Claude Code identity headers disable conversational state for that request rather than assigning it to Main. The Agent headers are observed client behavior, not a documented stable public contract.
 - Automatic transport fallback occurs only before an upstream request is sent, which avoids replaying possible side effects.
 
 ## Kimi

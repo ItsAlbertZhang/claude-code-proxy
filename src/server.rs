@@ -21,6 +21,7 @@ use crate::{
         },
     },
     registry::{Registry, normalize_incoming_model},
+    request_identity::{RequestPurpose, RequestScope},
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
@@ -635,6 +636,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     );
 
     let session_id = native_session_id(&headers);
+    let request_scope = RequestScope::from_headers(&headers, RequestPurpose::Conversation);
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Responses);
     }
@@ -679,7 +681,8 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
     let now = current_millis();
-    let session_state = session::existing_session(session_id.as_deref(), now);
+    let session_state =
+        session::existing_session_for_lane(request_scope.conversational_lane(), now);
     let affinity = session_state
         .as_ref()
         .and_then(|session| session.affinity_provider.as_ref());
@@ -707,22 +710,25 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
             OpenAiSurface::Responses,
             body.clone(),
             provider.name(),
-            session_id.as_deref(),
+            request_scope
+                .conversational_lane()
+                .and(session_id.as_deref()),
         ) {
             Ok(parsed) => Some(parsed),
             Err(error) => return monitor_response_body(error.response(), request_guard),
         }
     };
     if provider.name() != "codex"
-        && let Some(session_id) = session_id.as_deref()
+        && let Some(lane_token) = request_scope.lane_token("codex-conversation")
     {
-        crate::providers::codex::clear_session_compaction(session_id);
+        crate::providers::codex::clear_lane_compactions(&lane_token);
     }
-    let current = session::record_session_request(
-        session_id.as_deref(),
+    let current = session::record_session_request_for_lane(
+        request_scope.conversational_lane(),
         session_state.as_ref(),
         provider.name(),
         &normalized_model,
+        true,
         now,
     );
     let effort = parsed
@@ -781,7 +787,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     }
     let context = RequestContext {
         req_id: req_id.clone(),
-        session_id,
+        session_id: request_scope.conversational_lane().and(session_id),
         session_seq: current.map(|session| session.seq),
         provider: provider.name().to_string(),
         traffic: traffic.clone(),
@@ -789,7 +795,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     };
     let response = if let Some(parsed) = parsed {
         match provider
-            .generate_anthropic_stream(parsed.messages, context)
+            .generate_anthropic_stream_scoped(parsed.messages, context, request_scope)
             .await
         {
             Ok(generation) => {
@@ -862,6 +868,7 @@ async fn handler_chat_completions(
     );
 
     let session_id = native_session_id(&headers);
+    let request_scope = RequestScope::from_headers(&headers, RequestPurpose::Conversation);
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(
             &req_id,
@@ -911,7 +918,8 @@ async fn handler_chat_completions(
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
     let now = current_millis();
-    let session_state = session::existing_session(session_id.as_deref(), now);
+    let session_state =
+        session::existing_session_for_lane(request_scope.conversational_lane(), now);
     let affinity = session_state
         .as_ref()
         .and_then(|session| session.affinity_provider.as_ref());
@@ -940,7 +948,9 @@ async fn handler_chat_completions(
             OpenAiSurface::ChatCompletions,
             body.clone(),
             provider.name(),
-            session_id.as_deref(),
+            request_scope
+                .conversational_lane()
+                .and(session_id.as_deref()),
         ) {
             Ok(parsed) => parsed,
             Err(error) => return monitor_response_body(error.response(), request_guard),
@@ -948,15 +958,16 @@ async fn handler_chat_completions(
         (None, Some(parsed))
     };
     if provider.name() != "codex"
-        && let Some(session_id) = session_id.as_deref()
+        && let Some(lane_token) = request_scope.lane_token("codex-conversation")
     {
-        crate::providers::codex::clear_session_compaction(session_id);
+        crate::providers::codex::clear_lane_compactions(&lane_token);
     }
-    let current = session::record_session_request(
-        session_id.as_deref(),
+    let current = session::record_session_request_for_lane(
+        request_scope.conversational_lane(),
         session_state.as_ref(),
         provider.name(),
         &normalized_model,
+        true,
         now,
     );
     let effort = translated
@@ -1021,7 +1032,7 @@ async fn handler_chat_completions(
     }
     let context = RequestContext {
         req_id: req_id.clone(),
-        session_id,
+        session_id: request_scope.conversational_lane().and(session_id),
         session_seq: current.map(|session| session.seq),
         provider: provider.name().to_string(),
         traffic: traffic.clone(),
@@ -1041,7 +1052,7 @@ async fn handler_chat_completions(
     } else {
         let parsed = parsed.expect("non-Codex request was parsed");
         match provider
-            .generate_anthropic_stream(parsed.messages, context)
+            .generate_anthropic_stream_scoped(parsed.messages, context, request_scope)
             .await
         {
             Ok(generation) => {
@@ -1190,10 +1201,17 @@ async fn dispatch_request(
             ("query".to_string(), json!(&query)),
         ])),
     );
-    let session_id = req
-        .headers()
-        .get("x-claude-code-session-id")
-        .and_then(|value| value.to_str().ok())
+    let mut request_scope = RequestScope::from_headers(
+        req.headers(),
+        if count_tokens {
+            RequestPurpose::CountTokens
+        } else {
+            RequestPurpose::Conversation
+        },
+    );
+    let session_id = request_scope
+        .identity
+        .session_id()
         .map(std::string::ToString::to_string);
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(&req_id, session_id.clone(), None, endpoint);
@@ -1341,11 +1359,7 @@ async fn dispatch_request(
 
     let mut normalized_model = normalize_incoming_model(model);
     body.model = Some(normalized_model.clone());
-    let session_state = if let Some(session_id) = session_id.as_deref() {
-        session::existing_session(Some(session_id), now)
-    } else {
-        None
-    };
+    let session_state = session::existing_session_for_lane(request_scope.lane(), now);
     let session_affinity = session_state
         .as_ref()
         .and_then(|state| state.affinity_provider.as_ref());
@@ -1353,6 +1367,10 @@ async fn dispatch_request(
         .registry
         .provider_for_model(&normalized_model, session_affinity);
     let configured_auto_review_model = crate::config::auto_review_model();
+    let auto_review_request = !count_tokens && is_claude_auto_review_request(&body);
+    if auto_review_request {
+        request_scope.purpose = RequestPurpose::AutoReview;
+    }
     let auto_review_route = original_provider.as_ref().and_then(|provider| {
         apply_auto_review_model(
             &mut body,
@@ -1449,24 +1467,22 @@ async fn dispatch_request(
         );
     }
 
-    if !count_tokens
-        && auto_review_route.is_none()
-        && provider.name() != "codex"
-        && let Some(session_id) = session_id.as_deref()
+    if provider.name() != "codex"
+        && let Some(lane_token) = request_scope.lane_token("codex-conversation")
     {
-        crate::providers::codex::clear_session_compaction(session_id);
+        crate::providers::codex::clear_lane_compactions(&lane_token);
     }
 
     let effort = crate::providers::translate_shared::read_effort(&body)
         .ok()
         .flatten()
         .map(str::to_string);
-    let current = session::record_session_request_with_affinity_update(
-        session_id.as_deref(),
+    let current = session::record_session_request_for_lane(
+        request_scope.conversational_lane(),
         session_state.as_ref(),
         provider.name(),
         &normalized_model,
-        auto_review_route.is_none(),
+        true,
         now,
     );
     if let Some(monitor) = state.monitor.as_ref() {
@@ -1495,6 +1511,9 @@ async fn dispatch_request(
                 "reqId": &req_id,
                 "sessionId": &session_id,
                 "sessionSeq": current.as_ref().map(|s| s.seq),
+                "laneKind": request_scope.lane().map(|lane| lane.kind()),
+                "laneFingerprint": request_scope.lane().map(|lane| lane.fingerprint()),
+                "requestPurpose": format!("{:?}", request_scope.purpose),
                 "kind": if count_tokens { "count_tokens" } else { "messages" },
                 "provider": provider.name(),
                 "model": &normalized_model,
@@ -1510,9 +1529,12 @@ async fn dispatch_request(
         );
     }
 
+    let provider_session_id = request_scope
+        .conversational_lane()
+        .and_then(|_| session_id.clone());
     let context = RequestContext {
         req_id: req_id.clone(),
-        session_id,
+        session_id: provider_session_id,
         session_seq: current.map(|s| s.seq),
         provider: provider.name().to_string(),
         traffic,
@@ -1520,9 +1542,13 @@ async fn dispatch_request(
     };
 
     let response = if count_tokens {
-        provider.handle_count_tokens(body, context).await
+        provider
+            .handle_count_tokens_scoped(body, context, request_scope)
+            .await
     } else {
-        provider.handle_messages(body, context).await
+        provider
+            .handle_messages_scoped(body, context, request_scope)
+            .await
     };
     log_request_completed(
         &log,
@@ -1840,7 +1866,16 @@ fn monitor_failed(
 fn headers_to_record(headers: &http::HeaderMap) -> Value {
     let mut out = Map::new();
     for (key, value) in headers {
-        if let Ok(raw) = value.to_str() {
+        if matches!(
+            key.as_str(),
+            crate::request_identity::CLAUDE_AGENT_HEADER
+                | crate::request_identity::CLAUDE_PARENT_AGENT_HEADER
+        ) {
+            out.insert(
+                key.as_str().to_string(),
+                Value::String("[redacted agent identity]".to_string()),
+            );
+        } else if let Ok(raw) = value.to_str() {
             out.insert(key.as_str().to_string(), Value::String(raw.to_string()));
         }
     }
@@ -1925,7 +1960,10 @@ fn _unused(session_state: Option<&SessionState>) {
 
 #[cfg(test)]
 mod auto_review_tests {
-    use super::{apply_auto_review_effort, apply_auto_review_model, is_claude_auto_review_request};
+    use super::{
+        apply_auto_review_effort, apply_auto_review_model, headers_to_record,
+        is_claude_auto_review_request,
+    };
     use crate::anthropic::schema::MessagesRequest;
     use serde_json::{Value, json};
 
@@ -2127,6 +2165,37 @@ mod auto_review_tests {
             Some("low")
         ));
         assert!(count_tokens.extra.get("output_config").is_none());
+    }
+
+    #[test]
+    fn traffic_headers_redact_agent_identity() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            crate::request_identity::CLAUDE_SESSION_HEADER,
+            "session-visible-for-aggregation".parse().unwrap(),
+        );
+        headers.insert(
+            crate::request_identity::CLAUDE_AGENT_HEADER,
+            "raw-agent-secret".parse().unwrap(),
+        );
+        headers.insert(
+            crate::request_identity::CLAUDE_PARENT_AGENT_HEADER,
+            "raw-parent-secret".parse().unwrap(),
+        );
+
+        let recorded = headers_to_record(&headers);
+        let serialized = serde_json::to_string(&recorded).unwrap();
+        assert!(serialized.contains("session-visible-for-aggregation"));
+        assert!(!serialized.contains("raw-agent-secret"));
+        assert!(!serialized.contains("raw-parent-secret"));
+        assert_eq!(
+            recorded[crate::request_identity::CLAUDE_AGENT_HEADER],
+            json!("[redacted agent identity]")
+        );
+        assert_eq!(
+            recorded[crate::request_identity::CLAUDE_PARENT_AGENT_HEADER],
+            json!("[redacted agent identity]")
+        );
     }
 
     #[test]

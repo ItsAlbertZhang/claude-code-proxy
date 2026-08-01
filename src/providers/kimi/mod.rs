@@ -22,6 +22,7 @@ use crate::providers::kimi::translate::model_allowlist::{assert_allowed_model, r
 use crate::providers::kimi::translate::request::{TranslateOptions, translate_request};
 use crate::providers::kimi::translate::stream::translate_stream_bytes;
 use crate::registry::KIMI_MODELS;
+use crate::request_identity::RequestScope;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -170,6 +171,16 @@ impl Provider for KimiProvider {
         }
     }
 
+    async fn handle_messages_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> Response {
+        self.handle_messages(body, scope_kimi_context(ctx, &scope))
+            .await
+    }
+
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let model = body.model.as_deref().unwrap_or("kimi-for-coding");
         let resolved = resolve_model(model);
@@ -280,6 +291,21 @@ impl Provider for KimiProvider {
             resolved_model: resolved,
         })
     }
+
+    async fn generate_anthropic_stream_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> Result<Generation, ProviderError> {
+        self.generate_anthropic_stream(body, scope_kimi_context(ctx, &scope))
+            .await
+    }
+}
+
+fn scope_kimi_context(mut ctx: RequestContext, scope: &RequestScope) -> RequestContext {
+    ctx.session_id = scope.lane_token("kimi-prompt-cache");
+    ctx
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -381,3 +407,54 @@ impl CliHandlers for KimiCli {
 }
 
 pub(crate) static KIMI_CLI: KimiCli = KimiCli;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request_identity::{
+        CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, CLAUDE_SESSION_HEADER, RequestPurpose,
+    };
+
+    fn context() -> RequestContext {
+        RequestContext {
+            req_id: "request".to_string(),
+            session_id: Some("shared-session".to_string()),
+            session_seq: None,
+            provider: "kimi".to_string(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    fn scope(agent_id: Option<&str>, parent_id: Option<&str>) -> RequestScope {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(CLAUDE_SESSION_HEADER, "shared-session".parse().unwrap());
+        if let Some(agent_id) = agent_id {
+            headers.insert(CLAUDE_AGENT_HEADER, agent_id.parse().unwrap());
+        }
+        if let Some(parent_id) = parent_id {
+            headers.insert(CLAUDE_PARENT_AGENT_HEADER, parent_id.parse().unwrap());
+        }
+        RequestScope::from_headers(&headers, RequestPurpose::Conversation)
+    }
+
+    #[test]
+    fn scoped_context_isolates_prompt_cache_keys_without_raw_ids() {
+        let main = scope_kimi_context(context(), &scope(None, None)).session_id;
+        let agent_a = scope_kimi_context(context(), &scope(Some("agent-a"), None)).session_id;
+        let agent_b =
+            scope_kimi_context(context(), &scope(Some("agent-b"), Some("agent-a"))).session_id;
+        let malformed =
+            scope_kimi_context(context(), &scope(None, Some("orphan-parent"))).session_id;
+
+        assert_ne!(main, agent_a);
+        assert_ne!(agent_a, agent_b);
+        assert_ne!(main, agent_b);
+        assert!(malformed.is_none());
+        for token in [main.unwrap(), agent_a.unwrap(), agent_b.unwrap()] {
+            assert!(!token.contains("shared-session"));
+            assert!(!token.contains("agent-a"));
+            assert!(!token.contains("agent-b"));
+        }
+    }
+}

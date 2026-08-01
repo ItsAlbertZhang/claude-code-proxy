@@ -56,7 +56,11 @@ WebSocket is the default transport. Set `CCP_CODEX_TRANSPORT=http` for HTTP SSE,
 
 WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `wss://` endpoint, `ALL_PROXY` as a fallback, and `NO_PROXY` exclusions. A normal HTTP proxy can therefore carry the default WebSocket connection with CONNECT; TUN mode is not required. Set proxy variables before starting the process and restart after changing them. For example, setting `HTTPS_PROXY` to `http://127.0.0.1:7890` sends HTTPS/WSS destinations through the HTTP proxy at port 7890; it does not require an `https://` proxy URL.
 
-`CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables append-only WebSocket continuation. It reuses a session connection and sends `previous_response_id` only when the translated request shape and transcript extension are safe. State is in memory, keyed by Claude Code session ID.
+`CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables append-only WebSocket continuation. It sends `previous_response_id` only when the translated request shape and transcript extension are safe **and** the exact WebSocket that produced the response is still available. If that socket has closed or been replaced, the proxy retries with the full translated context instead of attaching the response ID to a different connection.
+
+For Claude Code traffic, in-memory conversation state is partitioned by `x-claude-code-session-id` and, for child Agents, `x-claude-code-agent-id`. The Main conversation and every child Agent therefore keep separate continuation chains, WebSocket pools, prompt-cache identities, and compaction artifacts even when they share one Claude Code session. Count-token and detected auto-review requests are auxiliary and do not mutate those chains. Missing or malformed identity headers fail closed to stateless behavior. These Agent headers are an observed Claude Code integration contract rather than a documented stable public API; upgrading Claude Code may require compatibility verification.
+
+Each conversational request binds one immutable Codex auth/route snapshot before selecting state or transport. If that route receives 401 before output, the proxy invalidates its socket and refreshes or observes rotated credentials for the next request, but returns the original 401 instead of retrying new credentials inside the old state lane. The next request starts under the new account/credential binding.
 
 ## Server compaction
 
@@ -70,7 +74,7 @@ This is most useful for long coding sessions where continuity after `/compact` o
 
 1. Claude Code reaches a manual or automatic compaction boundary.
 2. The proxy sends the translated conversation to Codex with a trailing `compaction_trigger`.
-3. Codex returns an encrypted `compaction` item, which the proxy keeps in memory for that Claude Code session and model.
+3. Codex returns an encrypted `compaction` item, which the proxy keeps in memory for the current Main or child-Agent lane, Codex route, credential generation, protocol lane, and model.
 4. Claude Code completes its normal summary request. The proxy uses the resulting summary as an exact anchor.
 5. On subsequent matching turns, the proxy replaces the portable summary with the encrypted item, retained recent context, and post-compaction messages.
 
@@ -96,7 +100,7 @@ CCP_CODEX_SERVER_COMPACTION=1 claude-code-proxy serve
 
 ### Fallbacks and visibility
 
-Replay requires the same Claude Code session and Codex model with append-only history. A branch, proxy restart, provider or model change, malformed response, upstream failure, memory limit, or 30 minutes without matching activity discards the native state and uses Claude Code's portable summary instead.
+Replay requires the same Main or child-Agent lane, Codex route/account/credential/protocol binding, Codex model, and matching summary anchor with append-only history. A branch, proxy restart, provider or model change, credential or endpoint rollover, malformed response, upstream failure, memory limit, or 30 minutes without matching activity safely falls back to Claude Code's portable summary. Concurrent and stale compaction operations cannot publish over or delete a newer artifact.
 
 While the native request is active, the monitor shows `compacting`. Structured log events named `server_compaction_triggered`, `server_compaction_completed`, and `server_compaction_failed` report each attempt and outcome.
 

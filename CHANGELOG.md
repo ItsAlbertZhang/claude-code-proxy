@@ -5,6 +5,14 @@ description: Release notes for claude-code-proxy.
 
 ## v0.1.29 (2026-07-30)
 
+- Same-session Claude Code child Agents now keep independent provider affinity,
+  Codex continuation/WebSocket state, prompt-cache identities, and native
+  compaction artifacts. Auxiliary count-token and auto-review requests no longer
+  mutate conversational state.
+- Codex continuation IDs are reused only on the exact originating WebSocket, and
+  Codex state rolls over across endpoint, account, credential, or protocol
+  changes. Stale and concurrent compaction operations cannot overwrite or delete
+  newer artifacts.
 - Codex honors required, disabled, and single-tool choices from Claude Code, and
   disables parallel tool calls when requested.
   ([#89](https://github.com/raine/claude-code-proxy/pull/89))

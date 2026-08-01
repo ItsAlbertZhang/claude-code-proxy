@@ -8,13 +8,14 @@ use claude_code_proxy::{
     monitor::{MonitorHandle, RequestStatus},
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
+    request_identity::{AgentLaneKey, RequestPurpose, RequestScope},
     server::{
         AppFeatures, app, app_with_features, app_with_monitor, app_with_options,
         bind_proxy_listener,
     },
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::util::ServiceExt;
 
 fn body_string(json: &str) -> Body {
@@ -95,6 +96,75 @@ impl Provider for FakeProvider {
     }
 }
 
+struct ScopeCaptureProvider {
+    scopes: Arc<Mutex<Vec<RequestScope>>>,
+    contexts: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait]
+impl Provider for ScopeCaptureProvider {
+    fn name(&self) -> &'static str {
+        "kimi"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["kimi-k2.6".to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unscoped messages").into_response()
+    }
+
+    async fn handle_messages_scoped(
+        &self,
+        _body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> axum::response::Response {
+        self.contexts.lock().unwrap().push(ctx.session_id);
+        self.scopes.lock().unwrap().push(scope);
+        (StatusCode::OK, "ok").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unscoped count tokens").into_response()
+    }
+
+    async fn handle_count_tokens_scoped(
+        &self,
+        _body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> axum::response::Response {
+        self.contexts.lock().unwrap().push(ctx.session_id);
+        self.scopes.lock().unwrap().push(scope);
+        (StatusCode::OK, "ok").into_response()
+    }
+
+    async fn generate_anthropic_stream(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> Result<Generation, ProviderError> {
+        Ok(Generation {
+            body: GenerationBody::BufferedSse(Vec::new().into()),
+            resolved_model: "kimi-k2.6".to_string(),
+        })
+    }
+}
+
 fn routed_registry() -> Arc<Registry> {
     Arc::new(Registry::from_providers(
         AliasProvider::Kimi,
@@ -166,6 +236,113 @@ async fn healthz_returns_ok() {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap();
     assert_eq!(body, json!({"ok": true}));
+}
+
+#[tokio::test]
+async fn messages_ingress_preserves_agent_identity_and_auxiliary_purpose() {
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(Registry::from_providers(
+        AliasProvider::Kimi,
+        vec![Arc::new(ScopeCaptureProvider {
+            scopes: scopes.clone(),
+            contexts: contexts.clone(),
+        }) as Arc<dyn Provider>],
+    ));
+    let app = app(registry);
+    let body =
+        r#"{"model":"kimi-k2.6","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
+
+    let nested = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "shared-session")
+                .header("x-claude-code-agent-id", "child-agent")
+                .header("x-claude-code-parent-agent-id", "parent-agent")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nested.status(), StatusCode::OK);
+
+    let main = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "shared-session")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(main.status(), StatusCode::OK);
+
+    let ambiguous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-agent-id", "orphan-agent")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ambiguous.status(), StatusCode::OK);
+
+    let count_tokens = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "shared-session")
+                .header("x-claude-code-agent-id", "child-agent")
+                .body(body_string(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count_tokens.status(), StatusCode::OK);
+
+    let scopes = scopes.lock().unwrap();
+    assert_eq!(scopes.len(), 4);
+    assert_eq!(scopes[0].purpose, RequestPurpose::Conversation);
+    assert_eq!(scopes[0].identity.parent_agent_id(), Some("parent-agent"));
+    assert!(matches!(
+        scopes[0].lane(),
+        Some(AgentLaneKey::Agent {
+            session_id,
+            agent_id,
+        }) if session_id == "shared-session" && agent_id == "child-agent"
+    ));
+    assert!(matches!(
+        scopes[1].lane(),
+        Some(AgentLaneKey::Main { session_id }) if session_id == "shared-session"
+    ));
+    assert!(scopes[2].lane().is_none());
+    assert_eq!(scopes[3].purpose, RequestPurpose::CountTokens);
+    assert!(scopes[3].lane().is_some());
+    assert!(scopes[3].conversational_lane().is_none());
+    assert_eq!(
+        *contexts.lock().unwrap(),
+        vec![
+            Some("shared-session".to_string()),
+            Some("shared-session".to_string()),
+            None,
+            None,
+        ]
+    );
 }
 
 #[tokio::test]

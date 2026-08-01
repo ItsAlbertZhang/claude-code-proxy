@@ -37,6 +37,7 @@ use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
     resume_cursor_tool_bridge, start_cursor_tool_bridge,
 };
+use crate::request_identity::RequestScope;
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -223,6 +224,16 @@ impl Provider for CursorProvider {
         }
     }
 
+    async fn handle_messages_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> Response {
+        self.handle_messages(body, scope_cursor_context(ctx, &scope))
+            .await
+    }
+
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let prompt = render_cursor_prompt(&body);
         let tokens = (prompt.len() / 4) as u64; // rough estimate
@@ -345,6 +356,21 @@ impl Provider for CursorProvider {
             resolved_model: resolved.model_id,
         })
     }
+
+    async fn generate_anthropic_stream_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        scope: RequestScope,
+    ) -> Result<Generation, ProviderError> {
+        self.generate_anthropic_stream(body, scope_cursor_context(ctx, &scope))
+            .await
+    }
+}
+
+fn scope_cursor_context(mut ctx: RequestContext, scope: &RequestScope) -> RequestContext {
+    ctx.session_id = scope.lane_token("cursor-tool-bridge");
+    ctx
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -499,6 +525,58 @@ mod tests {
         assert!(models.contains(&"cursor-agent".to_string()));
         assert!(models.contains(&"cursor-plan".to_string()));
         assert!(models.contains(&"cursor-ask".to_string()));
+    }
+
+    #[test]
+    fn scoped_context_isolates_cursor_tool_bridge_lanes() {
+        let context = || RequestContext {
+            req_id: "request".to_string(),
+            session_id: Some("shared-session".to_string()),
+            session_seq: None,
+            provider: "cursor".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let scope = |agent_id: Option<&str>, parent_id: Option<&str>| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                crate::request_identity::CLAUDE_SESSION_HEADER,
+                "shared-session".parse().unwrap(),
+            );
+            if let Some(agent_id) = agent_id {
+                headers.insert(
+                    crate::request_identity::CLAUDE_AGENT_HEADER,
+                    agent_id.parse().unwrap(),
+                );
+            }
+            if let Some(parent_id) = parent_id {
+                headers.insert(
+                    crate::request_identity::CLAUDE_PARENT_AGENT_HEADER,
+                    parent_id.parse().unwrap(),
+                );
+            }
+            RequestScope::from_headers(
+                &headers,
+                crate::request_identity::RequestPurpose::Conversation,
+            )
+        };
+
+        let main = scope_cursor_context(context(), &scope(None, None)).session_id;
+        let agent_a = scope_cursor_context(context(), &scope(Some("agent-a"), None)).session_id;
+        let agent_b =
+            scope_cursor_context(context(), &scope(Some("agent-b"), Some("agent-a"))).session_id;
+        let malformed =
+            scope_cursor_context(context(), &scope(None, Some("orphan-parent"))).session_id;
+
+        assert_ne!(main, agent_a);
+        assert_ne!(agent_a, agent_b);
+        assert_ne!(main, agent_b);
+        assert!(malformed.is_none());
+        for token in [main.unwrap(), agent_a.unwrap(), agent_b.unwrap()] {
+            assert!(!token.contains("shared-session"));
+            assert!(!token.contains("agent-a"));
+            assert!(!token.contains("agent-b"));
+        }
     }
 
     #[test]

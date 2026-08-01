@@ -10,7 +10,7 @@ use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, read_effort,
 };
 
-use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
+use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite_in_scope};
 use super::reasoning_signature::decode_reasoning_signature;
 
 // ---------------------------------------------------------------------------
@@ -426,7 +426,7 @@ pub fn translate_request(
 ) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
-    let input = build_input(req);
+    let input = build_input(req, opts.session_id.as_deref());
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
     let parallel_tool_calls = !disable_parallel_tool_use(req);
@@ -762,7 +762,7 @@ fn disable_parallel_tool_use(req: &MessagesRequest) -> bool {
         .unwrap_or(false)
 }
 
-fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
+fn build_input(req: &MessagesRequest, rewrite_scope: Option<&str>) -> Vec<ResponsesInputItem> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
 
@@ -797,9 +797,11 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                             if is_error.unwrap_or(false) {
                                 rendered.prepend_text("[tool execution error]".to_string());
                             }
-                            if let Some(note) =
-                                rewritten_read_offset_note(&rendered.joined_text(), tool_use_id)
-                            {
+                            if let Some(note) = rewritten_read_offset_note(
+                                &rendered.joined_text(),
+                                rewrite_scope,
+                                tool_use_id,
+                            ) {
                                 rendered.push_text(format!("\n{note}"));
                             }
                             if should_append_read_offset_guidance(
@@ -900,11 +902,16 @@ fn is_read_tool_use_with_offset(name: &str, input: &Value) -> bool {
     name == "Read" && input.get("offset").is_some()
 }
 
-fn rewritten_read_offset_note(output: &str, tool_use_id: &str) -> Option<String> {
+fn rewritten_read_offset_note(
+    output: &str,
+    rewrite_scope: Option<&str>,
+    tool_use_id: &str,
+) -> Option<String> {
     if output.contains("Proxy Read offset note:") {
         return None;
     }
-    read_offset_rewrite(tool_use_id)
+    rewrite_scope
+        .and_then(|scope| read_offset_rewrite_in_scope(scope, tool_use_id))
         .as_ref()
         .map(read_offset_rewrite_note)
 }
@@ -1929,9 +1936,10 @@ mod tests {
 
     #[test]
     fn translate_rewritten_read_result_adds_proxy_note() {
-        crate::providers::codex::translate::read_rewrite::sanitize_read_args(
+        crate::providers::codex::translate::read_rewrite::sanitize_read_args_in_scope(
             "Read",
             r#"{"file_path":"/tmp/a","offset":1300000,"limit":20}"#,
+            Some("lane-rewritten-read"),
             Some("tu_rewritten_read"),
         );
         let req: MessagesRequest = serde_json::from_value(json!({
@@ -1951,7 +1959,9 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = translate_request(&req, opts()).unwrap();
+        let mut options = opts();
+        options.session_id = Some("lane-rewritten-read".to_string());
+        let out = translate_request(&req, options).unwrap();
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
             let output = output.as_text().expect("text tool output");

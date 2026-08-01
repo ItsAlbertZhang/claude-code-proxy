@@ -12,6 +12,7 @@ const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
 #[derive(Clone)]
 struct ContinuationState {
     response_id: String,
+    socket_id: u64,
     prompt_signature: String,
     transcript: Vec<ResponsesInputItem>,
     transcript_bytes: u64,
@@ -37,6 +38,7 @@ static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
 pub struct ContinuationCandidate {
     pub turn_id: Option<u64>,
     pub previous_response_id: Option<String>,
+    pub socket_id: Option<u64>,
     pub input_delta: Option<Vec<ResponsesInputItem>>,
     pub input_delta_count: usize,
     pub disabled_reason: Option<String>,
@@ -58,6 +60,7 @@ pub fn continuation_candidate(
         return ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: body.input.len(),
             disabled_reason: Some("disabled".to_string()),
@@ -68,6 +71,7 @@ pub fn continuation_candidate(
         return ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: body.input.len(),
             disabled_reason: Some("missing_session".to_string()),
@@ -115,6 +119,7 @@ fn continuation_candidate_from_state(
             return ContinuationCandidate {
                 turn_id: Some(turn_id),
                 previous_response_id: None,
+                socket_id: None,
                 input_delta: None,
                 input_delta_count: body.input.len(),
                 disabled_reason: Some(if superseded_turn {
@@ -131,6 +136,7 @@ fn continuation_candidate_from_state(
         return ContinuationCandidate {
             turn_id: Some(turn_id),
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: body.input.len(),
             disabled_reason: Some("prompt_changed".to_string()),
@@ -141,6 +147,7 @@ fn continuation_candidate_from_state(
         return ContinuationCandidate {
             turn_id: Some(turn_id),
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: body.input.len(),
             disabled_reason: Some("not_append_only".to_string()),
@@ -151,6 +158,7 @@ fn continuation_candidate_from_state(
         return ContinuationCandidate {
             turn_id: Some(turn_id),
             previous_response_id: None,
+            socket_id: None,
             input_delta: None,
             input_delta_count: 0,
             disabled_reason: Some("empty_delta".to_string()),
@@ -160,6 +168,7 @@ fn continuation_candidate_from_state(
     ContinuationCandidate {
         turn_id: Some(turn_id),
         previous_response_id: Some(state.response_id),
+        socket_id: Some(state.socket_id),
         input_delta_count: suffix.len(),
         input_delta: Some(suffix),
         disabled_reason: None,
@@ -171,6 +180,7 @@ pub fn record_continuation(
     turn_id: Option<u64>,
     request_body: &ResponsesRequest,
     response_id: Option<&str>,
+    socket_id: Option<u64>,
     output_items: &[ResponsesInputItem],
 ) {
     let (session_id, turn_id) = match (session_id, turn_id) {
@@ -180,6 +190,14 @@ pub fn record_continuation(
 
     let response_id = match response_id {
         Some(id) => id.to_string(),
+        None => {
+            abort_continuation(Some(session_id), Some(turn_id));
+            return;
+        }
+    };
+
+    let socket_id = match socket_id {
+        Some(socket_id) => socket_id,
         None => {
             abort_continuation(Some(session_id), Some(turn_id));
             return;
@@ -199,6 +217,7 @@ pub fn record_continuation(
 
     let state = ContinuationState {
         response_id,
+        socket_id,
         prompt_signature: prompt_signature(request_body),
         transcript,
         transcript_bytes,
@@ -430,6 +449,7 @@ mod tests {
             candidate.turn_id,
             request,
             response_id,
+            Some(1),
             &[],
         );
     }
@@ -536,20 +556,41 @@ mod tests {
         assert!(has_continuation_for_tests("s1"));
 
         let candidate = continuation_candidate(Some("s1"), &req, true);
-        record_continuation(Some("s1"), candidate.turn_id, &req, None, &[]);
+        record_continuation(Some("s1"), candidate.turn_id, &req, None, Some(1), &[]);
         assert!(!has_continuation_for_tests("s1"));
 
         // stale turns cannot publish or clear a newer turn
         clear_all_continuations_for_tests();
         let first = continuation_candidate(Some("s1"), &req, true);
-        record_continuation(Some("s1"), first.turn_id, &req, Some("resp_1"), &[]);
+        record_continuation(
+            Some("s1"),
+            first.turn_id,
+            &req,
+            Some("resp_1"),
+            Some(1),
+            &[],
+        );
         let second = continuation_candidate(Some("s1"), &req, true);
         let third = continuation_candidate(Some("s1"), &req, true);
         assert_eq!(third.disabled_reason.as_deref(), Some("superseded_turn"));
 
-        record_continuation(Some("s1"), second.turn_id, &req, Some("resp_2"), &[]);
+        record_continuation(
+            Some("s1"),
+            second.turn_id,
+            &req,
+            Some("resp_2"),
+            Some(2),
+            &[],
+        );
         assert!(!has_continuation_for_tests("s1"));
-        record_continuation(Some("s1"), third.turn_id, &req, Some("resp_3"), &[]);
+        record_continuation(
+            Some("s1"),
+            third.turn_id,
+            &req,
+            Some("resp_3"),
+            Some(3),
+            &[],
+        );
         assert!(has_continuation_for_tests("s1"));
         abort_continuation(Some("s1"), second.turn_id);
         assert!(has_continuation_for_tests("s1"));

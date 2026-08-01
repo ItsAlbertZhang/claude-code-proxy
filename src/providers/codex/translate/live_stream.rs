@@ -4,7 +4,7 @@ use crate::anthropic::sse::encode_sse_event;
 use crate::providers::codex::events::is_terminal_rate_limit_event;
 use crate::traffic::TrafficCapture;
 
-use super::read_rewrite::sanitize_read_args;
+use super::read_rewrite::sanitize_read_args_in_scope;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
     CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
@@ -67,6 +67,7 @@ pub struct LiveStreamTranslator {
     // Seeds Claude Code's live subagent counter until the provider returns
     // authoritative usage in the terminal message_delta.
     estimated_input_tokens: u64,
+    read_rewrite_scope: Option<String>,
     finished: bool,
 }
 
@@ -96,8 +97,14 @@ impl LiveStreamTranslator {
             deferred_text: Vec::new(),
             semantic_output_started: false,
             estimated_input_tokens,
+            read_rewrite_scope: None,
             finished: false,
         }
+    }
+
+    pub fn with_read_rewrite_scope(mut self, scope: Option<String>) -> Self {
+        self.read_rewrite_scope = scope;
+        self
     }
 
     pub fn accept(
@@ -113,10 +120,8 @@ impl LiveStreamTranslator {
         let mut out = Vec::new();
 
         match kind {
-            "codex.rate_limits" => {
-                if is_terminal_rate_limit_event(payload) {
-                    return Err("rate limit reached".to_string());
-                }
+            "codex.rate_limits" if is_terminal_rate_limit_event(payload) => {
+                return Err("rate limit reached".to_string());
             }
             "keepalive" => {}
             "response.failed" | "response.error" | "error" => {
@@ -515,6 +520,7 @@ impl LiveStreamTranslator {
             return Ok(());
         }
         let mut repaired_read: Option<(usize, String)> = None;
+        let read_rewrite_scope = self.read_rewrite_scope.clone();
         let Some(LiveBlock::Tool {
             index,
             call_id,
@@ -536,9 +542,12 @@ impl LiveStreamTranslator {
                     "Buffered {name} tool arguments exceeded safe limits"
                 ));
             }
-            if let Some(repaired) =
-                repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
-            {
+            if let Some(repaired) = repair_whitespace_stalled_read_args(
+                name,
+                args_accum,
+                read_rewrite_scope.as_deref(),
+                Some(call_id.as_str()),
+            ) {
                 *args_accum = repaired.clone();
                 *emitted_args = true;
                 repaired_read = Some((*index, repaired));
@@ -707,7 +716,12 @@ impl LiveStreamTranslator {
                     *args_accum = final_args.to_string();
                 }
                 if !args_accum.is_empty() {
-                    *args_accum = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
+                    *args_accum = sanitize_read_args_in_scope(
+                        name,
+                        args_accum,
+                        self.read_rewrite_scope.as_deref(),
+                        Some(call_id.as_str()),
+                    );
                     if *buffer_until_done || !*emitted_args {
                         *emitted_args = true;
                         self.emit(
@@ -1097,6 +1111,7 @@ fn response_is_incomplete(payload: &serde_json::Value) -> bool {
 fn repair_whitespace_stalled_read_args(
     name: &str,
     args: &str,
+    rewrite_scope: Option<&str>,
     call_id: Option<&str>,
 ) -> Option<String> {
     if name != "Read" {
@@ -1107,20 +1122,25 @@ fn repair_whitespace_stalled_read_args(
     if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
         return None;
     }
-    parse_read_args_candidate(trimmed, call_id).or_else(|| {
+    parse_read_args_candidate(trimmed, rewrite_scope, call_id).or_else(|| {
         let with_brace = format!("{trimmed}}}");
-        parse_read_args_candidate(&with_brace, call_id)
+        parse_read_args_candidate(&with_brace, rewrite_scope, call_id)
     })
 }
 
-fn parse_read_args_candidate(args: &str, call_id: Option<&str>) -> Option<String> {
+fn parse_read_args_candidate(
+    args: &str,
+    rewrite_scope: Option<&str>,
+    call_id: Option<&str>,
+) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
     if !is_valid_read_args(&parsed) {
         return None;
     }
-    Some(sanitize_read_args(
+    Some(sanitize_read_args_in_scope(
         "Read",
         &serde_json::to_string(&parsed).ok()?,
+        rewrite_scope,
         call_id,
     ))
 }

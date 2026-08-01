@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -37,6 +38,8 @@ pub const WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
 pub const WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL: &str = "websocket_response_start_timeout";
 pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal";
+pub const WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL: &str =
+    "websocket_continuation_socket_missing";
 pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy_tunnel_rejected";
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
@@ -51,7 +54,55 @@ const TERMINAL_EVENTS: &[&str] = &[
     "error",
 ];
 
-pub type CodexWebSocketEventReceiver = mpsc::Receiver<Result<serde_json::Value, CodexError>>;
+pub struct CodexWebSocketEventReceiver {
+    receiver: mpsc::Receiver<Result<serde_json::Value, CodexError>>,
+    socket_id: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+pub(super) struct CodexWebSocketSocketIdPublisher(Arc<AtomicU64>);
+
+impl CodexWebSocketEventReceiver {
+    fn with_socket_id(
+        receiver: mpsc::Receiver<Result<serde_json::Value, CodexError>>,
+        socket_id: u64,
+    ) -> Self {
+        Self {
+            receiver,
+            socket_id: Arc::new(AtomicU64::new(socket_id)),
+        }
+    }
+
+    pub(super) fn pending(
+        receiver: mpsc::Receiver<Result<serde_json::Value, CodexError>>,
+    ) -> (Self, CodexWebSocketSocketIdPublisher) {
+        let socket_id = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                receiver,
+                socket_id: socket_id.clone(),
+            },
+            CodexWebSocketSocketIdPublisher(socket_id),
+        )
+    }
+
+    pub async fn recv(&mut self) -> Option<Result<serde_json::Value, CodexError>> {
+        self.receiver.recv().await
+    }
+
+    pub fn socket_id(&self) -> Option<u64> {
+        match self.socket_id.load(Ordering::Acquire) {
+            0 => None,
+            socket_id => Some(socket_id),
+        }
+    }
+}
+
+impl CodexWebSocketSocketIdPublisher {
+    pub(super) fn publish(&self, socket_id: Option<u64>) {
+        self.0.store(socket_id.unwrap_or(0), Ordering::Release);
+    }
+}
 
 trait WebSocketIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -216,9 +267,25 @@ impl std::fmt::Display for CodexWebSocketError {
 
 struct PoolEntry {
     ws: Arc<AsyncMutex<CodexWebSocketStream>>,
-    created_at: u64,
+    socket_id: u64,
+    last_used_at: AtomicU64,
 }
 
+impl PoolEntry {
+    fn new(ws: CodexWebSocketStream) -> Self {
+        Self {
+            ws: Arc::new(AsyncMutex::new(ws)),
+            socket_id: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+            last_used_at: AtomicU64::new(now_ms()),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_used_at.store(now_ms(), Ordering::Relaxed);
+    }
+}
+
+static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<PoolEntry>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -239,9 +306,13 @@ pub fn invalidate_codex_websocket_pool_key(session_id: &str) {
     guard.remove(session_id);
 }
 
-pub fn invalidate_codex_websocket_pool_turn(session_id: &str, turn_id: Option<u64>) {
-    super::continuation::with_current_turn(Some(session_id), turn_id, || {
-        invalidate_codex_websocket_pool_key(session_id)
+pub fn invalidate_codex_websocket_pool_turn(
+    pool_key: &str,
+    continuation_session: Option<&str>,
+    turn_id: Option<u64>,
+) {
+    super::continuation::with_current_turn(continuation_session, turn_id, || {
+        invalidate_codex_websocket_pool_key(pool_key)
     });
 }
 
@@ -265,21 +336,38 @@ fn invalidate_pool_owner(pool_key: Option<&str>, entry: Option<&Arc<PoolEntry>>)
     }
 }
 
-fn pool_get_for_turn(key: &str, turn_id: Option<u64>) -> Option<Arc<PoolEntry>> {
-    super::continuation::if_current_turn(Some(key), turn_id, || {
+fn pool_get_for_turn(
+    key: &str,
+    continuation_session: Option<&str>,
+    turn_id: Option<u64>,
+) -> Option<Arc<PoolEntry>> {
+    super::continuation::if_current_turn(continuation_session, turn_id, || {
         WS_POOL.lock().ok()?.get(key).cloned()
     })
     .flatten()
 }
 
-fn pool_take_for_turn(key: &str, turn_id: Option<u64>) -> Option<Arc<PoolEntry>> {
-    super::continuation::if_current_turn(Some(key), turn_id, || WS_POOL.lock().ok()?.remove(key))
-        .flatten()
+fn pool_take_for_turn(
+    key: &str,
+    continuation_session: Option<&str>,
+    turn_id: Option<u64>,
+) -> Option<Arc<PoolEntry>> {
+    super::continuation::if_current_turn(continuation_session, turn_id, || {
+        WS_POOL.lock().ok()?.remove(key)
+    })
+    .flatten()
 }
 
-fn pool_insert_for_turn(key: String, entry: Arc<PoolEntry>, turn_id: Option<u64>) {
-    let session_id = key.clone();
-    super::continuation::with_current_turn(Some(&session_id), turn_id, || pool_insert(key, entry));
+fn pool_insert_for_turn(
+    key: String,
+    entry: Arc<PoolEntry>,
+    continuation_session: Option<&str>,
+    turn_id: Option<u64>,
+) {
+    super::continuation::with_current_turn(continuation_session, turn_id, || {
+        entry.touch();
+        pool_insert(key, entry);
+    });
 }
 
 fn pool_remove_entry(key: &str, entry: &Arc<PoolEntry>) {
@@ -296,7 +384,9 @@ fn pool_insert(key: String, entry: Arc<PoolEntry>) {
     }
     // Evict expired entries
     let now = now_ms();
-    guard.retain(|_, e| now.saturating_sub(e.created_at) < POOL_IDLE_TTL_MS);
+    guard.retain(|_, entry| {
+        now.saturating_sub(entry.last_used_at.load(Ordering::Relaxed)) < POOL_IDLE_TTL_MS
+    });
     guard.insert(key, entry);
 }
 
@@ -455,7 +545,7 @@ pub(super) async fn codex_websocket_request(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
     traffic: Option<&TrafficCapture>,
     pool_key: Option<&str>,
     connect_timeout_ms: u64,
@@ -495,10 +585,25 @@ pub(super) async fn codex_websocket_request(
     }
     let started_at = Instant::now();
 
-    // Check pool for existing connection
+    // Check pool for the exact connection that produced the previous response.
+    let requires_continuation_socket = continuation
+        .and_then(|candidate| candidate.previous_response_id.as_deref())
+        .is_some();
+    let expected_socket_id = continuation.and_then(|candidate| candidate.socket_id);
     let pooled = pool_key.and_then(|key| {
-        pool_get_for_turn(key, continuation.and_then(|candidate| candidate.turn_id))
+        pool_get_for_turn(
+            key,
+            ctx.session_id.as_deref(),
+            continuation.and_then(|candidate| candidate.turn_id),
+        )
     });
+    if requires_continuation_socket
+        && pooled
+            .as_ref()
+            .is_none_or(|entry| Some(entry.socket_id) != expected_socket_id)
+    {
+        return Err(continuation_socket_missing_error());
+    }
 
     let ws_stream = if let Some(entry) = pooled {
         // Use pooled connection
@@ -506,7 +611,10 @@ pub(super) async fn codex_websocket_request(
         // Check if connection is still alive by sending a ping
         if ws_guard.send(Message::Ping(vec![])).await.is_err() {
             invalidate_pool_entry(pool_key.unwrap(), &entry);
-            // Fall through to new connection
+            if requires_continuation_socket {
+                return Err(continuation_socket_missing_error());
+            }
+            // Full-context requests may replace a dead pooled connection.
             connect_with_timeout(
                 websocket_client,
                 proxy_config,
@@ -564,15 +672,24 @@ pub(super) async fn codex_websocket_request(
 
             // Write traffic metadata
             if let Some(tc) = traffic {
-                write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, true);
+                write_websocket_metadata_capture(
+                    tc,
+                    &ws_url,
+                    pool_key,
+                    continuation,
+                    true,
+                    entry.socket_id,
+                );
                 write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
             }
 
+            entry.touch();
             return Ok(CodexResponse {
                 body: sse_body,
                 status,
                 headers: vec![],
                 transport: ActualTransport::WebSocket,
+                socket_id: Some(entry.socket_id),
             });
         }
     } else {
@@ -587,10 +704,7 @@ pub(super) async fn codex_websocket_request(
     };
 
     // New connection path (not pooled or pool miss)
-    let entry = Arc::new(PoolEntry {
-        ws: Arc::new(AsyncMutex::new(ws_stream)),
-        created_at: now_ms(),
-    });
+    let entry = Arc::new(PoolEntry::new(ws_stream));
 
     // Send the request
     let msg = Message::Text(body_json);
@@ -636,6 +750,7 @@ pub(super) async fn codex_websocket_request(
                 pool_insert_for_turn(
                     key.to_string(),
                     entry.clone(),
+                    ctx.session_id.as_deref(),
                     continuation.and_then(|candidate| candidate.turn_id),
                 );
             }
@@ -649,7 +764,14 @@ pub(super) async fn codex_websocket_request(
 
         // Write traffic metadata
         if let Some(tc) = traffic {
-            write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, false);
+            write_websocket_metadata_capture(
+                tc,
+                &ws_url,
+                pool_key,
+                continuation,
+                false,
+                entry.socket_id,
+            );
             write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
         }
 
@@ -658,6 +780,7 @@ pub(super) async fn codex_websocket_request(
             status,
             headers: vec![],
             transport: ActualTransport::WebSocket,
+            socket_id: Some(entry.socket_id),
         })
     }
 }
@@ -668,20 +791,24 @@ pub(super) struct ReadyWebSocket {
     entry: Arc<PoolEntry>,
     used_pooled: bool,
     pool_key: Option<String>,
+    continuation_session: Option<String>,
     turn_id: Option<u64>,
     traffic: Option<Arc<TrafficCapture>>,
     idle_timeout_ms: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn prepare_codex_websocket(
+async fn prepare_codex_websocket_with_socket_id(
     websocket_client: &reqwest::Client,
     proxy_config: &WebSocketProxyConfig,
     url: &str,
     headers: &HeaderMap,
     traffic: Option<Arc<TrafficCapture>>,
     pool_key: Option<&str>,
+    continuation_session: Option<&str>,
     turn_id: Option<u64>,
+    require_pooled_socket: bool,
+    expected_socket_id: Option<u64>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
 ) -> Result<ReadyWebSocket, CodexError> {
@@ -692,7 +819,23 @@ pub(super) async fn prepare_codex_websocket(
         retry_after: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
-    let pooled = pool_key.and_then(|key| pool_take_for_turn(key, turn_id));
+    let pooled = pool_key.and_then(|key| pool_take_for_turn(key, continuation_session, turn_id));
+    let socket_mismatch = expected_socket_id.is_some_and(|expected| {
+        pooled
+            .as_ref()
+            .is_none_or(|entry| entry.socket_id != expected)
+    });
+    if require_pooled_socket && (pooled.is_none() || socket_mismatch) {
+        if socket_mismatch && let (Some(key), Some(entry)) = (pool_key, pooled.as_ref()) {
+            pool_insert_for_turn(
+                key.to_string(),
+                entry.clone(),
+                continuation_session,
+                turn_id,
+            );
+        }
+        return Err(continuation_socket_missing_error());
+    }
     let used_pooled = pooled.is_some();
     let entry = if let Some(entry) = pooled {
         entry
@@ -705,37 +848,45 @@ pub(super) async fn prepare_codex_websocket(
             connect_timeout_ms,
         )
         .await?;
-        Arc::new(PoolEntry {
-            ws: Arc::new(AsyncMutex::new(stream)),
-            created_at: now_ms(),
-        })
+        Arc::new(PoolEntry::new(stream))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
     if used_pooled {
         let nonce = b"codex-ready".to_vec();
-        guard
-            .send(Message::Ping(nonce.clone()))
-            .await
-            .map_err(|error| pooled_validation_error(error.to_string()))?;
-        let validation = tokio::time::timeout(Duration::from_millis(connect_timeout_ms), async {
-            loop {
-                match guard.next().await {
-                    Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
-                    Some(Ok(Message::Ping(payload))) => guard
-                        .send(Message::Pong(payload))
-                        .await
-                        .map_err(|error| error.to_string())?,
-                    Some(Ok(_)) => {
-                        return Err("unexpected frame during pooled validation".to_string());
+        let validation: Result<(), String> = async {
+            guard
+                .send(Message::Ping(nonce.clone()))
+                .await
+                .map_err(|error| error.to_string())?;
+            tokio::time::timeout(Duration::from_millis(connect_timeout_ms), async {
+                loop {
+                    match guard.next().await {
+                        Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
+                        Some(Ok(Message::Ping(payload))) => guard
+                            .send(Message::Pong(payload))
+                            .await
+                            .map_err(|error| error.to_string())?,
+                        Some(Ok(_)) => {
+                            return Err("unexpected frame during pooled validation".to_string());
+                        }
+                        Some(Err(error)) => return Err(error.to_string()),
+                        None => {
+                            return Err("connection closed during pooled validation".to_string());
+                        }
                     }
-                    Some(Err(error)) => return Err(error.to_string()),
-                    None => return Err("connection closed during pooled validation".to_string()),
                 }
-            }
-        })
-        .await
-        .map_err(|_| pooled_validation_error("validation timeout".to_string()))?;
-        validation.map_err(pooled_validation_error)?;
+            })
+            .await
+            .map_err(|_| "validation timeout".to_string())?
+        }
+        .await;
+        if let Err(detail) = validation {
+            return Err(if require_pooled_socket {
+                continuation_socket_missing_error()
+            } else {
+                pooled_validation_error(detail)
+            });
+        }
     }
     Ok(ReadyWebSocket {
         ws_url,
@@ -743,6 +894,7 @@ pub(super) async fn prepare_codex_websocket(
         entry,
         used_pooled,
         pool_key: pool_key.map(str::to_string),
+        continuation_session: continuation_session.map(str::to_string),
         turn_id,
         traffic,
         idle_timeout_ms,
@@ -766,6 +918,7 @@ pub(super) fn start_codex_websocket_events(
     headers: &HeaderMap,
     continuation: Option<&ContinuationCandidate>,
 ) -> CodexWebSocketEventReceiver {
+    let socket_id = ready.entry.socket_id;
     if let Some(tc) = ready.traffic.as_deref() {
         write_websocket_metadata_capture(
             tc,
@@ -773,6 +926,7 @@ pub(super) fn start_codex_websocket_events(
             ready.pool_key.as_deref(),
             continuation,
             ready.used_pooled,
+            ready.entry.socket_id,
         );
         tc.write_json("020-upstream-request", body_value);
         tc.write_json(
@@ -793,6 +947,7 @@ pub(super) fn start_codex_websocket_events(
             entry,
             used_pooled: _,
             pool_key,
+            continuation_session,
             turn_id,
             traffic,
             idle_timeout_ms,
@@ -812,24 +967,32 @@ pub(super) fn start_codex_websocket_events(
                 .await;
             return;
         }
-        let reusable = stream_ws_events(
+        let (reusable, terminal_event) = stream_ws_events(
             &mut guard,
             idle_timeout_ms,
             pool_key.as_deref(),
             Some(&entry),
             traffic,
-            tx,
+            &tx,
         )
         .await;
         if let Some(key) = pool_key.as_deref() {
             if reusable {
-                pool_insert_for_turn(key.to_string(), entry, turn_id);
+                pool_insert_for_turn(
+                    key.to_string(),
+                    entry.clone(),
+                    continuation_session.as_deref(),
+                    turn_id,
+                );
             } else {
                 pool_remove_entry(key, &entry);
             }
         }
+        if let Some(terminal_event) = terminal_event {
+            let _ = tx.send(Ok(terminal_event)).await;
+        }
     });
-    rx
+    CodexWebSocketEventReceiver::with_socket_id(rx, socket_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -839,7 +1002,7 @@ pub(super) async fn codex_websocket_event_stream(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
     traffic: Option<Arc<TrafficCapture>>,
     pool_key: Option<&str>,
     connect_timeout_ms: u64,
@@ -853,14 +1016,19 @@ pub(super) async fn codex_websocket_event_stream(
         retry_after: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
-    let ready = prepare_codex_websocket(
+    let ready = prepare_codex_websocket_with_socket_id(
         websocket_client,
         proxy_config,
         url,
         headers,
         traffic,
         pool_key,
+        ctx.session_id.as_deref(),
         continuation.and_then(|candidate| candidate.turn_id),
+        continuation
+            .and_then(|candidate| candidate.previous_response_id.as_deref())
+            .is_some(),
+        continuation.and_then(|candidate| candidate.socket_id),
         connect_timeout_ms,
         idle_timeout_ms,
     )
@@ -872,6 +1040,16 @@ pub(super) async fn codex_websocket_event_stream(
         headers,
         continuation,
     ))
+}
+
+fn continuation_socket_missing_error() -> CodexError {
+    CodexError {
+        status: 0,
+        message: "Previous response socket is no longer available".to_string(),
+        detail: Some(WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL.to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocketHandshake,
+    }
 }
 
 fn missing_terminal_error() -> CodexError {
@@ -900,6 +1078,7 @@ fn write_websocket_metadata_capture(
     pool_key: Option<&str>,
     continuation: Option<&ContinuationCandidate>,
     pooled: bool,
+    socket_id: u64,
 ) {
     traffic.write_json(
         "022-upstream-websocket-metadata",
@@ -908,6 +1087,7 @@ fn write_websocket_metadata_capture(
             "transport": "websocket",
             "url": ws_url,
             "poolKey": pool_key,
+            "socketId": socket_id,
             "pooled": pooled,
             "continuation": {
                 "previousResponseId": continuation
@@ -1745,8 +1925,8 @@ async fn stream_ws_events<S>(
     pool_key: Option<&str>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<Arc<TrafficCapture>>,
-    tx: mpsc::Sender<Result<serde_json::Value, CodexError>>,
-) -> bool
+    tx: &mpsc::Sender<Result<serde_json::Value, CodexError>>,
+) -> (bool, Option<serde_json::Value>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1758,6 +1938,7 @@ where
     let mut response_started = false;
     let mut status = 200u16;
     let mut reusable = false;
+    let mut terminal_event = None;
 
     loop {
         let response_deadline_started = if response_started {
@@ -1857,12 +2038,13 @@ where
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                if tx.send(Ok(parsed)).await.is_err() {
-                    invalidate_pool_owner(pool_key, pool_entry);
-                    break;
-                }
                 if terminal {
                     reusable = event_type == "response.completed";
+                    terminal_event = Some(parsed);
+                    break;
+                }
+                if tx.send(Ok(parsed)).await.is_err() {
+                    invalidate_pool_owner(pool_key, pool_entry);
                     break;
                 }
             }
@@ -1907,7 +2089,7 @@ where
     if let Some(tc) = traffic.as_deref() {
         write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
     }
-    reusable
+    (reusable, terminal_event)
 }
 
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
@@ -2206,7 +2388,8 @@ mod tests {
         clear_codex_websocket_pool_for_tests();
         let first = Arc::new(PoolEntry {
             ws: Arc::new(AsyncMutex::new(create_dummy_stream_async().await)),
-            created_at: now_ms(),
+            socket_id: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+            last_used_at: AtomicU64::new(now_ms()),
         });
         pool_insert("exclusive".to_string(), first.clone());
         assert!(Arc::ptr_eq(
@@ -2217,12 +2400,123 @@ mod tests {
 
         let replacement = Arc::new(PoolEntry {
             ws: Arc::new(AsyncMutex::new(create_dummy_stream_async().await)),
-            created_at: now_ms(),
+            socket_id: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+            last_used_at: AtomicU64::new(now_ms()),
         });
         pool_insert("exclusive".to_string(), replacement.clone());
         pool_remove_entry("exclusive", &first);
         assert!(Arc::ptr_eq(
             WS_POOL.lock().unwrap().get("exclusive").unwrap(),
+            &replacement
+        ));
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn completed_event_is_published_after_socket_returns_to_pool() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+
+        let _pool_test_guard = lock_ws_pool_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                if matches!(message, Message::Text(_)) {
+                    ws.send(Message::Text(
+                        serde_json::json!({
+                            "type": "response.completed",
+                            "response": {"id": "resp-terminal-order"}
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    break;
+                }
+            }
+            futures_util::future::pending::<()>().await;
+        });
+
+        let ctx = RequestContext {
+            req_id: "terminal-order-request".to_string(),
+            session_id: Some("terminal-order-session".to_string()),
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let mut events = codex_websocket_event_stream(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &serde_json::json!({"type":"response.create","input":[]}),
+            &ctx,
+            None,
+            Some("terminal-order-pool"),
+            1_000,
+            1_000,
+            None,
+        )
+        .await
+        .unwrap();
+        let terminal = events.recv().await.unwrap().unwrap();
+
+        assert_eq!(
+            terminal.get("type").and_then(serde_json::Value::as_str),
+            Some("response.completed")
+        );
+        let pooled = WS_POOL
+            .lock()
+            .unwrap()
+            .get("terminal-order-pool")
+            .cloned()
+            .expect("socket must be reusable before terminal publication");
+        assert_eq!(Some(pooled.socket_id), events.socket_id());
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn continuation_rejects_replacement_socket_with_same_pool_key() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let replacement = Arc::new(PoolEntry {
+            ws: Arc::new(AsyncMutex::new(create_dummy_stream_async().await)),
+            socket_id: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+            last_used_at: AtomicU64::new(now_ms()),
+        });
+        pool_insert_for_turn("exact-socket".to_string(), replacement.clone(), None, None);
+
+        let error = match prepare_codex_websocket_with_socket_id(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            "ws://codex.invalid/responses",
+            &HeaderMap::new(),
+            None,
+            Some("exact-socket"),
+            None,
+            None,
+            true,
+            Some(replacement.socket_id.saturating_add(1)),
+            1_000,
+            1_000,
+        )
+        .await
+        {
+            Ok(_) => panic!("replacement socket must not satisfy continuation ownership"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL)
+        );
+        assert!(Arc::ptr_eq(
+            WS_POOL.lock().unwrap().get("exact-socket").unwrap(),
             &replacement
         ));
         clear_codex_websocket_pool_for_tests();
@@ -2241,7 +2535,8 @@ mod tests {
                 "test-session".to_string(),
                 Arc::new(PoolEntry {
                     ws: Arc::new(AsyncMutex::new(stream)),
-                    created_at: now_ms(),
+                    socket_id: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+                    last_used_at: AtomicU64::new(now_ms()),
                 }),
             );
         }
@@ -2573,7 +2868,8 @@ mod tests {
                 "binary-session".to_string(),
                 Arc::new(PoolEntry {
                     ws: Arc::new(AsyncMutex::new(pooled_stream)),
-                    created_at: now_ms(),
+                    socket_id: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+                    last_used_at: AtomicU64::new(now_ms()),
                 }),
             );
         }
@@ -2610,7 +2906,8 @@ mod tests {
                 "start-timeout-session".to_string(),
                 Arc::new(PoolEntry {
                     ws: Arc::new(AsyncMutex::new(pooled_stream)),
-                    created_at: now_ms(),
+                    socket_id: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+                    last_used_at: AtomicU64::new(now_ms()),
                 }),
             );
         }
@@ -2665,7 +2962,8 @@ mod tests {
                 "response-idle-session".to_string(),
                 Arc::new(PoolEntry {
                     ws: Arc::new(AsyncMutex::new(pooled_stream)),
-                    created_at: now_ms(),
+                    socket_id: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+                    last_used_at: AtomicU64::new(now_ms()),
                 }),
             );
         }

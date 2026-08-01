@@ -1,7 +1,7 @@
 use crate::anthropic::sse::parse_sse_events;
 use crate::providers::codex::events::is_terminal_rate_limit_event;
 
-use super::read_rewrite::sanitize_read_args;
+use super::read_rewrite::sanitize_read_args_in_scope;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
 
@@ -228,7 +228,14 @@ fn emit_signature_only_reasoning(
 pub fn finish_metadata_from_upstream(
     input: &[u8],
 ) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
-    let events = reduce_upstream_bytes(input)?;
+    finish_metadata_from_upstream_in_scope(input, Some("legacy"))
+}
+
+pub fn finish_metadata_from_upstream_in_scope(
+    input: &[u8],
+    rewrite_scope: Option<&str>,
+) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
+    let events = reduce_upstream_bytes_in_scope(input, rewrite_scope)?;
     Ok(events.into_iter().rev().find_map(|event| match event {
         ReducerEvent::Finish {
             continuation_eligible,
@@ -245,6 +252,13 @@ pub fn finish_metadata_from_upstream(
 }
 
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+    reduce_upstream_bytes_in_scope(input, Some("legacy"))
+}
+
+pub fn reduce_upstream_bytes_in_scope(
+    input: &[u8],
+    rewrite_scope: Option<&str>,
+) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
     let sse_events = parse_sse_events(input);
     let mut out = Vec::new();
 
@@ -592,6 +606,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         if let Some(repaired) = repair_whitespace_stalled_read_args(
                             name,
                             args_accum,
+                            rewrite_scope,
                             Some(call_id.as_str()),
                         ) {
                             *args_accum = repaired.clone();
@@ -741,7 +756,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 }
 
                 if !args_accum.is_empty() {
-                    let sanitized = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
+                    let sanitized = sanitize_read_args_in_scope(
+                        name,
+                        args_accum,
+                        rewrite_scope,
+                        Some(call_id.as_str()),
+                    );
                     *args_accum = sanitized;
                     if *buffer_until_done || !*emitted_args {
                         *emitted_args = true;
@@ -911,6 +931,7 @@ fn should_buffer_tool_args(name: &str) -> bool {
 fn repair_whitespace_stalled_read_args(
     name: &str,
     args: &str,
+    rewrite_scope: Option<&str>,
     call_id: Option<&str>,
 ) -> Option<String> {
     if name != "Read" {
@@ -921,20 +942,25 @@ fn repair_whitespace_stalled_read_args(
     if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
         return None;
     }
-    parse_read_args_candidate(trimmed, call_id).or_else(|| {
+    parse_read_args_candidate(trimmed, rewrite_scope, call_id).or_else(|| {
         let with_brace = format!("{trimmed}}}");
-        parse_read_args_candidate(&with_brace, call_id)
+        parse_read_args_candidate(&with_brace, rewrite_scope, call_id)
     })
 }
 
-fn parse_read_args_candidate(args: &str, call_id: Option<&str>) -> Option<String> {
+fn parse_read_args_candidate(
+    args: &str,
+    rewrite_scope: Option<&str>,
+    call_id: Option<&str>,
+) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
     if !is_valid_read_args(&parsed) {
         return None;
     }
-    Some(sanitize_read_args(
+    Some(sanitize_read_args_in_scope(
         "Read",
         &serde_json::to_string(&parsed).ok()?,
+        rewrite_scope,
         call_id,
     ))
 }
@@ -1493,13 +1519,62 @@ mod tests {
     #[test]
     fn sanitize_tool_args_removes_empty_pages() {
         let args = r#"{"file_path":"/tmp/a","pages":""}"#;
-        let sanitized = sanitize_read_args("Read", args, None);
+        let sanitized = sanitize_read_args_in_scope("Read", args, Some("legacy"), None);
         let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
         assert!(parsed.get("pages").is_none());
         assert_eq!(
             parsed.get("file_path").and_then(|v| v.as_str()),
             Some("/tmp/a")
         );
+    }
+
+    #[test]
+    fn buffered_read_rewrite_notes_are_scoped() {
+        fn read_stream(offset: i64) -> String {
+            format!(
+                "{}{}{}{}",
+                sse(
+                    "response.output_item.added",
+                    json!({
+                        "output_index": 0,
+                        "item": {"type":"function_call","call_id":"call_shared","name":"Read"}
+                    })
+                ),
+                sse(
+                    "response.function_call_arguments.done",
+                    json!({
+                        "output_index": 0,
+                        "arguments": json!({"file_path":"/tmp/a","offset":offset}).to_string()
+                    })
+                ),
+                sse(
+                    "response.output_item.done",
+                    json!({
+                        "output_index": 0,
+                        "item": {
+                            "type":"function_call",
+                            "call_id":"call_shared",
+                            "name":"Read",
+                            "arguments":json!({"file_path":"/tmp/a","offset":offset}).to_string()
+                        }
+                    })
+                ),
+                sse(
+                    "response.completed",
+                    json!({"response":{"id":"resp_1","usage":{}}})
+                ),
+            )
+        }
+
+        reduce_upstream_bytes_in_scope(read_stream(1_000_001).as_bytes(), Some("lane-a")).unwrap();
+        reduce_upstream_bytes_in_scope(read_stream(1_000_002).as_bytes(), Some("lane-b")).unwrap();
+
+        let a = super::super::read_rewrite::read_offset_rewrite_in_scope("lane-a", "call_shared")
+            .unwrap();
+        let b = super::super::read_rewrite::read_offset_rewrite_in_scope("lane-b", "call_shared")
+            .unwrap();
+        assert_eq!(a.offset, 1_000_001);
+        assert_eq!(b.offset, 1_000_002);
     }
 
     #[test]
