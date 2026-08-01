@@ -608,9 +608,14 @@ pub(super) async fn codex_websocket_request(
     let ws_stream = if let Some(entry) = pooled {
         // Use pooled connection
         let mut ws_guard = entry.ws.lock().await;
-        // Check if connection is still alive by sending a ping
-        if ws_guard.send(Message::Ping(vec![])).await.is_err() {
+        // A successful write can still target a half-open TCP connection. Require
+        // the exact Pong before sending continuation state on this socket.
+        if validate_pooled_websocket(&mut ws_guard, connect_timeout_ms)
+            .await
+            .is_err()
+        {
             invalidate_pool_entry(pool_key.unwrap(), &entry);
+            drop(ws_guard);
             if requires_continuation_socket {
                 return Err(continuation_socket_missing_error());
             }
@@ -654,6 +659,7 @@ pub(super) async fn codex_websocket_request(
 
             // Handle previous response missing
             if is_previous_response_missing(&terminal_event.payload) {
+                invalidate_pool_entry(pool_key.unwrap(), &entry);
                 return Err(CodexError {
                     status: 0,
                     message: "Previous response not found".to_string(),
@@ -683,7 +689,11 @@ pub(super) async fn codex_websocket_request(
                 write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
             }
 
-            entry.touch();
+            if terminal_event.event_type == "response.completed" {
+                entry.touch();
+            } else {
+                invalidate_pool_entry(pool_key.unwrap(), &entry);
+            }
             return Ok(CodexResponse {
                 body: sse_body,
                 status,
@@ -785,6 +795,36 @@ pub(super) async fn codex_websocket_request(
     }
 }
 
+async fn validate_pooled_websocket<S>(
+    websocket: &mut WebSocketStream<S>,
+    timeout_ms: u64,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let nonce = b"codex-ready".to_vec();
+    websocket
+        .send(Message::Ping(nonce.clone()))
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        loop {
+            match websocket.next().await {
+                Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
+                Some(Ok(Message::Ping(payload))) => websocket
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(|error| error.to_string())?,
+                Some(Ok(_)) => return Err("unexpected frame during pooled validation".to_string()),
+                Some(Err(error)) => return Err(error.to_string()),
+                None => return Err("connection closed during pooled validation".to_string()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "validation timeout".to_string())?
+}
+
 pub(super) struct ReadyWebSocket {
     ws_url: String,
     guard: OwnedMutexGuard<CodexWebSocketStream>,
@@ -851,42 +891,14 @@ async fn prepare_codex_websocket_with_socket_id(
         Arc::new(PoolEntry::new(stream))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
-    if used_pooled {
-        let nonce = b"codex-ready".to_vec();
-        let validation: Result<(), String> = async {
-            guard
-                .send(Message::Ping(nonce.clone()))
-                .await
-                .map_err(|error| error.to_string())?;
-            tokio::time::timeout(Duration::from_millis(connect_timeout_ms), async {
-                loop {
-                    match guard.next().await {
-                        Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
-                        Some(Ok(Message::Ping(payload))) => guard
-                            .send(Message::Pong(payload))
-                            .await
-                            .map_err(|error| error.to_string())?,
-                        Some(Ok(_)) => {
-                            return Err("unexpected frame during pooled validation".to_string());
-                        }
-                        Some(Err(error)) => return Err(error.to_string()),
-                        None => {
-                            return Err("connection closed during pooled validation".to_string());
-                        }
-                    }
-                }
-            })
-            .await
-            .map_err(|_| "validation timeout".to_string())?
-        }
-        .await;
-        if let Err(detail) = validation {
-            return Err(if require_pooled_socket {
-                continuation_socket_missing_error()
-            } else {
-                pooled_validation_error(detail)
-            });
-        }
+    if used_pooled
+        && let Err(detail) = validate_pooled_websocket(&mut guard, connect_timeout_ms).await
+    {
+        return Err(if require_pooled_socket {
+            continuation_socket_missing_error()
+        } else {
+            pooled_validation_error(detail)
+        });
     }
     Ok(ReadyWebSocket {
         ws_url,
@@ -2410,6 +2422,112 @@ mod tests {
             &replacement
         ));
         clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn pooled_validation_requires_matching_pong() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+
+        let error = validate_pooled_websocket(&mut websocket, 25)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "validation timeout");
+    }
+
+    #[tokio::test]
+    async fn failed_buffered_terminal_removes_reused_socket() {
+        use tokio::net::TcpListener;
+
+        let _pool_test_guard = lock_ws_pool_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for terminal in ["response.completed", "response.failed"] {
+                loop {
+                    match websocket.next().await {
+                        Some(Ok(Message::Ping(payload))) => {
+                            websocket.send(Message::Pong(payload)).await.unwrap();
+                        }
+                        Some(Ok(Message::Text(_))) => {
+                            websocket
+                                .send(Message::Text(
+                                    serde_json::json!({
+                                        "type": terminal,
+                                        "response": {"id": format!("resp-{terminal}")}
+                                    })
+                                    .to_string(),
+                                ))
+                                .await
+                                .unwrap();
+                            break;
+                        }
+                        other => panic!("unexpected buffered test frame: {other:?}"),
+                    }
+                }
+            }
+        });
+        let context = RequestContext {
+            req_id: "failed-terminal-request".to_string(),
+            session_id: Some("failed-terminal-session".to_string()),
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let body = serde_json::json!({"type":"response.create","input":[]});
+        let client = test_websocket_client();
+        let proxy = WebSocketProxyConfig::direct();
+        let url = format!("http://{addr}/responses");
+
+        let first = codex_websocket_request(
+            &client,
+            &proxy,
+            &url,
+            &HeaderMap::new(),
+            &body,
+            &context,
+            None,
+            Some("failed-terminal-pool"),
+            1_000,
+            1_000,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status, 200);
+        assert!(WS_POOL.lock().unwrap().contains_key("failed-terminal-pool"));
+
+        let second = codex_websocket_request(
+            &client,
+            &proxy,
+            &url,
+            &HeaderMap::new(),
+            &body,
+            &context,
+            None,
+            Some("failed-terminal-pool"),
+            1_000,
+            1_000,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.status, 200);
+        assert!(!WS_POOL.lock().unwrap().contains_key("failed-terminal-pool"));
     }
 
     #[tokio::test]

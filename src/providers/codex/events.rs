@@ -147,6 +147,26 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
     None
 }
 
+pub(crate) fn first_failure_with_status(
+    body: &[u8],
+    expected_status: u16,
+) -> Option<CodexEventFailure> {
+    for event in crate::anthropic::sse::parse_sse_events(body) {
+        if event.data == "[DONE]" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
+            continue;
+        };
+        if let Some(failure) = classify_event_failure(&payload)
+            && failure.status == expected_status
+        {
+            return Some(failure);
+        }
+    }
+    None
+}
+
 pub(crate) fn numeric_status(payload: &Value) -> Option<u64> {
     payload
         .get("status")
@@ -214,6 +234,15 @@ mod tests {
         .unwrap();
         assert_eq!(overload.status, 529);
         assert!(overload.retryable());
+    }
+
+    #[test]
+    fn finds_permanent_in_band_unauthorized_failure() {
+        let body = b"data: {\"type\":\"response.failed\",\"status_code\":401,\"response\":{\"error\":{\"message\":\"expired\"}}}\n\n";
+        let failure = first_failure_with_status(body, 401).unwrap();
+        assert_eq!(failure.status, 401);
+        assert_eq!(failure.message, "expired");
+        assert!(!failure.retryable());
     }
 
     #[test]

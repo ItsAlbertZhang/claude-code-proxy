@@ -1092,7 +1092,17 @@ impl CodexHttpClient {
                 }
             };
 
-            if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
+            let buffered_unauthorized = result.as_ref().ok().and_then(|response| {
+                (200..300)
+                    .contains(&response.status)
+                    .then(|| super::events::first_failure_with_status(&response.body, 401))
+                    .flatten()
+                    .map(|failure| (failure, response.transport))
+            });
+            if (buffered_unauthorized.is_some()
+                || should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport))
+                && !auth_refresh_attempted
+            {
                 auth_refresh_attempted = true;
                 if let Some(key) = pool_key {
                     super::websocket::invalidate_codex_websocket_pool_turn(
@@ -1123,6 +1133,19 @@ impl CodexHttpClient {
                     }
                     Ok(_) => unreachable!("refresh-enabled branch handled above"),
                 }
+            }
+
+            if let Some((failure, actual_transport)) = buffered_unauthorized {
+                return Err(CodexError {
+                    status: 401,
+                    message: failure.message.clone(),
+                    detail: Some(failure.message),
+                    retry_after: failure.retry_after,
+                    origin: match actual_transport {
+                        ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
+                        ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
+                    },
+                });
             }
 
             if let Ok(response) = &result
@@ -2589,6 +2612,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.output, "search output");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_buffered_in_band_unauthorized_refreshes_only_next_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "buffered-token-a".into(),
+            refresh: "buffered-refresh-a".into(),
+            account_id: Some("buffered-acct-a".into()),
+            expires: u64::MAX,
+        });
+        let route = client.conversation_route(false).await.unwrap();
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "buffered-token-b".into(),
+            refresh: "buffered-refresh-b".into(),
+            account_id: Some("buffered-acct-b".into()),
+            expires: u64::MAX,
+        });
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_http_request(&mut stream).await).to_string();
+            assert!(request.contains("authorization: Bearer buffered-token-a"));
+            let body = b"data: {\"type\":\"response.failed\",\"status_code\":401,\"response\":{\"error\":{\"message\":\"expired\"}}}\n\n";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err(),
+                "bound buffered request must not retry with rotated auth"
+            );
+        });
+
+        let error = match client
+            .post_codex_bound_with_transport(
+                &route,
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expected buffered in-band unauthorized failure"),
+        };
+        assert_eq!(error.status, 401);
+        assert_eq!(error.origin, CodexErrorOrigin::BufferedHttp);
+        assert_eq!(
+            client.auth_manager().get_auth().await.unwrap().access,
+            "buffered-token-b"
+        );
         server.await.unwrap();
     }
 

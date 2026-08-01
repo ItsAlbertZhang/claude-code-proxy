@@ -1009,7 +1009,7 @@ async fn monitor_records_successful_request_events() {
         state.recent[0].session_id.as_deref(),
         Some("project-session")
     );
-    assert!(state.recent[0].session_seq.is_some());
+    assert!(state.recent[0].session_seq.is_none());
     assert_eq!(state.recent[0].project.as_deref(), Some("example"));
     assert_eq!(state.sessions[0].project.as_deref(), Some("example"));
     assert_eq!(state.recent[0].provider.as_deref(), Some("codex"));

@@ -47,6 +47,7 @@ enum CompactionPhase {
 struct CompactionState {
     lane_token: String,
     operation_id: String,
+    start_order: u64,
     revision: u64,
     model: String,
     phase: CompactionPhase,
@@ -84,6 +85,7 @@ struct CompactionRegistry {
 pub struct CompactionStartPermit {
     lane_token: String,
     operation_id: String,
+    start_order: u64,
     active: bool,
 }
 
@@ -141,9 +143,11 @@ pub fn reserve_compaction_start(
     if !registry.pending_starts.insert(key) {
         return None;
     }
+    registry.next_revision = registry.next_revision.wrapping_add(1).max(1);
     Some(CompactionStartPermit {
         lane_token: lane_token.to_string(),
         operation_id: operation_id.to_string(),
+        start_order: registry.next_revision,
         active: true,
     })
 }
@@ -167,7 +171,17 @@ pub fn begin_compaction_for_lane(
     let now = now_ms();
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.get_or_insert_with(CompactionRegistry::default);
-    begin_compaction_locked(registry, session_id, lane_token, model, operation_id, now)
+    registry.next_revision = registry.next_revision.wrapping_add(1).max(1);
+    let start_order = registry.next_revision;
+    begin_compaction_locked(
+        registry,
+        session_id,
+        lane_token,
+        model,
+        operation_id,
+        start_order,
+        now,
+    )
 }
 
 pub fn begin_compaction_with_permit(
@@ -194,6 +208,7 @@ pub fn begin_compaction_with_permit(
         &permit.lane_token,
         model,
         &permit.operation_id,
+        permit.start_order,
         now,
     )
 }
@@ -204,9 +219,17 @@ fn begin_compaction_locked(
     lane_token: &str,
     model: &str,
     operation_id: &str,
+    start_order: u64,
     now: u64,
 ) -> Option<CompactionLease> {
     evict_states(registry, now);
+    if registry
+        .states
+        .get(session_id)
+        .is_some_and(|state| state.start_order >= start_order)
+    {
+        return None;
+    }
     registry.next_revision = registry.next_revision.wrapping_add(1).max(1);
     let lease = CompactionLease {
         session_id: session_id.to_string(),
@@ -219,6 +242,7 @@ fn begin_compaction_locked(
         CompactionState {
             lane_token: lane_token.to_string(),
             operation_id: operation_id.to_string(),
+            start_order,
             revision: lease.revision,
             model: model.to_string(),
             phase: CompactionPhase::PendingRemote,
@@ -1134,6 +1158,39 @@ mod tests {
         assert!(replay.request.input.iter().any(|item| matches!(
             item,
             ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "current"
+        )));
+    }
+
+    #[test]
+    fn delayed_older_reservation_cannot_replace_newer_anchor() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let older = reserve_compaction_start(Some("lane"), "operation-older").unwrap();
+        let newer = reserve_compaction_start(Some("lane"), "operation-newer").unwrap();
+        let newer_lease =
+            begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", newer).unwrap();
+        assert!(store_compaction(
+            &newer_lease,
+            "gpt-5.6-sol",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "newer".to_string(),
+            }],
+        ));
+        assert!(activate_compaction(
+            Some(&newer_lease),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+
+        assert!(begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", older).is_none());
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay = apply_compaction_replay(Some("bound"), &next, "replay").unwrap();
+        assert!(replay.request.input.iter().any(|item| matches!(
+            item,
+            ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "newer"
         )));
     }
 
