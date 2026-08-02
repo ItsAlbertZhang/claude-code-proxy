@@ -14,14 +14,15 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{
     CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
-    RequestContext,
+    RequestContext, ScopedRequestContext,
 };
 use crate::providers::kimi::auth::token_store::file_store;
 use crate::providers::kimi::translate::accumulate::accumulate_response;
 use crate::providers::kimi::translate::model_allowlist::{assert_allowed_model, resolve_model};
-use crate::providers::kimi::translate::request::{TranslateOptions, translate_request};
+use crate::providers::kimi::translate::request::translate_request_scoped;
 use crate::providers::kimi::translate::stream::translate_stream_bytes;
 use crate::registry::KIMI_MODELS;
+use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -42,6 +43,13 @@ impl KimiProvider {
     pub fn new() -> Self {
         Self
     }
+}
+
+fn kimi_prompt_cache_lane(session_id: Option<&str>) -> Option<OpaqueLane> {
+    session_id.and_then(OpaqueLane::decode).or_else(|| {
+        RequestScope::legacy(session_id, RequestPurpose::Conversation)
+            .provider_lane(LaneDomain::KimiPromptCache)
+    })
 }
 
 #[async_trait]
@@ -78,11 +86,9 @@ impl Provider for KimiProvider {
             monitor.model_resolved(&ctx.req_id, &resolved);
         }
 
-        let translated = match translate_request(
+        let translated = match translate_request_scoped(
             &body,
-            TranslateOptions {
-                session_id: ctx.session_id.clone(),
-            },
+            kimi_prompt_cache_lane(ctx.session_id.as_deref()),
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -170,6 +176,20 @@ impl Provider for KimiProvider {
         }
     }
 
+    async fn handle_messages_scoped(
+        &self,
+        body: MessagesRequest,
+        scoped: ScopedRequestContext,
+    ) -> Response {
+        let prompt_cache_key = scoped
+            .scope()
+            .provider_lane(LaneDomain::KimiPromptCache)
+            .map(|lane| lane.encode());
+        let mut ctx = scoped.into_legacy();
+        ctx.session_id = prompt_cache_key;
+        self.handle_messages(body, ctx).await
+    }
+
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let model = body.model.as_deref().unwrap_or("kimi-for-coding");
         let resolved = resolve_model(model);
@@ -213,19 +233,15 @@ impl Provider for KimiProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved);
         }
-        let translated = translate_request(
-            &body,
-            TranslateOptions {
-                session_id: ctx.session_id.clone(),
-            },
-        )
-        .map_err(|error| {
-            ProviderError::new(
-                StatusCode::BAD_REQUEST,
-                ProviderErrorKind::InvalidRequest,
-                error.to_string(),
-            )
-        })?;
+        let translated =
+            translate_request_scoped(&body, kimi_prompt_cache_lane(ctx.session_id.as_deref()))
+                .map_err(|error| {
+                    ProviderError::new(
+                        StatusCode::BAD_REQUEST,
+                        ProviderErrorKind::InvalidRequest,
+                        error.to_string(),
+                    )
+                })?;
         if let Some(traffic) = ctx.traffic.as_ref() {
             traffic.write_json(
                 "020-upstream-request",
@@ -279,6 +295,20 @@ impl Provider for KimiProvider {
             body: GenerationBody::BufferedSse(sse.into()),
             resolved_model: resolved,
         })
+    }
+
+    async fn generate_anthropic_stream_scoped(
+        &self,
+        body: MessagesRequest,
+        scoped: ScopedRequestContext,
+    ) -> Result<Generation, ProviderError> {
+        let prompt_cache_key = scoped
+            .scope()
+            .provider_lane(LaneDomain::KimiPromptCache)
+            .map(|lane| lane.encode());
+        let mut ctx = scoped.into_legacy();
+        ctx.session_id = prompt_cache_key;
+        self.generate_anthropic_stream(body, ctx).await
     }
 }
 

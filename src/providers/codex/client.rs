@@ -2851,6 +2851,7 @@ mod tests {
             &first_response.body,
             first_response.socket_id,
             false,
+            None,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);
@@ -2881,6 +2882,7 @@ mod tests {
             &second_response.body,
             second_response.socket_id,
             false,
+            None,
         );
 
         let third_request = buffered_request_with_texts(&["one", "two", "three"]);
@@ -2982,6 +2984,7 @@ mod tests {
             &first_response.body,
             first_response.socket_id,
             false,
+            None,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);
@@ -3096,6 +3099,7 @@ mod tests {
             &first_response.body,
             first_response.socket_id,
             false,
+            None,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);

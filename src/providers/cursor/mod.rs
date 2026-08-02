@@ -21,7 +21,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{
     CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
-    RequestContext,
+    RequestContext, ScopedRequestContext,
 };
 use crate::providers::cursor::auth::{
     clear_cursor_auth, expired_auth_message, load_cursor_auth, missing_auth_message,
@@ -34,9 +34,10 @@ use crate::providers::cursor::response::{
     CursorDecodeError, decode_cursor_upstream, decode_upstream_response,
 };
 use crate::providers::cursor::tool_bridge::{
-    BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
-    resume_cursor_tool_bridge, start_cursor_tool_bridge,
+    BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools_scoped, find_tool_result,
+    resume_cursor_tool_bridge_scoped, start_cursor_tool_bridge_scoped,
 };
+use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -54,6 +55,13 @@ impl CursorProvider {
     pub fn new() -> Self {
         Self
     }
+}
+
+fn cursor_bridge_lane(session_id: Option<&str>) -> Option<OpaqueLane> {
+    session_id.and_then(OpaqueLane::decode).or_else(|| {
+        RequestScope::legacy(session_id, RequestPurpose::Conversation)
+            .provider_lane(LaneDomain::CursorToolBridge)
+    })
 }
 
 #[async_trait]
@@ -84,12 +92,13 @@ impl Provider for CursorProvider {
             );
         }
 
-        if let Some(ref session_id) = ctx.session_id
-            && let Some(pending) = BridgeRegistry::pending_tool(session_id)
+        let bridge_lane = cursor_bridge_lane(ctx.session_id.as_deref());
+        if let Some(lane) = bridge_lane
+            && let Some(pending) = BridgeRegistry::pending_tool_scoped(lane)
             && let Some(result) = find_tool_result(&body, pending.tool_use_id())
         {
             let (_result_messages, sse_bytes) =
-                resume_cursor_tool_bridge(session_id, &message_id, model, result, &pending);
+                resume_cursor_tool_bridge_scoped(lane, &message_id, model, result, &pending);
             if let Some(monitor) = ctx.monitor.as_ref() {
                 let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
                 monitor.stream_progress(
@@ -151,8 +160,7 @@ impl Provider for CursorProvider {
         };
 
         if want_stream {
-            let session_id = ctx.session_id.as_deref();
-            let bridge_eligible = can_bridge_cursor_native_tools(&body, session_id);
+            let bridge_eligible = can_bridge_cursor_native_tools_scoped(&body, bridge_lane);
 
             if bridge_eligible {
                 let events = match decode_upstream_response(&upstream.body) {
@@ -161,10 +169,10 @@ impl Provider for CursorProvider {
                 };
 
                 let allowed = advertised_tool_names(&body);
-                let (sse_bytes, _paused) = start_cursor_tool_bridge(
+                let (sse_bytes, _paused) = start_cursor_tool_bridge_scoped(
                     &message_id,
                     model,
-                    session_id.unwrap(),
+                    bridge_lane.expect("bridge lane validated"),
                     &events,
                     allowed,
                     Box::new(|| uuid::Uuid::new_v4().to_string().replace('-', "")),
@@ -223,6 +231,20 @@ impl Provider for CursorProvider {
         }
     }
 
+    async fn handle_messages_scoped(
+        &self,
+        body: MessagesRequest,
+        scoped: ScopedRequestContext,
+    ) -> Response {
+        let bridge_lane = scoped
+            .scope()
+            .provider_lane(LaneDomain::CursorToolBridge)
+            .map(|lane| lane.encode());
+        let mut ctx = scoped.into_legacy();
+        ctx.session_id = bridge_lane;
+        self.handle_messages(body, ctx).await
+    }
+
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let prompt = render_cursor_prompt(&body);
         let tokens = (prompt.len() / 4) as u64; // rough estimate
@@ -256,12 +278,13 @@ impl Provider for CursorProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model_id);
         }
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        if let Some(session_id) = ctx.session_id.as_deref()
-            && let Some(pending) = BridgeRegistry::pending_tool(session_id)
+        let bridge_lane = cursor_bridge_lane(ctx.session_id.as_deref());
+        if let Some(lane) = bridge_lane
+            && let Some(pending) = BridgeRegistry::pending_tool_scoped(lane)
             && let Some(result) = find_tool_result(&body, pending.tool_use_id())
         {
             let (_, bytes) =
-                resume_cursor_tool_bridge(session_id, &message_id, &requested, result, &pending);
+                resume_cursor_tool_bridge_scoped(lane, &message_id, &requested, result, &pending);
             return Ok(Generation {
                 body: GenerationBody::BufferedSse(bytes.into()),
                 resolved_model: resolved.model_id,
@@ -311,14 +334,14 @@ impl Provider for CursorProvider {
         if let Some(traffic) = ctx.traffic.as_ref() {
             traffic.write_bytes("032-upstream-response-body.bin", &upstream.body);
         }
-        let bytes = if can_bridge_cursor_native_tools(&body, ctx.session_id.as_deref()) {
+        let bytes = if can_bridge_cursor_native_tools_scoped(&body, bridge_lane) {
             let events =
                 decode_upstream_response(&upstream.body).map_err(cursor_decode_provider_error)?;
             let allowed = advertised_tool_names(&body);
-            start_cursor_tool_bridge(
+            start_cursor_tool_bridge_scoped(
                 &message_id,
                 &requested,
-                ctx.session_id.as_deref().expect("bridge session validated"),
+                bridge_lane.expect("bridge lane validated"),
                 &events,
                 allowed,
                 Box::new(|| uuid::Uuid::new_v4().simple().to_string()),
@@ -344,6 +367,20 @@ impl Provider for CursorProvider {
             body: GenerationBody::BufferedSse(bytes.into()),
             resolved_model: resolved.model_id,
         })
+    }
+
+    async fn generate_anthropic_stream_scoped(
+        &self,
+        body: MessagesRequest,
+        scoped: ScopedRequestContext,
+    ) -> Result<Generation, ProviderError> {
+        let bridge_lane = scoped
+            .scope()
+            .provider_lane(LaneDomain::CursorToolBridge)
+            .map(|lane| lane.encode());
+        let mut ctx = scoped.into_legacy();
+        ctx.session_id = bridge_lane;
+        self.generate_anthropic_stream(body, ctx).await
     }
 }
 

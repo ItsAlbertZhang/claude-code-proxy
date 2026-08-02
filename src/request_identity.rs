@@ -26,11 +26,16 @@ impl ConversationIdentity {
 
     pub(crate) fn validated(&self) -> Option<Self> {
         match self {
-            Self::Main(session) if valid_identity_text(session) => Some(self.clone()),
+            Self::Main(session) if valid_identity_text(session) => {
+                Some(Self::Main(trim_ows(session).to_string()))
+            }
             Self::Agent(session, agent)
                 if valid_identity_text(session) && valid_identity_text(agent) =>
             {
-                Some(self.clone())
+                Some(Self::Agent(
+                    trim_ows(session).to_string(),
+                    trim_ows(agent).to_string(),
+                ))
             }
             Self::Main(_) | Self::Agent(_, _) => None,
         }
@@ -236,6 +241,13 @@ impl OpaqueLane {
 
     pub(crate) fn encode(&self) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0)
+    }
+
+    pub(crate) fn decode(value: &str) -> Option<Self> {
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value)
+            .ok()?;
+        Some(Self(decoded.try_into().ok()?))
     }
 }
 
@@ -486,6 +498,37 @@ mod tests {
         );
         assert!(!codex.encode().contains("session-a"));
         assert!(!codex.encode().contains("agent-a"));
+    }
+
+    #[test]
+    fn explicit_identity_is_canonicalized_before_lane_derivation() {
+        let canonical = RequestScope::from_conversation_identity(
+            Some(ConversationIdentity::Agent(
+                "session-a".to_string(),
+                "agent-a".to_string(),
+            )),
+            RequestPurpose::Conversation,
+        );
+        let padded = RequestScope::from_conversation_identity(
+            Some(ConversationIdentity::Agent(
+                " \tsession-a\t ".to_string(),
+                "\tagent-a ".to_string(),
+            )),
+            RequestPurpose::Conversation,
+        );
+        assert_eq!(canonical.identity(), padded.identity());
+        assert_eq!(
+            canonical.provider_lane(LaneDomain::CodexReadRewrite),
+            padded.provider_lane(LaneDomain::CodexReadRewrite)
+        );
+    }
+
+    #[test]
+    fn opaque_lane_encoding_round_trips_exactly() {
+        let scope = RequestScope::legacy(Some("session-a"), RequestPurpose::Conversation);
+        let lane = scope.provider_lane(LaneDomain::CursorToolBridge).unwrap();
+        assert_eq!(OpaqueLane::decode(&lane.encode()), Some(lane));
+        assert!(OpaqueLane::decode("not-an-opaque-lane").is_none());
     }
 
     #[test]

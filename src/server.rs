@@ -2415,7 +2415,7 @@ mod auto_review_tests {
         let captured = headers_to_record(&headers);
         assert_eq!(
             captured["x-claude-code-session-id"],
-            json!("session-visible")
+            json!("[redacted len=15]")
         );
         assert_eq!(captured[CLAUDE_AGENT_HEADER], json!("[redacted len=12]"));
         assert_eq!(
@@ -2423,6 +2423,7 @@ mod auto_review_tests {
             json!("[redacted len=13]")
         );
         let serialized = captured.to_string();
+        assert!(!serialized.contains("session-visible"));
         assert!(!serialized.contains("agent-secret"));
         assert!(!serialized.contains("parent-secret"));
     }

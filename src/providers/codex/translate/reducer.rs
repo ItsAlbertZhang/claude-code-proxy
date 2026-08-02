@@ -1,7 +1,8 @@
 use crate::anthropic::sse::parse_sse_events;
 use crate::providers::codex::events::is_terminal_rate_limit_event;
+use crate::request_identity::OpaqueLane;
 
-use super::read_rewrite::sanitize_read_args;
+use super::read_rewrite::{sanitize_read_args, sanitize_read_args_scoped};
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
 
@@ -225,10 +226,30 @@ fn emit_signature_only_reasoning(
     output_items_by_index.insert(output_index, reasoning_input_item(replay));
 }
 
+#[derive(Clone, Copy)]
+enum ReadLane {
+    Legacy,
+    Stable(Option<OpaqueLane>),
+}
+
 pub fn finish_metadata_from_upstream(
     input: &[u8],
 ) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
-    let events = reduce_upstream_bytes(input)?;
+    finish_metadata_from_upstream_with_lane(input, ReadLane::Legacy)
+}
+
+pub(crate) fn finish_metadata_from_upstream_scoped(
+    input: &[u8],
+    read_lane: Option<OpaqueLane>,
+) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
+    finish_metadata_from_upstream_with_lane(input, ReadLane::Stable(read_lane))
+}
+
+fn finish_metadata_from_upstream_with_lane(
+    input: &[u8],
+    read_lane: ReadLane,
+) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
+    let events = reduce_upstream_bytes_with_lane(input, read_lane)?;
     Ok(events.into_iter().rev().find_map(|event| match event {
         ReducerEvent::Finish {
             continuation_eligible,
@@ -245,6 +266,20 @@ pub fn finish_metadata_from_upstream(
 }
 
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+    reduce_upstream_bytes_with_lane(input, ReadLane::Legacy)
+}
+
+pub(crate) fn reduce_upstream_bytes_scoped(
+    input: &[u8],
+    read_lane: Option<OpaqueLane>,
+) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+    reduce_upstream_bytes_with_lane(input, ReadLane::Stable(read_lane))
+}
+
+fn reduce_upstream_bytes_with_lane(
+    input: &[u8],
+    read_lane: ReadLane,
+) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
     let sse_events = parse_sse_events(input);
     let mut out = Vec::new();
 
@@ -593,6 +628,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                             name,
                             args_accum,
                             Some(call_id.as_str()),
+                            read_lane,
                         ) {
                             *args_accum = repaired.clone();
                             *emitted_args = true;
@@ -741,7 +777,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 }
 
                 if !args_accum.is_empty() {
-                    let sanitized = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
+                    let sanitized = sanitize_read_args_for_lane(
+                        name,
+                        args_accum,
+                        Some(call_id.as_str()),
+                        read_lane,
+                    );
                     *args_accum = sanitized;
                     if *buffer_until_done || !*emitted_args {
                         *emitted_args = true;
@@ -908,10 +949,23 @@ fn should_buffer_tool_args(name: &str) -> bool {
     name == "Read"
 }
 
+fn sanitize_read_args_for_lane(
+    name: &str,
+    args: &str,
+    call_id: Option<&str>,
+    read_lane: ReadLane,
+) -> String {
+    match read_lane {
+        ReadLane::Legacy => sanitize_read_args(name, args, call_id),
+        ReadLane::Stable(lane) => sanitize_read_args_scoped(name, args, call_id, lane),
+    }
+}
+
 fn repair_whitespace_stalled_read_args(
     name: &str,
     args: &str,
     call_id: Option<&str>,
+    read_lane: ReadLane,
 ) -> Option<String> {
     if name != "Read" {
         return None;
@@ -921,21 +975,26 @@ fn repair_whitespace_stalled_read_args(
     if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
         return None;
     }
-    parse_read_args_candidate(trimmed, call_id).or_else(|| {
+    parse_read_args_candidate(trimmed, call_id, read_lane).or_else(|| {
         let with_brace = format!("{trimmed}}}");
-        parse_read_args_candidate(&with_brace, call_id)
+        parse_read_args_candidate(&with_brace, call_id, read_lane)
     })
 }
 
-fn parse_read_args_candidate(args: &str, call_id: Option<&str>) -> Option<String> {
+fn parse_read_args_candidate(
+    args: &str,
+    call_id: Option<&str>,
+    read_lane: ReadLane,
+) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
     if !is_valid_read_args(&parsed) {
         return None;
     }
-    Some(sanitize_read_args(
+    Some(sanitize_read_args_for_lane(
         "Read",
         &serde_json::to_string(&parsed).ok()?,
         call_id,
+        read_lane,
     ))
 }
 
