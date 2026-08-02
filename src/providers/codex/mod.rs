@@ -610,12 +610,7 @@ impl LiveRequestStateCleanup {
 impl Drop for LiveRequestStateCleanup {
     fn drop(&mut self) {
         if self.armed {
-            abort_request_state(
-                self.session_id.as_deref(),
-                &self.continuation,
-                self.compact_boundary,
-                &self.request,
-            );
+            abort_continuation_for_owner(&self.continuation);
         }
     }
 }
@@ -2100,20 +2095,43 @@ mod tests {
         let session_id = "stale-live-request-cleanup";
         let owner = ConversationIdentity::Main(session_id.to_string());
         continuation::clear_continuation_for_owner(Some(&owner));
+        compaction::clear_compaction(session_id);
         let request = live_test_request("one");
         let stale_continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
         let stale_cleanup = LiveRequestStateCleanup::new(
             stale_continuation,
             Some(session_id.to_string()),
-            false,
+            true,
             request.clone(),
         );
 
         let newer_continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        assert!(store_compaction_for_request(
+            session_id,
+            &request,
+            vec![translate::request::ResponsesInputItem::Compaction {
+                encrypted_content: "newer-native-history".to_string(),
+            }],
+        ));
         drop(stale_cleanup);
 
         assert!(continuation::is_current_turn_for_owner(&newer_continuation));
-        abort_request_state(Some(session_id), &newer_continuation, false, &request);
+        let summary: Vec<translate::request::ResponsesInputItem> =
+            serde_json::from_value(serde_json::json!([{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "newer portable summary with enough detail for safe activation"
+                }]
+            }]))
+            .unwrap();
+        assert!(activate_compaction_for_request(
+            Some(session_id),
+            &request,
+            &summary,
+        ));
+        abort_request_state(Some(session_id), &newer_continuation, true, &request);
     }
 
     #[tokio::test]
