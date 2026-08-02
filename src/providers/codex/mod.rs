@@ -39,8 +39,9 @@ use self::auth::manager::CodexAuthManager;
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
 use self::compaction::{
-    abort_compaction_attempt, activate_compaction_for_request, apply_compaction_replay,
-    request_compaction, store_compaction_for_request,
+    CompactionAttempt, abort_compaction_for_owner, activate_compaction_for_owner,
+    apply_compaction_replay_for_owner, begin_compaction_for_owner, request_compaction,
+    store_compaction_for_owner,
 };
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
@@ -95,10 +96,18 @@ impl CodexProvider {
         body: MessagesRequest,
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
+        use_legacy_compaction_owner: bool,
     ) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
+        let compaction_identity = conversation_identity.clone().or_else(|| {
+            if use_legacy_compaction_owner {
+                ctx.session_id.clone().map(ConversationIdentity::Main)
+            } else {
+                None
+            }
+        });
 
         let mut resolved =
             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
@@ -219,14 +228,14 @@ impl CodexProvider {
 
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
-        if !server_compaction_enabled && let Some(session_id) = ctx.session_id.as_deref() {
-            compaction::clear_compaction(session_id);
+        let mut compaction_attempt = None;
+        if !server_compaction_enabled {
+            compaction::clear_compaction_for_owner(compaction_identity.as_ref());
         }
-        if server_compaction_enabled
-            && compact_boundary
-            && let Some(session_id) = ctx.session_id.as_deref()
-        {
-            compaction::clear_compaction(session_id);
+        if server_compaction_enabled && compact_boundary && compaction_identity.is_some() {
+            let attempt = begin_compaction_for_owner(compaction_identity.as_ref(), &translated)
+                .expect("checked compaction owner");
+            compaction_attempt = Some(attempt);
             log_compaction_event(
                 "server_compaction_triggered",
                 &ctx,
@@ -240,7 +249,11 @@ impl CodexProvider {
             compaction_ctx.monitor = None;
             match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
                 Ok(native_history) => {
-                    if store_compaction_for_request(session_id, &translated, native_history) {
+                    if store_compaction_for_owner(
+                        compaction_identity.as_ref(),
+                        Some(attempt),
+                        native_history,
+                    ) {
                         log_compaction_event(
                             "server_compaction_completed",
                             &ctx,
@@ -252,12 +265,12 @@ impl CodexProvider {
                             "server_compaction_failed",
                             &ctx,
                             translated.input.len(),
-                            Some("compaction state exceeded the in-memory limit"),
+                            Some("compaction state was superseded or exceeded the in-memory limit"),
                         );
                     }
                 }
                 Err(error) => {
-                    compaction::clear_compaction(session_id);
+                    abort_compaction_for_owner(compaction_identity.as_ref(), Some(attempt));
                     log_compaction_event(
                         "server_compaction_failed",
                         &ctx,
@@ -268,10 +281,17 @@ impl CodexProvider {
             }
         } else if server_compaction_enabled
             && !compact_boundary
-            && let Some(replay) = apply_compaction_replay(ctx.session_id.as_deref(), &translated)
+            && let Some(replay) =
+                apply_compaction_replay_for_owner(compaction_identity.as_ref(), &translated)
         {
-            translated = replay;
+            translated = replay.request;
+            compaction_attempt = Some(replay.attempt);
         }
+        let request_compaction = RequestCompactionState {
+            owner: compaction_identity,
+            attempt: compaction_attempt,
+            compact_boundary,
+        };
 
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
@@ -295,7 +315,7 @@ impl CodexProvider {
                 ctx,
                 stream_request,
                 continuation,
-                compact_boundary,
+                request_compaction,
             )
             .await;
         }
@@ -310,10 +330,9 @@ impl CodexProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    abort_compaction_attempt(
-                        ctx.session_id.as_deref(),
-                        compact_boundary,
-                        &translated,
+                    abort_compaction_for_owner(
+                        request_compaction.owner.as_ref(),
+                        request_compaction.attempt,
                     );
                     abort_continuation_for_owner(&request_continuation);
                     return map_codex_error_to_response(&e);
@@ -327,13 +346,19 @@ impl CodexProvider {
             let error = empty_buffered_completion_error();
             drop_live_continuation_for_retry(&mut continuation);
             if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
-                abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
+                abort_compaction_for_owner(
+                    request_compaction.owner.as_ref(),
+                    request_compaction.attempt,
+                );
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
             let delay = compute_backoff_delay(attempt, None);
             if delay.exceeds_budget {
-                abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
+                abort_compaction_for_owner(
+                    request_compaction.owner.as_ref(),
+                    request_compaction.attempt,
+                );
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
@@ -352,10 +377,9 @@ impl CodexProvider {
             ) {
                 Ok(b) => b,
                 Err(e) => {
-                    abort_compaction_attempt(
-                        ctx.session_id.as_deref(),
-                        compact_boundary,
-                        &translated,
+                    abort_compaction_for_owner(
+                        request_compaction.owner.as_ref(),
+                        request_compaction.attempt,
                     );
                     abort_continuation_for_owner(&request_continuation);
                     return map_codex_failure_to_response(&format!(
@@ -374,12 +398,11 @@ impl CodexProvider {
                 );
             }
             update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
+                &request_compaction,
                 &request_continuation,
                 &translated,
                 &upstream.body,
                 upstream.socket_id,
-                compact_boundary,
             );
 
             let headers = [
@@ -405,20 +428,18 @@ impl CodexProvider {
                         );
                     }
                     update_continuation_from_upstream(
-                        ctx.session_id.as_deref(),
+                        &request_compaction,
                         &request_continuation,
                         &translated,
                         &upstream.body,
                         upstream.socket_id,
-                        compact_boundary,
                     );
                     (StatusCode::OK, Json(json)).into_response()
                 }
                 Err(e) => {
-                    abort_compaction_attempt(
-                        ctx.session_id.as_deref(),
-                        compact_boundary,
-                        &translated,
+                    abort_compaction_for_owner(
+                        request_compaction.owner.as_ref(),
+                        request_compaction.attempt,
                     );
                     abort_continuation_for_owner(&request_continuation);
                     map_codex_failure_to_response(&format!("Accumulation error: {e}"))
@@ -452,7 +473,7 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        self.handle_messages_inner(body, ctx, None).await
+        self.handle_messages_inner(body, ctx, None, true).await
     }
 
     async fn handle_messages_with_conversation_identity(
@@ -461,7 +482,7 @@ impl Provider for CodexProvider {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        self.handle_messages_inner(body, ctx, conversation_identity)
+        self.handle_messages_inner(body, ctx, conversation_identity, false)
             .await
     }
 
@@ -556,48 +577,39 @@ fn log_compaction_event(
     }
 }
 
-fn abort_request_state(
-    session_id: Option<&str>,
-    continuation: &ContinuationReservation,
+#[derive(Clone)]
+struct RequestCompactionState {
+    owner: Option<ConversationIdentity>,
+    attempt: Option<CompactionAttempt>,
     compact_boundary: bool,
-    request: &translate::request::ResponsesRequest,
+}
+
+fn abort_request_state(
+    compaction: &RequestCompactionState,
+    continuation: &ContinuationReservation,
 ) {
-    abort_compaction_attempt(session_id, compact_boundary, request);
+    abort_compaction_for_owner(compaction.owner.as_ref(), compaction.attempt);
     abort_continuation_for_owner(continuation);
 }
 
 struct LiveRequestStateCleanup {
     continuation: ContinuationReservation,
-    session_id: Option<String>,
-    compact_boundary: bool,
-    request: translate::request::ResponsesRequest,
+    compaction: RequestCompactionState,
     armed: bool,
 }
 
 impl LiveRequestStateCleanup {
-    fn new(
-        continuation: ContinuationReservation,
-        session_id: Option<String>,
-        compact_boundary: bool,
-        request: translate::request::ResponsesRequest,
-    ) -> Self {
+    fn new(continuation: ContinuationReservation, compaction: RequestCompactionState) -> Self {
         Self {
             continuation,
-            session_id,
-            compact_boundary,
-            request,
+            compaction,
             armed: true,
         }
     }
 
     fn abort(&mut self) {
         if self.armed {
-            abort_request_state(
-                self.session_id.as_deref(),
-                &self.continuation,
-                self.compact_boundary,
-                &self.request,
-            );
+            abort_request_state(&self.compaction, &self.continuation);
             self.armed = false;
         }
     }
@@ -610,12 +622,7 @@ impl LiveRequestStateCleanup {
 impl Drop for LiveRequestStateCleanup {
     fn drop(&mut self) {
         if self.armed {
-            abort_request_state(
-                self.session_id.as_deref(),
-                &self.continuation,
-                self.compact_boundary,
-                &self.request,
-            );
+            abort_request_state(&self.compaction, &self.continuation);
         }
     }
 }
@@ -635,16 +642,12 @@ async fn live_stream_response(
     ctx: RequestContext,
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationReservation,
-    compact_boundary: bool,
+    compaction: RequestCompactionState,
 ) -> Response {
     let model = model.to_string();
     let request_continuation = continuation.clone();
-    let mut cleanup = LiveRequestStateCleanup::new(
-        request_continuation.clone(),
-        ctx.session_id.clone(),
-        compact_boundary,
-        request_body.clone(),
-    );
+    let mut cleanup =
+        LiveRequestStateCleanup::new(request_continuation.clone(), compaction.clone());
     let mut attempt = 0_u32;
     let mut continuation = Some(continuation);
 
@@ -686,7 +689,7 @@ async fn live_stream_response(
             ctx.clone(),
             request_continuation.clone(),
             request_body.clone(),
-            compact_boundary,
+            compaction.clone(),
         )
         .await
         {
@@ -743,7 +746,7 @@ async fn live_stream_response_once(
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
-    compact_boundary: bool,
+    compaction: RequestCompactionState,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -764,12 +767,7 @@ async fn live_stream_response_once(
                 if retryable_live_start_codex_error(&err) {
                     return provider_retry(&upstream_events, err);
                 }
-                abort_request_state(
-                    ctx.session_id.as_deref(),
-                    &request_continuation,
-                    compact_boundary,
-                    &request_body,
-                );
+                abort_request_state(&compaction, &request_continuation);
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
@@ -818,12 +816,7 @@ async fn live_stream_response_once(
                         },
                     );
                 }
-                abort_request_state(
-                    ctx.session_id.as_deref(),
-                    &request_continuation,
-                    compact_boundary,
-                    &request_body,
-                );
+                abort_request_state(&compaction, &request_continuation);
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
@@ -839,12 +832,11 @@ async fn live_stream_response_once(
             record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
                 update_continuation_from_upstream(
-                    ctx.session_id.as_deref(),
+                    &compaction,
                     &request_continuation,
                     &request_body,
                     &upstream_sse_body,
                     upstream_events.socket_id(),
-                    compact_boundary,
                 );
                 return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
             }
@@ -856,17 +848,16 @@ async fn live_stream_response_once(
                 request_continuation,
                 request_body,
                 upstream_sse_body,
-                compact_boundary,
+                compaction,
             ));
         }
         if terminal {
             update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
+                &compaction,
                 &request_continuation,
                 &request_body,
                 &upstream_sse_body,
                 upstream_events.socket_id(),
-                compact_boundary,
             );
             if pending_chunk.is_empty() {
                 return LiveStreamStart::Response(empty_live_stream_response());
@@ -966,29 +957,19 @@ fn remaining_live_stream_response(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
-    compact_boundary: bool,
+    compaction: RequestCompactionState,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
-            abort_request_state(
-                ctx.session_id.as_deref(),
-                &request_continuation,
-                compact_boundary,
-                &request_body,
-            );
+            abort_request_state(&compaction, &request_continuation);
             return;
         }
         loop {
             let item = tokio::select! {
                 biased;
                 _ = tx.closed() => {
-                    abort_request_state(
-                        ctx.session_id.as_deref(),
-                        &request_continuation,
-                        compact_boundary,
-                        &request_body,
-                    );
+                    abort_request_state(&compaction, &request_continuation);
                     return;
                 }
                 item = upstream_events.recv() => item,
@@ -1006,12 +987,7 @@ fn remaining_live_stream_response(
                     ) {
                         Ok(result) => result,
                         Err(message) => {
-                            abort_request_state(
-                                ctx.session_id.as_deref(),
-                                &request_continuation,
-                                compact_boundary,
-                                &request_body,
-                            );
+                            abort_request_state(&compaction, &request_continuation);
                             let chunk = translator.error_chunk(
                                 &message,
                                 "api_error",
@@ -1027,34 +1003,23 @@ fn remaining_live_stream_response(
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                            abort_request_state(
-                                ctx.session_id.as_deref(),
-                                &request_continuation,
-                                compact_boundary,
-                                &request_body,
-                            );
+                            abort_request_state(&compaction, &request_continuation);
                             return;
                         }
                     }
                     if terminal {
                         update_continuation_from_upstream(
-                            ctx.session_id.as_deref(),
+                            &compaction,
                             &request_continuation,
                             &request_body,
                             &upstream_sse_body,
                             upstream_events.socket_id(),
-                            compact_boundary,
                         );
                         return;
                     }
                 }
                 Err(err) => {
-                    abort_request_state(
-                        ctx.session_id.as_deref(),
-                        &request_continuation,
-                        compact_boundary,
-                        &request_body,
-                    );
+                    abort_request_state(&compaction, &request_continuation);
                     let chunk =
                         translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
                     if !chunk.is_empty() {
@@ -1077,12 +1042,7 @@ fn remaining_live_stream_response(
             }
         }
 
-        abort_request_state(
-            ctx.session_id.as_deref(),
-            &request_continuation,
-            compact_boundary,
-            &request_body,
-        );
+        abort_request_state(&compaction, &request_continuation);
         let chunk = translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
@@ -1257,19 +1217,22 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_continuation_from_upstream(
-    session_id: Option<&str>,
+    compaction: &RequestCompactionState,
     continuation: &ContinuationReservation,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
     socket_id: Option<u64>,
-    compact_boundary: bool,
 ) {
     match finish_metadata_from_upstream(upstream_body) {
         Ok(Some(finish)) if finish.continuation_eligible => {
-            if compact_boundary {
-                activate_compaction_for_request(session_id, request_body, &finish.output_items);
+            if compaction.compact_boundary {
+                activate_compaction_for_owner(
+                    compaction.owner.as_ref(),
+                    compaction.attempt,
+                    request_body,
+                    &finish.output_items,
+                );
             }
             record_continuation_for_owner(
                 continuation,
@@ -1279,10 +1242,7 @@ fn update_continuation_from_upstream(
                 &finish.output_items,
             );
         }
-        _ => {
-            abort_compaction_attempt(session_id, compact_boundary, request_body);
-            abort_continuation_for_owner(continuation);
-        }
+        _ => abort_request_state(compaction, continuation),
     }
 }
 
@@ -1510,6 +1470,14 @@ mod tests {
             provider: "codex".to_string(),
             traffic: None,
             monitor: None,
+        }
+    }
+
+    fn live_test_compaction(session_id: &str) -> RequestCompactionState {
+        RequestCompactionState {
+            owner: Some(ConversationIdentity::Main(session_id.to_string())),
+            attempt: None,
+            compact_boundary: false,
         }
     }
 
@@ -1939,7 +1907,7 @@ mod tests {
                 live_test_context(session_id),
                 request.clone(),
                 continuation.clone(),
-                false,
+                live_test_compaction(session_id),
             ),
         )
         .await
@@ -1997,7 +1965,7 @@ mod tests {
                 live_test_context(session_id),
                 task_request,
                 task_continuation,
-                false,
+                live_test_compaction(session_id),
             )
             .await
         });
@@ -2072,7 +2040,7 @@ mod tests {
                 live_test_context(session_id),
                 request.clone(),
                 continuation.clone(),
-                false,
+                live_test_compaction(session_id),
             ),
         )
         .await
@@ -2094,26 +2062,132 @@ mod tests {
         websocket::invalidate_codex_websocket_pool_owner(&owner);
     }
 
+    #[test]
+    fn ownerless_continuation_cleanup_still_fences_compaction_attempt() {
+        let session_id = "ownerless-compaction-cleanup";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        let request = live_test_request("one");
+        let stale_attempt = begin_compaction_for_owner(Some(&owner), &request).unwrap();
+        assert!(store_compaction_for_owner(
+            Some(&owner),
+            Some(stale_attempt),
+            vec![translate::request::ResponsesInputItem::Compaction {
+                encrypted_content: "stale-ownerless-history".to_string(),
+            }],
+        ));
+        let public_candidate = continuation::ContinuationCandidate {
+            turn_id: None,
+            previous_response_id: None,
+            input_delta: None,
+            input_delta_count: request.input.len(),
+            disabled_reason: Some("missing_identity".to_string()),
+        };
+        let stale_cleanup = LiveRequestStateCleanup::new(
+            ContinuationReservation::from_public_candidate(&public_candidate),
+            RequestCompactionState {
+                owner: Some(owner.clone()),
+                attempt: Some(stale_attempt),
+                compact_boundary: true,
+            },
+        );
+
+        let newer_attempt = begin_compaction_for_owner(Some(&owner), &request).unwrap();
+        assert!(store_compaction_for_owner(
+            Some(&owner),
+            Some(newer_attempt),
+            vec![translate::request::ResponsesInputItem::Compaction {
+                encrypted_content: "newer-ownerless-history".to_string(),
+            }],
+        ));
+        drop(stale_cleanup);
+
+        let summary: Vec<translate::request::ResponsesInputItem> =
+            serde_json::from_value(serde_json::json!([{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "ownerless portable summary with enough detail for activation"
+                }]
+            }]))
+            .unwrap();
+        assert!(activate_compaction_for_owner(
+            Some(&owner),
+            Some(newer_attempt),
+            &request,
+            &summary,
+        ));
+        abort_compaction_for_owner(Some(&owner), Some(newer_attempt));
+    }
+
     #[tokio::test]
-    async fn stale_request_cleanup_preserves_newer_continuation_turn() {
+    async fn stale_request_cleanup_preserves_newer_turn_and_compaction_attempt() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let session_id = "stale-live-request-cleanup";
         let owner = ConversationIdentity::Main(session_id.to_string());
         continuation::clear_continuation_for_owner(Some(&owner));
-        let request = live_test_request("one");
-        let stale_continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let stale_request = live_test_request("one");
+        let stale_continuation =
+            continuation_candidate_for_owner(Some(&owner), &stale_request, true);
+        let stale_attempt = begin_compaction_for_owner(Some(&owner), &stale_request).unwrap();
+        assert!(store_compaction_for_owner(
+            Some(&owner),
+            Some(stale_attempt),
+            vec![translate::request::ResponsesInputItem::Compaction {
+                encrypted_content: "stale-native-history".to_string(),
+            }],
+        ));
         let stale_cleanup = LiveRequestStateCleanup::new(
             stale_continuation,
-            Some(session_id.to_string()),
-            false,
-            request.clone(),
+            RequestCompactionState {
+                owner: Some(owner.clone()),
+                attempt: Some(stale_attempt),
+                compact_boundary: true,
+            },
         );
 
-        let newer_continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let newer_continuation =
+            continuation_candidate_for_owner(Some(&owner), &stale_request, true);
+        let mut newer_request = stale_request.clone();
+        newer_request.client_metadata = Some(std::collections::HashMap::from([(
+            translate::request::RESPONSES_LITE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        )]));
+        let newer_attempt = begin_compaction_for_owner(Some(&owner), &newer_request).unwrap();
+        assert!(store_compaction_for_owner(
+            Some(&owner),
+            Some(newer_attempt),
+            vec![translate::request::ResponsesInputItem::Compaction {
+                encrypted_content: "newer-native-history".to_string(),
+            }],
+        ));
         drop(stale_cleanup);
 
         assert!(continuation::is_current_turn_for_owner(&newer_continuation));
-        abort_request_state(Some(session_id), &newer_continuation, false, &request);
+        let summary: Vec<translate::request::ResponsesInputItem> =
+            serde_json::from_value(serde_json::json!([{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "newer portable summary with enough detail for safe activation"
+                }]
+            }]))
+            .unwrap();
+        assert!(activate_compaction_for_owner(
+            Some(&owner),
+            Some(newer_attempt),
+            &newer_request,
+            &summary,
+        ));
+        abort_request_state(
+            &RequestCompactionState {
+                owner: Some(owner),
+                attempt: Some(newer_attempt),
+                compact_boundary: true,
+            },
+            &newer_continuation,
+        );
     }
 
     #[tokio::test]
@@ -2224,7 +2298,7 @@ mod tests {
                 live_test_context(session_id),
                 task_request,
                 task_continuation,
-                false,
+                live_test_compaction(session_id),
             )
             .await
         });

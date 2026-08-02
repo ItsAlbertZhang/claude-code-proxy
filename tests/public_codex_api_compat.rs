@@ -1,4 +1,4 @@
-#![allow(deprecated)]
+#![deny(deprecated)]
 
 use std::pin::Pin;
 use std::sync::Arc;

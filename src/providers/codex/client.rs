@@ -2343,6 +2343,14 @@ mod tests {
         }
     }
 
+    fn no_compaction() -> super::super::RequestCompactionState {
+        super::super::RequestCompactionState {
+            owner: None,
+            attempt: None,
+            compact_boundary: false,
+        }
+    }
+
     fn http_test_client(base_url: String, body_idle_timeout_ms: u64) -> CodexHttpClient {
         CodexHttpClient::new_for_test(
             reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -2845,12 +2853,11 @@ mod tests {
             .socket_id
             .expect("first socket must be reusable");
         super::super::update_continuation_from_upstream(
-            None,
+            &no_compaction(),
             &first_candidate,
             &first_request,
             &first_response.body,
             first_response.socket_id,
-            false,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);
@@ -2875,12 +2882,11 @@ mod tests {
             .expect("full-context retry socket must be reusable");
         assert_ne!(second_socket_id, first_socket_id);
         super::super::update_continuation_from_upstream(
-            None,
+            &no_compaction(),
             &second_candidate,
             &second_request,
             &second_response.body,
             second_response.socket_id,
-            false,
         );
 
         let third_request = buffered_request_with_texts(&["one", "two", "three"]);
@@ -2976,12 +2982,11 @@ mod tests {
             .await
             .unwrap();
         super::super::update_continuation_from_upstream(
-            None,
+            &no_compaction(),
             &first_candidate,
             &first_request,
             &first_response.body,
             first_response.socket_id,
-            false,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);
@@ -3090,12 +3095,11 @@ mod tests {
             .await
             .unwrap();
         super::super::update_continuation_from_upstream(
-            None,
+            &no_compaction(),
             &first_candidate,
             &first_request,
             &first_response.body,
             first_response.socket_id,
-            false,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);

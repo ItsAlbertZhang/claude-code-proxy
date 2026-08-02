@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::sse::parse_sse_events;
 use crate::provider::RequestContext;
 use crate::providers::codex::client::{CodexError, CodexHttpClient};
+use crate::request_identity::ConversationIdentity;
 
 use super::translate::request::{
     ResponsesContentPart, ResponsesInputItem, ResponsesRequest, is_compact_message_text,
@@ -34,11 +36,13 @@ impl std::fmt::Display for CompactionError {
 }
 
 enum CompactionPhase {
+    Preparing,
     Unconfirmed,
     Anchored { portable_summary: String },
 }
 
 struct CompactionState {
+    attempt: CompactionAttempt,
     model: String,
     use_responses_lite: Option<bool>,
     native_history: Vec<ResponsesInputItem>,
@@ -46,13 +50,22 @@ struct CompactionState {
     updated_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactionAttempt(u64);
+
+pub(crate) struct CompactionReplay {
+    pub request: ResponsesRequest,
+    pub attempt: CompactionAttempt,
+}
+
 #[derive(Default)]
 struct CompactionRegistry {
-    states: HashMap<String, CompactionState>,
+    states: HashMap<ConversationIdentity, CompactionState>,
     total_bytes: usize,
 }
 
 static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
+static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub async fn request_compaction(
     client: &CodexHttpClient,
@@ -85,47 +98,87 @@ pub fn store_compaction(
     model: &str,
     native_history: Vec<ResponsesInputItem>,
 ) -> bool {
-    store_compaction_state(session_id, model, None, native_history)
+    let owner = ConversationIdentity::Main(session_id.to_string());
+    let attempt = begin_compaction_state(&owner, model, None);
+    store_compaction_state(&owner, attempt, native_history)
 }
 
-pub(crate) fn store_compaction_for_request(
-    session_id: &str,
+pub(crate) fn begin_compaction_for_owner(
+    owner: Option<&ConversationIdentity>,
     request: &ResponsesRequest,
-    native_history: Vec<ResponsesInputItem>,
-) -> bool {
-    store_compaction_state(
-        session_id,
+) -> Option<CompactionAttempt> {
+    let owner = owner?;
+    Some(begin_compaction_state(
+        owner,
         &request.model,
         Some(request_uses_responses_lite(request)),
-        native_history,
-    )
+    ))
 }
 
-fn store_compaction_state(
-    session_id: &str,
+fn begin_compaction_state(
+    owner: &ConversationIdentity,
     model: &str,
     use_responses_lite: Option<bool>,
-    native_history: Vec<ResponsesInputItem>,
-) -> bool {
+) -> CompactionAttempt {
+    let attempt = CompactionAttempt(NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed));
     let state = CompactionState {
+        attempt,
         model: model.to_string(),
         use_responses_lite,
-        native_history,
-        phase: CompactionPhase::Unconfirmed,
+        native_history: Vec::new(),
+        phase: CompactionPhase::Preparing,
         updated_at: now_ms(),
     };
-    if state_size(session_id, &state) > MAX_STATE_BYTES {
-        clear_compaction(session_id);
-        return false;
-    }
-
     let now = state.updated_at;
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.get_or_insert_with(CompactionRegistry::default);
     evict_states(registry, now);
-    registry.states.insert(session_id.to_string(), state);
+    registry.states.insert(owner.clone(), state);
     evict_states(registry, now);
-    registry.states.contains_key(session_id)
+    attempt
+}
+
+pub(crate) fn store_compaction_for_owner(
+    owner: Option<&ConversationIdentity>,
+    attempt: Option<CompactionAttempt>,
+    native_history: Vec<ResponsesInputItem>,
+) -> bool {
+    let (Some(owner), Some(attempt)) = (owner, attempt) else {
+        return false;
+    };
+    store_compaction_state(owner, attempt, native_history)
+}
+
+fn store_compaction_state(
+    owner: &ConversationIdentity,
+    attempt: CompactionAttempt,
+    native_history: Vec<ResponsesInputItem>,
+) -> bool {
+    let now = now_ms();
+    let mut guard = REGISTRY.lock().unwrap();
+    let Some(registry) = guard.as_mut() else {
+        return false;
+    };
+    evict_states(registry, now);
+    let Some(state) = registry.states.get_mut(owner) else {
+        return false;
+    };
+    if state.attempt != attempt || !matches!(state.phase, CompactionPhase::Preparing) {
+        return false;
+    }
+    state.native_history = native_history;
+    state.phase = CompactionPhase::Unconfirmed;
+    state.updated_at = now;
+    if state_size(owner, state) > MAX_STATE_BYTES {
+        registry.states.remove(owner);
+        update_total_bytes(registry);
+        return false;
+    }
+    evict_states(registry, now);
+    registry
+        .states
+        .get(owner)
+        .is_some_and(|state| state.attempt == attempt)
 }
 
 pub fn activate_compaction(
@@ -133,16 +186,20 @@ pub fn activate_compaction(
     model: &str,
     output: &[ResponsesInputItem],
 ) -> bool {
-    activate_compaction_state(session_id, model, None, output)
+    let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_string()));
+    let attempt = current_attempt_for_owner(owner.as_ref());
+    activate_compaction_state(owner.as_ref(), attempt, model, None, output)
 }
 
-pub(crate) fn activate_compaction_for_request(
-    session_id: Option<&str>,
+pub(crate) fn activate_compaction_for_owner(
+    owner: Option<&ConversationIdentity>,
+    attempt: Option<CompactionAttempt>,
     request: &ResponsesRequest,
     output: &[ResponsesInputItem],
 ) -> bool {
     activate_compaction_state(
-        session_id,
+        owner,
+        attempt,
         &request.model,
         Some(request_uses_responses_lite(request)),
         output,
@@ -150,16 +207,17 @@ pub(crate) fn activate_compaction_for_request(
 }
 
 fn activate_compaction_state(
-    session_id: Option<&str>,
+    owner: Option<&ConversationIdentity>,
+    attempt: Option<CompactionAttempt>,
     model: &str,
     use_responses_lite: Option<bool>,
     output: &[ResponsesInputItem],
 ) -> bool {
-    let Some(session_id) = session_id else {
+    let (Some(owner), Some(attempt)) = (owner, attempt) else {
         return false;
     };
     let Some(portable_summary) = portable_summary_text(output) else {
-        clear_compaction(session_id);
+        abort_compaction_for_owner(Some(owner), Some(attempt));
         return false;
     };
 
@@ -169,9 +227,12 @@ fn activate_compaction_state(
         return false;
     };
     evict_states(registry, now);
-    let Some(state) = registry.states.get_mut(session_id) else {
+    let Some(state) = registry.states.get_mut(owner) else {
         return false;
     };
+    if state.attempt != attempt {
+        return false;
+    }
     if state.model != model
         || matches!(
             (state.use_responses_lite, use_responses_lite),
@@ -179,37 +240,48 @@ fn activate_compaction_state(
         )
         || !matches!(state.phase, CompactionPhase::Unconfirmed)
     {
-        registry.states.remove(session_id);
+        registry.states.remove(owner);
         update_total_bytes(registry);
         return false;
     }
     state.phase = CompactionPhase::Anchored { portable_summary };
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
+    if state_size(owner, state) > MAX_STATE_BYTES {
+        registry.states.remove(owner);
         update_total_bytes(registry);
         return false;
     }
     evict_states(registry, now);
-    registry.states.contains_key(session_id)
+    registry.states.contains_key(owner)
 }
 
 pub fn apply_compaction_replay(
     session_id: Option<&str>,
     request: &ResponsesRequest,
 ) -> Option<ResponsesRequest> {
-    let session_id = session_id?;
+    let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_string()));
+    apply_compaction_replay_for_owner(owner.as_ref(), request).map(|replay| replay.request)
+}
+
+pub(crate) fn apply_compaction_replay_for_owner(
+    owner: Option<&ConversationIdentity>,
+    request: &ResponsesRequest,
+) -> Option<CompactionReplay> {
+    let owner = owner?;
     let now = now_ms();
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.as_mut()?;
     evict_states(registry, now);
-    let state = registry.states.get_mut(session_id)?;
+    let state = registry.states.get_mut(owner)?;
+    if !matches!(state.phase, CompactionPhase::Anchored { .. }) {
+        return None;
+    }
     if state.model != request.model
         || state
             .use_responses_lite
             .is_some_and(|stored_lane| stored_lane != request_uses_responses_lite(request))
     {
-        registry.states.remove(session_id);
+        registry.states.remove(owner);
         update_total_bytes(registry);
         return None;
     }
@@ -220,12 +292,12 @@ pub fn apply_compaction_replay(
     let (envelope, conversation) = split_input_envelope(&request.input);
     let summary_item = conversation.first()?;
     let Some(text) = message_text(summary_item) else {
-        registry.states.remove(session_id);
+        registry.states.remove(owner);
         update_total_bytes(registry);
         return None;
     };
     if text.match_indices(portable_summary).count() != 1 {
-        registry.states.remove(session_id);
+        registry.states.remove(owner);
         update_total_bytes(registry);
         return None;
     }
@@ -241,12 +313,15 @@ pub fn apply_compaction_replay(
         .chain(conversation[1..].iter().cloned())
         .collect();
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
+        registry.states.remove(owner);
         update_total_bytes(registry);
         return None;
     }
     state.updated_at = now;
-    Some(replay)
+    Some(CompactionReplay {
+        request: replay,
+        attempt: state.attempt,
+    })
 }
 
 pub fn abort_compaction_attempt(
@@ -261,6 +336,27 @@ pub fn abort_compaction_attempt(
     }
 }
 
+pub(crate) fn abort_compaction_for_owner(
+    owner: Option<&ConversationIdentity>,
+    attempt: Option<CompactionAttempt>,
+) {
+    let (Some(owner), Some(attempt)) = (owner, attempt) else {
+        return;
+    };
+    let mut guard = REGISTRY.lock().unwrap();
+    let Some(registry) = guard.as_mut() else {
+        return;
+    };
+    if registry
+        .states
+        .get(owner)
+        .is_some_and(|state| state.attempt == attempt)
+    {
+        registry.states.remove(owner);
+        update_total_bytes(registry);
+    }
+}
+
 pub fn request_contains_compaction(request: &ResponsesRequest) -> bool {
     request
         .input
@@ -271,8 +367,40 @@ pub fn request_contains_compaction(request: &ResponsesRequest) -> bool {
 pub fn clear_compaction(session_id: &str) {
     let mut guard = REGISTRY.lock().unwrap();
     if let Some(registry) = guard.as_mut() {
-        registry.states.remove(session_id);
+        registry
+            .states
+            .retain(|owner, _| owner_session_id(owner) != session_id);
         update_total_bytes(registry);
+    }
+}
+
+pub(crate) fn clear_compaction_for_owner(owner: Option<&ConversationIdentity>) {
+    let Some(owner) = owner else {
+        return;
+    };
+    let mut guard = REGISTRY.lock().unwrap();
+    if let Some(registry) = guard.as_mut() {
+        registry.states.remove(owner);
+        update_total_bytes(registry);
+    }
+}
+
+fn current_attempt_for_owner(owner: Option<&ConversationIdentity>) -> Option<CompactionAttempt> {
+    let owner = owner?;
+    REGISTRY
+        .lock()
+        .unwrap()
+        .as_ref()?
+        .states
+        .get(owner)
+        .map(|state| state.attempt)
+}
+
+fn owner_session_id(owner: &ConversationIdentity) -> &str {
+    match owner {
+        ConversationIdentity::Main(session_id) | ConversationIdentity::Agent(session_id, _) => {
+            session_id
+        }
     }
 }
 
@@ -516,16 +644,23 @@ fn serialized_size(items: &[ResponsesInputItem]) -> usize {
     serde_json::to_vec(items).map_or(usize::MAX, |value| value.len())
 }
 
-fn state_size(session_id: &str, state: &CompactionState) -> usize {
+fn state_size(owner: &ConversationIdentity, state: &CompactionState) -> usize {
     let summary_len = match &state.phase {
-        CompactionPhase::Unconfirmed => 0,
+        CompactionPhase::Preparing | CompactionPhase::Unconfirmed => 0,
         CompactionPhase::Anchored { portable_summary } => portable_summary.len(),
     };
-    session_id.len()
+    owner_size(owner)
         + state.model.len()
         + std::mem::size_of::<Option<bool>>()
         + summary_len
         + serialized_size(&state.native_history)
+}
+
+fn owner_size(owner: &ConversationIdentity) -> usize {
+    match owner {
+        ConversationIdentity::Main(session_id) => session_id.len(),
+        ConversationIdentity::Agent(session_id, agent_id) => session_id.len() + agent_id.len(),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -539,7 +674,7 @@ fn update_total_bytes(registry: &mut CompactionRegistry) {
     registry.total_bytes = registry
         .states
         .iter()
-        .map(|(session_id, state)| state_size(session_id, state))
+        .map(|(owner, state)| state_size(owner, state))
         .sum();
 }
 
@@ -553,7 +688,7 @@ fn evict_states(registry: &mut CompactionRegistry, now: u64) {
             .states
             .iter()
             .min_by_key(|(_, state)| state.updated_at)
-            .map(|(session_id, _)| session_id.clone());
+            .map(|(owner, _)| owner.clone());
         let Some(oldest) = oldest else {
             break;
         };
@@ -573,6 +708,10 @@ mod tests {
 
     const SUMMARY: &str =
         "portable summary with enough detail to identify this compacted conversation";
+    const STALE_SUMMARY: &str =
+        "stale portable summary from an older overlapping compaction attempt";
+    const SIBLING_SUMMARY: &str =
+        "sibling portable summary with enough detail to remain fully isolated";
     static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
     fn request(input: serde_json::Value) -> ResponsesRequest {
@@ -605,6 +744,30 @@ mod tests {
             "content":[{"type":"output_text","text":text}]
         }]))
         .unwrap()
+    }
+
+    fn main_owner(session_id: &str) -> ConversationIdentity {
+        ConversationIdentity::Main(session_id.to_string())
+    }
+
+    fn agent_owner(session_id: &str, agent_id: &str) -> ConversationIdentity {
+        ConversationIdentity::Agent(session_id.to_string(), agent_id.to_string())
+    }
+
+    fn stored_compaction_for_owner(
+        owner: &ConversationIdentity,
+        request: &ResponsesRequest,
+        encrypted_content: &str,
+    ) -> CompactionAttempt {
+        let attempt = begin_compaction_for_owner(Some(owner), request).unwrap();
+        assert!(store_compaction_for_owner(
+            Some(owner),
+            Some(attempt),
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: encrypted_content.to_string(),
+            }],
+        ));
+        attempt
     }
 
     #[test]
@@ -673,6 +836,147 @@ mod tests {
             ResponsesInputItem::Compaction { .. }
         ));
         assert_eq!(replay.client_metadata, next.client_metadata);
+    }
+
+    #[test]
+    fn stale_store_and_activation_cannot_replace_newer_compaction() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let owner = main_owner("overlap");
+        let base_request = request(json!([]));
+        let older = begin_compaction_for_owner(Some(&owner), &base_request).unwrap();
+        let newer = stored_compaction_for_owner(&owner, &base_request, "newer-native-history");
+
+        assert!(!store_compaction_for_owner(
+            Some(&owner),
+            Some(older),
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "late-older-native-history".to_string(),
+            }],
+        ));
+        assert!(!activate_compaction_for_owner(
+            Some(&owner),
+            Some(older),
+            &base_request,
+            &output(STALE_SUMMARY),
+        ));
+        assert!(activate_compaction_for_owner(
+            Some(&owner),
+            Some(newer),
+            &base_request,
+            &output(SUMMARY),
+        ));
+
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay = apply_compaction_replay_for_owner(Some(&owner), &next).unwrap();
+        assert!(replay.request.input.iter().any(|item| matches!(
+            item,
+            ResponsesInputItem::Compaction { encrypted_content }
+                if encrypted_content == "newer-native-history"
+        )));
+    }
+
+    #[test]
+    fn stale_abort_and_replay_cleanup_preserve_newer_attempt() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let owner = main_owner("stale-abort");
+        let base_request = request(json!([]));
+        let older = stored_compaction_for_owner(&owner, &base_request, "older-native-history");
+        assert!(activate_compaction_for_owner(
+            Some(&owner),
+            Some(older),
+            &base_request,
+            &output(STALE_SUMMARY),
+        ));
+        let older_next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":STALE_SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue old"}]}
+        ]));
+        let older_replay = apply_compaction_replay_for_owner(Some(&owner), &older_next).unwrap();
+
+        let newer = stored_compaction_for_owner(&owner, &base_request, "newer-native-history");
+        assert!(activate_compaction_for_owner(
+            Some(&owner),
+            Some(newer),
+            &base_request,
+            &output(SUMMARY),
+        ));
+        abort_compaction_for_owner(Some(&owner), Some(older_replay.attempt));
+
+        let newer_next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue new"}]}
+        ]));
+        let replay = apply_compaction_replay_for_owner(Some(&owner), &newer_next).unwrap();
+        assert!(replay.request.input.iter().any(|item| matches!(
+            item,
+            ResponsesInputItem::Compaction { encrypted_content }
+                if encrypted_content == "newer-native-history"
+        )));
+    }
+
+    #[test]
+    fn sibling_agents_keep_independent_compaction_attempts_and_lanes() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let first_owner = agent_owner("shared-session", "agent-a");
+        let second_owner = agent_owner("shared-session", "agent-b");
+        let lite = request_for_lane(json!([]), true);
+        let full = request_for_lane(json!([]), false);
+        let first = stored_compaction_for_owner(&first_owner, &lite, "agent-a-native");
+        let second = stored_compaction_for_owner(&second_owner, &full, "agent-b-native");
+        assert!(activate_compaction_for_owner(
+            Some(&first_owner),
+            Some(first),
+            &lite,
+            &output(SUMMARY),
+        ));
+        assert!(activate_compaction_for_owner(
+            Some(&second_owner),
+            Some(second),
+            &full,
+            &output(SIBLING_SUMMARY),
+        ));
+
+        abort_compaction_for_owner(Some(&first_owner), Some(first));
+        let second_next = request_for_lane(
+            json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":SIBLING_SUMMARY}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"continue sibling"}]}
+            ]),
+            false,
+        );
+        let replay = apply_compaction_replay_for_owner(Some(&second_owner), &second_next).unwrap();
+        assert!(replay.request.input.iter().any(|item| matches!(
+            item,
+            ResponsesInputItem::Compaction { encrypted_content }
+                if encrypted_content == "agent-b-native"
+        )));
+        assert!(apply_compaction_replay_for_owner(Some(&first_owner), &second_next).is_none());
+    }
+
+    #[test]
+    fn preparing_attempt_survives_unrelated_replay_checks() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let owner = main_owner("preparing");
+        let request = request(json!([]));
+        let attempt = begin_compaction_for_owner(Some(&owner), &request).unwrap();
+        let mut mismatched = request.clone();
+        mismatched.model = "gpt-5.4".to_string();
+
+        assert!(apply_compaction_replay_for_owner(Some(&owner), &mismatched).is_none());
+        assert!(store_compaction_for_owner(
+            Some(&owner),
+            Some(attempt),
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "native-history".to_string(),
+            }],
+        ));
     }
 
     #[test]
@@ -768,15 +1072,18 @@ mod tests {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
         let stored = request(json!([]));
-        assert!(store_compaction_for_request(
-            "session",
-            &stored,
+        let owner = ConversationIdentity::Main("session".to_string());
+        let attempt = begin_compaction_for_owner(Some(&owner), &stored).unwrap();
+        assert!(store_compaction_for_owner(
+            Some(&owner),
+            Some(attempt),
             vec![ResponsesInputItem::Compaction {
                 encrypted_content: "opaque".to_string(),
             }],
         ));
-        assert!(activate_compaction_for_request(
-            Some("session"),
+        assert!(activate_compaction_for_owner(
+            Some(&owner),
+            Some(attempt),
             &stored,
             &output(SUMMARY),
         ));
@@ -797,22 +1104,26 @@ mod tests {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
         let lite = request(json!([]));
-        assert!(store_compaction_for_request(
-            "session",
-            &lite,
+        let owner = ConversationIdentity::Main("session".to_string());
+        let attempt = begin_compaction_for_owner(Some(&owner), &lite).unwrap();
+        assert!(store_compaction_for_owner(
+            Some(&owner),
+            Some(attempt),
             vec![ResponsesInputItem::Compaction {
                 encrypted_content: "opaque".to_string(),
             }],
         ));
         let full = request_for_lane(json!([]), false);
 
-        assert!(!activate_compaction_for_request(
-            Some("session"),
+        assert!(!activate_compaction_for_owner(
+            Some(&owner),
+            Some(attempt),
             &full,
             &output(SUMMARY),
         ));
-        assert!(!activate_compaction_for_request(
-            Some("session"),
+        assert!(!activate_compaction_for_owner(
+            Some(&owner),
+            Some(attempt),
             &lite,
             &output(SUMMARY),
         ));

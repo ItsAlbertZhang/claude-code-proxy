@@ -136,7 +136,6 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
 pub fn continuation_candidate(
     session_id: Option<&str>,
     body: &ResponsesRequest,
@@ -301,7 +300,6 @@ fn continuation_candidate_from_state(
     )
 }
 
-#[deprecated(note = "recording without typed socket provenance is not reusable")]
 pub fn record_continuation(
     session_id: Option<&str>,
     turn_id: Option<u64>,
@@ -384,7 +382,6 @@ pub(crate) fn record_continuation_for_owner(
     evict_oldest(registry);
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
 pub fn abort_continuation(session_id: Option<&str>, turn_id: Option<u64>) {
     let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
     abort_continuation_inner(owner.as_ref(), turn_id);
@@ -415,7 +412,6 @@ fn abort_continuation_inner(owner: Option<&ConversationIdentity>, turn_id: Optio
     }
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
 pub fn if_current_turn<T>(
     session_id: Option<&str>,
     turn_id: Option<u64>,
@@ -448,7 +444,6 @@ fn if_current_turn_inner<T>(
     current.then(action)
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
 pub fn with_current_turn(
     session_id: Option<&str>,
     turn_id: Option<u64>,
@@ -465,7 +460,6 @@ pub(crate) fn with_current_turn_for_owner(
     if_current_turn_for_owner(reservation, action).is_some()
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
 pub fn is_current_turn(session_id: Option<&str>, turn_id: Option<u64>) -> bool {
     let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
     is_current_turn_inner(owner.as_ref(), turn_id)
@@ -487,7 +481,6 @@ fn is_current_turn_inner(owner: Option<&ConversationIdentity>, turn_id: Option<u
         .is_some_and(|state| state.current_turn == turn_id)
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
 pub fn clear_continuation(session_id: Option<&str>) {
     let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
     clear_continuation_for_owner(owner.as_ref());
@@ -510,7 +503,6 @@ pub(crate) fn clear_continuation_for_owner(owner: Option<&ConversationIdentity>)
     }
 }
 
-#[deprecated(note = "use the owner-aware test helper for typed conversation ownership")]
 pub fn has_continuation_for_tests(session_id: &str) -> bool {
     let owner = ConversationIdentity::Main(session_id.to_owned());
     has_continuation_for_owner_for_tests(&owner)
@@ -677,7 +669,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn disabled_and_missing_identity_requests_are_stateless() {
         let _registry_guard = lock_registry();
         let request = request_with_input(vec![input("one")], None);
@@ -817,7 +808,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn legacy_recording_without_provenance_publishes_no_reusable_state() {
         let _registry_guard = lock_registry();
         let session_id = "legacy-no-provenance";
@@ -863,7 +853,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn missing_owner_or_turn_mutations_are_hard_noops() {
         let _registry_guard = lock_registry();
         let owner = main_owner("session-a");

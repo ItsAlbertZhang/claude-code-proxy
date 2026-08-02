@@ -59,6 +59,7 @@ const TERMINAL_EVENTS: &[&str] = &[
     "response.completed",
     "response.incomplete",
     "response.failed",
+    "response.error",
     "error",
 ];
 
@@ -378,7 +379,6 @@ pub fn invalidate_codex_websocket_pool_owner(owner: &ConversationIdentity) {
     guard.remove(owner);
 }
 
-#[deprecated(note = "use typed conversation ownership internally")]
 pub fn invalidate_codex_websocket_pool_key(session_id: &str) {
     let mut guard = WS_POOL.lock().unwrap();
     guard.retain(|owner, _| match owner {
@@ -397,7 +397,6 @@ pub(crate) fn invalidate_codex_websocket_pool_turn_for_owner(
     });
 }
 
-#[deprecated(note = "use typed conversation ownership internally")]
 pub fn invalidate_codex_websocket_pool_turn(session_id: &str, turn_id: Option<u64>) {
     let owner = ConversationIdentity::Main(session_id.to_owned());
     invalidate_codex_websocket_pool_turn_for_owner(&owner, turn_id);
@@ -678,8 +677,8 @@ fn encode_sse(text: &str) -> Vec<u8> {
 
 pub(super) fn is_terminal_event(payload: &serde_json::Value) -> bool {
     match payload.get("type").and_then(|v| v.as_str()) {
-        Some(t) => TERMINAL_EVENTS.contains(&t),
-        None => false,
+        Some(t) if TERMINAL_EVENTS.contains(&t) => true,
+        _ => super::events::is_terminal_rate_limit_event(payload),
     }
 }
 
@@ -729,6 +728,20 @@ fn extract_retry_after(payload: &serde_json::Value) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Main request function
 // ---------------------------------------------------------------------------
+
+async fn send_websocket_message<S>(
+    websocket: &mut WebSocketStream<S>,
+    message: Message,
+    timeout_ms: u64,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(Duration::from_millis(timeout_ms), websocket.send(message))
+        .await
+        .map_err(|_| format!("write timeout after {timeout_ms}ms"))?
+        .map_err(|error| error.to_string())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn codex_websocket_request(
@@ -825,8 +838,7 @@ pub(super) async fn codex_websocket_request(
         used_pooled = false;
     }
 
-    guard
-        .send(Message::Text(body_json))
+    send_websocket_message(&mut guard, Message::Text(body_json), connect_timeout_ms)
         .await
         .map_err(|error| {
             if let Some(owner) = pool_owner {
@@ -844,6 +856,7 @@ pub(super) async fn codex_websocket_request(
     let collected = collect_ws_events(
         &mut guard,
         idle_timeout_ms,
+        connect_timeout_ms,
         pool_owner,
         Some(&entry),
         traffic,
@@ -920,11 +933,11 @@ where
     let nonce = next_monotonic_nonzero(&POOLED_VALIDATION_SEQUENCE, "pooled validation")
         .to_be_bytes()
         .to_vec();
-    websocket
-        .send(Message::Ping(nonce.clone()))
-        .await
-        .map_err(|error| error.to_string())?;
     tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        websocket
+            .send(Message::Ping(nonce.clone()))
+            .await
+            .map_err(|error| error.to_string())?;
         loop {
             match websocket.next().await {
                 Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
@@ -954,6 +967,7 @@ pub(super) struct ReadyWebSocket {
     used_pooled: bool,
     reservation: Option<ContinuationReservation>,
     traffic: Option<Arc<TrafficCapture>>,
+    write_timeout_ms: u64,
     idle_timeout_ms: u64,
 }
 
@@ -1016,6 +1030,7 @@ pub(super) async fn prepare_codex_websocket(
         used_pooled,
         reservation: reservation.cloned(),
         traffic,
+        write_timeout_ms: connect_timeout_ms,
         idle_timeout_ms,
     })
 }
@@ -1060,15 +1075,31 @@ pub(super) fn start_codex_websocket_events(
             used_pooled: _,
             reservation,
             traffic,
+            write_timeout_ms,
             idle_timeout_ms,
         } = ready;
         let pool_owner = reservation_pool_owner(reservation.as_ref());
-        if let Err(error) = guard.send(Message::Text(body_json)).await {
+        let send_result = tokio::select! {
+            biased;
+            _ = tx.closed() => None,
+            result = send_websocket_message(
+                &mut guard,
+                Message::Text(body_json),
+                write_timeout_ms,
+            ) => Some(result),
+        };
+        let Some(send_result) = send_result else {
             drop(guard);
             if let Some(owner) = pool_owner {
                 pool_remove_entry(owner, &entry);
             }
-            socket_id_publisher.publish(None);
+            return;
+        };
+        if let Err(error) = send_result {
+            drop(guard);
+            if let Some(owner) = pool_owner {
+                pool_remove_entry(owner, &entry);
+            }
             let _ = tx
                 .send(Err(CodexError {
                     status: 0,
@@ -1081,7 +1112,7 @@ pub(super) fn start_codex_websocket_events(
             return;
         }
         let (reusable, terminal_item) =
-            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx).await;
+            stream_ws_events(&mut guard, idle_timeout_ms, write_timeout_ms, traffic, &tx).await;
         drop(guard);
 
         let origin_reinserted = if reusable {
@@ -1946,6 +1977,7 @@ struct WsEvent {
 async fn collect_ws_events<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
+    write_timeout_ms: u64,
     pool_owner: Option<&ConversationIdentity>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
@@ -2064,8 +2096,18 @@ where
                 });
             }
             Some(Ok(Message::Ping(data))) => {
-                // Respond to ping automatically, continue
-                let _ = ws.send(Message::Pong(data)).await;
+                if let Err(error) =
+                    send_websocket_message(ws, Message::Pong(data), write_timeout_ms).await
+                {
+                    invalidate_pool_owner(pool_owner, pool_entry);
+                    return Err(CodexError {
+                        status: 0,
+                        message: format!("WebSocket Pong send error: {error}"),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    });
+                }
                 continue;
             }
             Some(Ok(Message::Pong(_))) => {
@@ -2105,6 +2147,7 @@ where
 async fn stream_ws_events<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
+    write_timeout_ms: u64,
     traffic: Option<Arc<TrafficCapture>>,
     tx: &mpsc::Sender<Result<serde_json::Value, CodexError>>,
 ) -> (bool, Option<Result<serde_json::Value, CodexError>>)
@@ -2232,7 +2275,18 @@ where
                 break;
             }
             Some(Ok(Message::Ping(data))) => {
-                let _ = ws.send(Message::Pong(data)).await;
+                if let Err(error) =
+                    send_websocket_message(ws, Message::Pong(data), write_timeout_ms).await
+                {
+                    terminal_item = Some(Err(CodexError {
+                        status: 0,
+                        message: format!("WebSocket Pong send error: {error}"),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    }));
+                    break;
+                }
             }
             Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
             Some(Ok(Message::Close(_))) | None => {
@@ -2420,10 +2474,45 @@ mod tests {
         }
     }
 
+    struct PendingWriteIo;
+
+    impl AsyncRead for PendingWriteIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     async fn raw_test_stream(
         probe: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
     ) -> CodexWebSocketStream {
         let io: BoxedWebSocketIo = Box::new(DropProbeIo { probe });
+        WebSocketStream::from_raw_socket(io, Role::Client, None).await
+    }
+
+    async fn pending_write_stream() -> CodexWebSocketStream {
+        let io: BoxedWebSocketIo = Box::new(PendingWriteIo);
         WebSocketStream::from_raw_socket(io, Role::Client, None).await
     }
 
@@ -3010,6 +3099,24 @@ mod tests {
 
         let error = serde_json::json!({"type": "error", "error": {"message": "fail"}});
         assert!(is_terminal_event(&error));
+
+        let response_error =
+            serde_json::json!({"type": "response.error", "error": {"message": "fail"}});
+        assert!(is_terminal_event(&response_error));
+
+        let terminal_rate_limit = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {"limit_reached": true},
+            "credits": {"has_credits": false, "unlimited": false}
+        });
+        assert!(is_terminal_event(&terminal_rate_limit));
+
+        let credited_rate_limit = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {"limit_reached": true},
+            "credits": {"has_credits": true, "unlimited": false}
+        });
+        assert!(!is_terminal_event(&credited_rate_limit));
     }
 
     #[test]
@@ -3103,6 +3210,119 @@ mod tests {
             &replacement
         ));
         clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_live_send_releases_lease_without_removing_replacement() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let owner = agent_owner("cancel-send-session", "cancel-send-agent");
+        let reservation = test_continuation(Some(owner.clone()), None, None, None);
+        let leased = Arc::new(PoolEntry::new(pending_write_stream().await));
+        let guard = leased.ws.clone().lock_owned().await;
+        let replacement = Arc::new(PoolEntry::new(raw_test_stream(None).await));
+        pool_insert(owner.clone(), replacement.clone());
+        let ready = ReadyWebSocket {
+            ws_url: "ws://pending.invalid/responses".to_string(),
+            guard,
+            entry: leased.clone(),
+            used_pooled: true,
+            reservation: Some(reservation.clone()),
+            traffic: None,
+            write_timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+        };
+        let events = start_codex_websocket_events(
+            ready,
+            &serde_json::json!({"input": []}),
+            "{\"input\":[]}".to_string(),
+            &HeaderMap::new(),
+            Some(&reservation),
+        );
+        let published_socket_id = events.socket_id.clone();
+        drop(events);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if leased.ws.try_lock().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled send kept the WebSocket lease locked");
+        assert_eq!(published_socket_id.load(Ordering::Acquire), 0);
+        assert!(Arc::ptr_eq(
+            WS_POOL.lock().unwrap().get(&owner).unwrap(),
+            &replacement
+        ));
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn initial_live_send_timeout_releases_exact_lease_and_reports_error() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let owner = main_owner("timeout-send-session");
+        let reservation = test_continuation(Some(owner.clone()), None, None, None);
+        let leased = Arc::new(PoolEntry::new(pending_write_stream().await));
+        let guard = leased.ws.clone().lock_owned().await;
+        let replacement = Arc::new(PoolEntry::new(raw_test_stream(None).await));
+        pool_insert(owner.clone(), replacement.clone());
+        let ready = ReadyWebSocket {
+            ws_url: "ws://pending.invalid/responses".to_string(),
+            guard,
+            entry: leased.clone(),
+            used_pooled: true,
+            reservation: Some(reservation.clone()),
+            traffic: None,
+            write_timeout_ms: 20,
+            idle_timeout_ms: 5_000,
+        };
+        let mut events = start_codex_websocket_events(
+            ready,
+            &serde_json::json!({"input": []}),
+            "{\"input\":[]}".to_string(),
+            &HeaderMap::new(),
+            Some(&reservation),
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("initial write did not honor its deadline")
+            .expect("initial write timeout closed without an error")
+            .unwrap_err();
+        assert!(error.message.contains("write timeout after 20ms"));
+        assert_eq!(events.socket_id(), None);
+        assert!(Arc::ptr_eq(
+            WS_POOL.lock().unwrap().get(&owner).unwrap(),
+            &replacement
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if leased.ws.try_lock().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out send kept the WebSocket lease locked");
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn pooled_validation_bounds_initial_ping_write() {
+        let mut websocket = pending_write_stream().await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            validate_pooled_websocket(&mut websocket, 20),
+        )
+        .await
+        .expect("pooled validation write ignored its deadline")
+        .unwrap_err();
+        assert_eq!(error, "validation timeout");
     }
 
     #[tokio::test]
@@ -3515,7 +3735,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
     async fn session_key_invalidation_removes_main_and_agents_only_for_exact_session() {
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
         clear_codex_websocket_pool_for_tests();
@@ -3924,13 +4143,57 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 1_000, Some(&owner), None, None).await {
+        let err = match collect_ws_events(&mut ws, 1_000, 1_000, Some(&owner), None, None).await {
             Ok(_) => panic!("expected binary frame to fail"),
             Err(err) => err,
         };
 
         assert!(err.message.contains("binary frames"));
         assert!(!WS_POOL.lock().unwrap().contains_key(&owner));
+    }
+
+    #[tokio::test]
+    async fn terminal_rate_limit_finishes_buffered_collection_while_socket_stays_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {
+                        "limit_reached": true,
+                        "primary": {"reset_after_seconds": 1.25}
+                    },
+                    "credits": {"has_credits": false, "unlimited": false}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            release_rx.await.unwrap();
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let (body, terminal) = tokio::time::timeout(
+            Duration::from_millis(250),
+            collect_ws_events(&mut ws, 1_000, 100, None, None, None),
+        )
+        .await
+        .expect("terminal rate limit must not wait for response-start timeout")
+        .unwrap();
+        let terminal = terminal.expect("rate limit must terminate buffered collection");
+        assert_eq!(terminal.event_type, "codex.rate_limits");
+        let failure = super::super::events::first_retryable_failure(&body).unwrap();
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.retry_after.as_deref(), Some("1.25"));
+
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -3965,7 +4228,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 50, Some(&owner), None, None).await {
+        let err = match collect_ws_events(&mut ws, 50, 50, Some(&owner), None, None).await {
             Ok(_) => panic!("expected response start timeout"),
             Err(err) => err,
         };
@@ -4010,7 +4273,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 50, Some(&owner), None, None).await {
+        let err = match collect_ws_events(&mut ws, 50, 50, Some(&owner), None, None).await {
             Ok(_) => panic!("expected response idle timeout"),
             Err(err) => err,
         };
