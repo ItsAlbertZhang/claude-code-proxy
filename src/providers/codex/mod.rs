@@ -30,6 +30,7 @@ use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::registry;
+use crate::request_identity::ConversationIdentity;
 use crate::retry::{compute_backoff_delay, sleep};
 
 use self::auth::browser_login::run_browser_login;
@@ -87,30 +88,13 @@ impl CodexProvider {
     }
 }
 
-#[async_trait]
-impl Provider for CodexProvider {
-    fn name(&self) -> &'static str {
-        "codex"
-    }
-
-    fn supported_models(&self) -> Vec<String> {
-        let mut models: Vec<String> = registry::CODEX_MODELS
-            .iter()
-            .map(|m| m.to_string())
-            .collect();
-        for m in registry::CODEX_MODELS {
-            models.push(format!("{m}-fast"));
-        }
-        models.sort_unstable();
-        models.dedup();
-        models
-    }
-
-    fn cli(&self) -> &'static dyn CliHandlers {
-        &CODEX_CLI
-    }
-
-    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+impl CodexProvider {
+    async fn handle_messages_inner(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
@@ -291,10 +275,11 @@ impl Provider for CodexProvider {
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
         let continuation = continuation_candidate(
-            ctx.session_id.as_deref(),
+            conversation_identity.as_ref(),
             &translated,
             previous_response_id_enabled,
         );
+        let continuation_owner = continuation.owner.clone();
         let turn_id = continuation.turn_id;
 
         // Post to upstream with continuation
@@ -330,7 +315,7 @@ impl Provider for CodexProvider {
                         compact_boundary,
                         &translated,
                     );
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation(continuation_owner.as_ref(), turn_id);
                     return map_codex_error_to_response(&e);
                 }
             };
@@ -343,13 +328,13 @@ impl Provider for CodexProvider {
             drop_live_continuation_for_retry(&mut continuation);
             if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
                 abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_continuation(continuation_owner.as_ref(), turn_id);
                 return map_codex_error_to_response(&error);
             }
             let delay = compute_backoff_delay(attempt, None);
             if delay.exceeds_budget {
                 abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_continuation(continuation_owner.as_ref(), turn_id);
                 return map_codex_error_to_response(&error);
             }
             attempt += 1;
@@ -372,7 +357,7 @@ impl Provider for CodexProvider {
                         compact_boundary,
                         &translated,
                     );
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation(continuation_owner.as_ref(), turn_id);
                     return map_codex_failure_to_response(&format!(
                         "Stream translation error: {e}"
                     ));
@@ -390,6 +375,7 @@ impl Provider for CodexProvider {
             }
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
+                continuation_owner.as_ref(),
                 turn_id,
                 &translated,
                 &upstream.body,
@@ -420,6 +406,7 @@ impl Provider for CodexProvider {
                     }
                     update_continuation_from_upstream(
                         ctx.session_id.as_deref(),
+                        continuation_owner.as_ref(),
                         turn_id,
                         &translated,
                         &upstream.body,
@@ -433,11 +420,49 @@ impl Provider for CodexProvider {
                         compact_boundary,
                         &translated,
                     );
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation(continuation_owner.as_ref(), turn_id);
                     map_codex_failure_to_response(&format!("Accumulation error: {e}"))
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl Provider for CodexProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        let mut models: Vec<String> = registry::CODEX_MODELS
+            .iter()
+            .map(|m| m.to_string())
+            .collect();
+        for m in registry::CODEX_MODELS {
+            models.push(format!("{m}-fast"));
+        }
+        models.sort_unstable();
+        models.dedup();
+        models
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &CODEX_CLI
+    }
+
+    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        self.handle_messages_inner(body, ctx, None).await
+    }
+
+    async fn handle_messages_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Response {
+        self.handle_messages_inner(body, ctx, conversation_identity)
+            .await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -533,12 +558,13 @@ fn log_compaction_event(
 
 fn abort_request_state(
     session_id: Option<&str>,
+    continuation_owner: Option<&ConversationIdentity>,
     turn_id: Option<u64>,
     compact_boundary: bool,
     request: &translate::request::ResponsesRequest,
 ) {
     abort_compaction_attempt(session_id, compact_boundary, request);
-    abort_continuation(session_id, turn_id);
+    abort_continuation(continuation_owner, turn_id);
 }
 
 enum LiveStreamStart {
@@ -556,6 +582,7 @@ async fn live_stream_response(
     compact_boundary: bool,
 ) -> Response {
     let model = model.to_string();
+    let continuation_owner = continuation.owner.clone();
     let turn_id = continuation.turn_id;
     let mut attempt = 0_u32;
     let mut continuation = Some(continuation);
@@ -575,6 +602,7 @@ async fn live_stream_response(
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
                     abort_request_state(
                         ctx.session_id.as_deref(),
+                        continuation_owner.as_ref(),
                         turn_id,
                         compact_boundary,
                         &request_body,
@@ -585,6 +613,7 @@ async fn live_stream_response(
                 if delay.exceeds_budget {
                     abort_request_state(
                         ctx.session_id.as_deref(),
+                        continuation_owner.as_ref(),
                         turn_id,
                         compact_boundary,
                         &request_body,
@@ -598,6 +627,7 @@ async fn live_stream_response(
             Err(err) => {
                 abort_request_state(
                     ctx.session_id.as_deref(),
+                    continuation_owner.as_ref(),
                     turn_id,
                     compact_boundary,
                     &request_body,
@@ -611,6 +641,7 @@ async fn live_stream_response(
             message_id.clone(),
             &model,
             ctx.clone(),
+            continuation_owner.clone(),
             turn_id,
             request_body.clone(),
             compact_boundary,
@@ -627,6 +658,7 @@ async fn live_stream_response(
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
                     abort_request_state(
                         ctx.session_id.as_deref(),
+                        continuation_owner.as_ref(),
                         turn_id,
                         compact_boundary,
                         &request_body,
@@ -637,6 +669,7 @@ async fn live_stream_response(
                 if delay.exceeds_budget {
                     abort_request_state(
                         ctx.session_id.as_deref(),
+                        continuation_owner.as_ref(),
                         turn_id,
                         compact_boundary,
                         &request_body,
@@ -650,11 +683,13 @@ async fn live_stream_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn live_stream_response_once(
     mut upstream_events: websocket::CodexWebSocketEventReceiver,
     message_id: String,
     model: &str,
     ctx: RequestContext,
+    continuation_owner: Option<ConversationIdentity>,
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
     compact_boundary: bool,
@@ -680,6 +715,7 @@ async fn live_stream_response_once(
                 }
                 abort_request_state(
                     ctx.session_id.as_deref(),
+                    continuation_owner.as_ref(),
                     turn_id,
                     compact_boundary,
                     &request_body,
@@ -733,6 +769,7 @@ async fn live_stream_response_once(
                 }
                 abort_request_state(
                     ctx.session_id.as_deref(),
+                    continuation_owner.as_ref(),
                     turn_id,
                     compact_boundary,
                     &request_body,
@@ -755,6 +792,7 @@ async fn live_stream_response_once(
             if terminal {
                 update_continuation_from_upstream(
                     ctx.session_id.as_deref(),
+                    continuation_owner.as_ref(),
                     turn_id,
                     &request_body,
                     &upstream_sse_body,
@@ -767,6 +805,7 @@ async fn live_stream_response_once(
                 translator,
                 pending_chunk,
                 ctx,
+                continuation_owner,
                 turn_id,
                 request_body,
                 upstream_sse_body,
@@ -776,6 +815,7 @@ async fn live_stream_response_once(
         if terminal {
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
+                continuation_owner.as_ref(),
                 turn_id,
                 &request_body,
                 &upstream_sse_body,
@@ -875,6 +915,7 @@ fn remaining_live_stream_response(
     mut translator: LiveStreamTranslator,
     first_chunk: Vec<u8>,
     ctx: RequestContext,
+    continuation_owner: Option<ConversationIdentity>,
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
@@ -885,6 +926,7 @@ fn remaining_live_stream_response(
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
                 ctx.session_id.as_deref(),
+                continuation_owner.as_ref(),
                 turn_id,
                 compact_boundary,
                 &request_body,
@@ -904,6 +946,7 @@ fn remaining_live_stream_response(
                         Err(message) => {
                             abort_request_state(
                                 ctx.session_id.as_deref(),
+                                continuation_owner.as_ref(),
                                 turn_id,
                                 compact_boundary,
                                 &request_body,
@@ -925,6 +968,7 @@ fn remaining_live_stream_response(
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
                                 ctx.session_id.as_deref(),
+                                continuation_owner.as_ref(),
                                 turn_id,
                                 compact_boundary,
                                 &request_body,
@@ -935,6 +979,7 @@ fn remaining_live_stream_response(
                     if terminal {
                         update_continuation_from_upstream(
                             ctx.session_id.as_deref(),
+                            continuation_owner.as_ref(),
                             turn_id,
                             &request_body,
                             &upstream_sse_body,
@@ -946,6 +991,7 @@ fn remaining_live_stream_response(
                 Err(err) => {
                     abort_request_state(
                         ctx.session_id.as_deref(),
+                        continuation_owner.as_ref(),
                         turn_id,
                         compact_boundary,
                         &request_body,
@@ -974,6 +1020,7 @@ fn remaining_live_stream_response(
 
         abort_request_state(
             ctx.session_id.as_deref(),
+            continuation_owner.as_ref(),
             turn_id,
             compact_boundary,
             &request_body,
@@ -1152,6 +1199,7 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
 
 fn update_continuation_from_upstream(
     session_id: Option<&str>,
+    continuation_owner: Option<&ConversationIdentity>,
     turn_id: Option<u64>,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
@@ -1163,7 +1211,7 @@ fn update_continuation_from_upstream(
                 activate_compaction_for_request(session_id, request_body, &finish.output_items);
             }
             record_continuation(
-                session_id,
+                continuation_owner,
                 turn_id,
                 request_body,
                 finish.response_id.as_deref(),
@@ -1172,7 +1220,7 @@ fn update_continuation_from_upstream(
         }
         _ => {
             abort_compaction_attempt(session_id, compact_boundary, request_body);
-            abort_continuation(session_id, turn_id);
+            abort_continuation(continuation_owner, turn_id);
         }
     }
 }
