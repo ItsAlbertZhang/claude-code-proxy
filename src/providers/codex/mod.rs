@@ -33,7 +33,9 @@ use crate::provider::{
     legacy_scope,
 };
 use crate::registry;
-use crate::request_identity::{ConversationIdentity, RequestPurpose, RequestScope};
+use crate::request_identity::{
+    ConversationIdentity, LaneDomain, OpaqueLane, RequestPurpose, RequestScope,
+};
 use crate::retry::{compute_backoff_delay, sleep};
 
 use self::auth::browser_login::run_browser_login;
@@ -50,21 +52,21 @@ use self::continuation::{
     record_continuation_for_owner,
 };
 use self::count_tokens::count_translated_tokens;
-use self::translate::accumulate::accumulate_response_with_traffic;
+use self::translate::accumulate::accumulate_response_scoped;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
     uses_responses_lite_with_full_lane,
 };
-use self::translate::reducer::finish_metadata_from_upstream;
+use self::translate::reducer::finish_metadata_from_upstream_scoped;
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request_scoped,
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
-use self::translate::stream::translate_stream_bytes_with_traffic;
+use self::translate::stream::translate_stream_bytes_scoped;
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -105,6 +107,7 @@ impl CodexProvider {
     ) -> Response {
         let (ctx, scope) = scoped.into_parts();
         let conversation_identity = scope.conversational_lane().cloned();
+        let read_lane = scope.provider_lane(LaneDomain::CodexReadRewrite);
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
@@ -207,7 +210,7 @@ impl CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let mut translated = match translate_request(
+        let mut translated = match translate_request_scoped(
             &body,
             TranslateOptions {
                 session_id: ctx.session_id.clone(),
@@ -215,6 +218,7 @@ impl CodexProvider {
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
+            read_lane,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -305,6 +309,7 @@ impl CodexProvider {
                 stream_request,
                 continuation,
                 compact_boundary,
+                read_lane,
             )
             .await;
         }
@@ -352,12 +357,13 @@ impl CodexProvider {
 
         if want_stream {
             let estimated_input_tokens = count_translated_tokens(&translated);
-            let sse_bytes = match translate_stream_bytes_with_traffic(
+            let sse_bytes = match translate_stream_bytes_scoped(
                 &upstream.body,
                 &message_id,
                 model,
                 estimated_input_tokens,
                 ctx.traffic.as_deref(),
+                read_lane,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -389,6 +395,7 @@ impl CodexProvider {
                 &upstream.body,
                 upstream.socket_id,
                 compact_boundary,
+                read_lane,
             );
 
             let headers = [
@@ -398,11 +405,12 @@ impl CodexProvider {
             ];
             (headers, sse_bytes).into_response()
         } else {
-            match accumulate_response_with_traffic(
+            match accumulate_response_scoped(
                 &upstream.body,
                 &message_id,
                 model,
                 ctx.traffic.as_deref(),
+                read_lane,
             ) {
                 Ok(json) => {
                     if let Some(monitor) = ctx.monitor.as_ref() {
@@ -420,6 +428,7 @@ impl CodexProvider {
                         &upstream.body,
                         upstream.socket_id,
                         compact_boundary,
+                        read_lane,
                     );
                     (StatusCode::OK, Json(json)).into_response()
                 }
@@ -508,7 +517,7 @@ impl Provider for CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let translated = match translate_request(
+        let translated = match translate_request_scoped(
             &body,
             TranslateOptions {
                 session_id: None,
@@ -516,6 +525,7 @@ impl Provider for CodexProvider {
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
+            None,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -653,6 +663,7 @@ async fn live_stream_response(
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationReservation,
     compact_boundary: bool,
+    read_lane: Option<OpaqueLane>,
 ) -> Response {
     let model = model.to_string();
     let request_continuation = continuation.clone();
@@ -704,6 +715,7 @@ async fn live_stream_response(
             request_continuation.clone(),
             request_body.clone(),
             compact_boundary,
+            read_lane,
         )
         .await
         {
@@ -761,12 +773,14 @@ async fn live_stream_response_once(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compact_boundary: bool,
+    read_lane: Option<OpaqueLane>,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
-    let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
+    let mut translator = LiveStreamTranslator::with_stable_read_lane(
         message_id,
         model.to_string(),
         estimated_input_tokens,
+        read_lane,
     );
     let mut upstream_sse_body = Vec::new();
     // Keep protocol framing private until real output makes a transparent retry unsafe.
@@ -862,6 +876,7 @@ async fn live_stream_response_once(
                     &upstream_sse_body,
                     upstream_events.socket_id(),
                     compact_boundary,
+                    read_lane,
                 );
                 return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
             }
@@ -874,6 +889,7 @@ async fn live_stream_response_once(
                 request_body,
                 upstream_sse_body,
                 compact_boundary,
+                read_lane,
             ));
         }
         if terminal {
@@ -884,6 +900,7 @@ async fn live_stream_response_once(
                 &upstream_sse_body,
                 upstream_events.socket_id(),
                 compact_boundary,
+                read_lane,
             );
             if pending_chunk.is_empty() {
                 return LiveStreamStart::Response(empty_live_stream_response());
@@ -984,6 +1001,7 @@ fn remaining_live_stream_response(
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
     compact_boundary: bool,
+    read_lane: Option<OpaqueLane>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -1061,6 +1079,7 @@ fn remaining_live_stream_response(
                             &upstream_sse_body,
                             upstream_events.socket_id(),
                             compact_boundary,
+                            read_lane,
                         );
                         return;
                     }
@@ -1282,8 +1301,9 @@ fn update_continuation_from_upstream(
     upstream_body: &[u8],
     socket_id: Option<u64>,
     compact_boundary: bool,
+    read_lane: Option<OpaqueLane>,
 ) {
-    match finish_metadata_from_upstream(upstream_body) {
+    match finish_metadata_from_upstream_scoped(upstream_body, read_lane) {
         Ok(Some(finish)) if finish.continuation_eligible => {
             if compact_boundary {
                 activate_compaction_for_request(session_id, request_body, &finish.output_items);
@@ -1957,6 +1977,7 @@ mod tests {
                 request.clone(),
                 continuation.clone(),
                 false,
+                None,
             ),
         )
         .await
@@ -2015,6 +2036,7 @@ mod tests {
                 task_request,
                 task_continuation,
                 false,
+                None,
             )
             .await
         });
@@ -2090,6 +2112,7 @@ mod tests {
                 request.clone(),
                 continuation.clone(),
                 false,
+                None,
             ),
         )
         .await
@@ -2265,6 +2288,7 @@ mod tests {
                 task_request,
                 task_continuation,
                 false,
+                None,
             )
             .await
         });
