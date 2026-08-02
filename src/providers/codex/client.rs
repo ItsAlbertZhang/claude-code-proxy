@@ -5,7 +5,7 @@ use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::provider::RequestContext;
-use crate::request_identity::ConversationIdentity;
+use crate::request_identity::{ConversationIdentity, OpaqueLane};
 use crate::retry::{compute_backoff_delay, should_retry_status, sleep};
 use crate::traffic::TrafficCapture;
 
@@ -13,6 +13,7 @@ use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIG
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
 use super::search::{SearchRequest, SearchResponse};
+use super::state::{CodexBoundRoute, CodexProtocolError, ProtocolLane};
 use super::translate::request::{ResponsesRequest, request_uses_responses_lite};
 
 // ---------------------------------------------------------------------------
@@ -187,6 +188,75 @@ pub fn build_codex_search_headers(
     ctx: &RequestContext,
 ) -> Result<http::HeaderMap, CodexError> {
     let mut headers = build_codex_headers(auth, ctx, false)?;
+    headers.insert(
+        http::header::ACCEPT,
+        header_value("accept", "application/json")?,
+    );
+    let originator = config::codex_originator(RESPONSES_LITE_ORIGINATOR);
+    headers.insert("originator", header_value("originator", &originator)?);
+    let user_agent = config::codex_user_agent(RESPONSES_LITE_ORIGINATOR);
+    if !user_agent.is_empty() {
+        headers.insert(
+            http::header::USER_AGENT,
+            header_value("user-agent", &user_agent)?,
+        );
+    }
+    Ok(headers)
+}
+
+fn build_bound_codex_headers(
+    route: &CodexBoundRoute,
+    ctx: &RequestContext,
+) -> Result<http::HeaderMap, CodexError> {
+    let mut stateless = ctx.clone();
+    stateless.session_id = None;
+    let mut headers = build_codex_headers(
+        route.auth(),
+        &stateless,
+        route.protocol().uses_responses_lite(),
+    )?;
+    if let Some(key) = route.conversation_key_encoded() {
+        headers.insert("session_id", header_value("session_id", &key)?);
+        headers.insert(
+            "x-client-request-id",
+            header_value("x-client-request-id", &key)?,
+        );
+        headers.insert(
+            "x-codex-window-id",
+            header_value("x-codex-window-id", &key)?,
+        );
+    }
+    Ok(headers)
+}
+
+fn build_bound_native_codex_headers(
+    route: &CodexBoundRoute,
+    ctx: &RequestContext,
+    stream: bool,
+) -> Result<http::HeaderMap, CodexError> {
+    let mut headers = build_bound_codex_headers(route, ctx)?;
+    headers.insert(
+        http::header::ACCEPT,
+        header_value(
+            "accept",
+            if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        )?,
+    );
+    Ok(headers)
+}
+
+fn build_bound_codex_search_headers(
+    route: &CodexBoundRoute,
+    ctx: &RequestContext,
+) -> Result<http::HeaderMap, CodexError> {
+    route
+        .validate_protocol(ProtocolLane::ResponsesFull)
+        .map_err(protocol_error)?;
+    let mut headers = build_bound_codex_headers(route, ctx)?;
     headers.insert(
         http::header::ACCEPT,
         header_value("accept", "application/json")?,
@@ -642,6 +712,40 @@ impl CodexHttpClient {
         self.body_idle_timeout_ms
     }
 
+    pub(crate) async fn bind_conversation_route(
+        &self,
+        lane: Option<OpaqueLane>,
+        protocol: ProtocolLane,
+    ) -> Result<CodexBoundRoute, CodexError> {
+        let auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|error| CodexError {
+                status: 401,
+                message: "Auth error".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            })?;
+        self.bind_route_with_auth(auth, protocol, lane)
+    }
+
+    fn bind_route_with_auth(
+        &self,
+        auth: StoredAuth,
+        protocol: ProtocolLane,
+        lane: Option<OpaqueLane>,
+    ) -> Result<CodexBoundRoute, CodexError> {
+        CodexBoundRoute::new(auth, &self.base_url, protocol, lane).map_err(|error| CodexError {
+            status: 500,
+            message: "Invalid Codex endpoint".to_string(),
+            detail: Some(error.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })
+    }
+
     pub(crate) async fn post_transcription(
         &self,
         base_url: &str,
@@ -819,61 +923,73 @@ impl CodexHttpClient {
         use_responses_lite: bool,
         stream: bool,
     ) -> Result<reqwest::Response, CodexError> {
-        let body_json = serde_json::to_string(body).map_err(|err| CodexError {
-            status: 500,
-            message: "Failed to serialize native Responses request".to_string(),
-            detail: Some(err.to_string()),
-            retry_after: None,
-            origin: CodexErrorOrigin::Http,
-        })?;
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|err| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(err.to_string()),
-                retry_after: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+        let protocol = ProtocolLane::from_uses_responses_lite(use_responses_lite);
+        let mut route = self.bind_conversation_route(None, protocol).await?;
         let mut refresh_attempted = false;
 
         loop {
-            let started_at = Instant::now();
-            let headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream)?;
-            if let Some(traffic) = ctx.traffic.as_deref() {
-                write_codex_http_request_capture(traffic, &self.base_url, &headers, &body_json);
-            }
-
             let response = self
-                .attempt_native_responses(&headers, body_json.clone())
+                .post_native_responses_bound(&route, body, ctx, use_responses_lite, stream)
                 .await?;
-            let status = response.status().as_u16();
-            if status == 401 && !refresh_attempted {
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
                 refresh_attempted = true;
                 drop(response);
-                auth = self
+                let auth = self
                     .auth_manager
-                    .force_refresh(&auth.access)
+                    .force_refresh(&route.auth().access)
                     .await
                     .map_err(auth_refresh_error)?;
+                route = self.bind_route_with_auth(auth, protocol, None)?;
                 continue;
-            }
-
-            if let Some(traffic) = ctx.traffic.as_deref() {
-                write_live_upstream_response_headers(traffic, &response, started_at.elapsed());
             }
             return Ok(response);
         }
     }
 
-    async fn attempt_native_responses(
+    pub(crate) async fn post_native_responses_bound(
         &self,
+        route: &CodexBoundRoute,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+        use_responses_lite: bool,
+        stream: bool,
+    ) -> Result<reqwest::Response, CodexError> {
+        route
+            .validate_protocol(ProtocolLane::from_uses_responses_lite(use_responses_lite))
+            .map_err(protocol_error)?;
+        let body_json = serde_json::to_string(body).map_err(|error| CodexError {
+            status: 500,
+            message: "Failed to serialize native Responses request".to_string(),
+            detail: Some(error.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
+        let headers = build_bound_native_codex_headers(route, ctx, stream)?;
+        let started_at = Instant::now();
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_codex_http_request_capture(
+                traffic,
+                route.canonical_endpoint().as_str(),
+                &headers,
+                &body_json,
+            );
+        }
+        let response = self
+            .attempt_native_responses_at(route.canonical_endpoint().as_str(), &headers, body_json)
+            .await?;
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_live_upstream_response_headers(traffic, &response, started_at.elapsed());
+        }
+        Ok(response)
+    }
+
+    async fn attempt_native_responses_at(
+        &self,
+        endpoint: &str,
         headers: &http::HeaderMap,
         body_json: String,
     ) -> Result<reqwest::Response, CodexError> {
-        let mut request = self.native_client.post(&self.base_url);
+        let mut request = self.native_client.post(endpoint);
         for (key, value) in headers {
             request = request.header(key.as_str(), value.as_bytes());
         }
@@ -920,6 +1036,27 @@ impl CodexHttpClient {
         .map(OwnerAwareCodexResponse::into_response)
     }
 
+    pub(crate) async fn post_codex_bound(
+        &self,
+        route: &CodexBoundRoute,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+    ) -> Result<OwnerAwareCodexResponse, CodexError> {
+        route
+            .validate_responses_request(body)
+            .map_err(protocol_error)?;
+        self.post_codex_with_transport_route(
+            route.clone(),
+            body,
+            ctx,
+            continuation,
+            crate::config::codex_transport(),
+            false,
+        )
+        .await
+    }
+
     pub(crate) async fn post_codex_for_owner(
         &self,
         body: &ResponsesRequest,
@@ -935,57 +1072,85 @@ impl CodexHttpClient {
         body: &SearchRequest,
         ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
-        let body_json = serde_json::to_string(body).map_err(|e| CodexError {
+        let mut route = self
+            .bind_conversation_route(None, ProtocolLane::ResponsesFull)
+            .await?;
+        let mut auth_refresh_attempted = false;
+        let mut retries = 0_u32;
+        loop {
+            match self
+                .post_search_bound_with_retries(&route, body, ctx, &mut retries)
+                .await
+            {
+                Err(error) if error.status == 401 && !auth_refresh_attempted => {
+                    auth_refresh_attempted = true;
+                    let auth = self
+                        .auth_manager
+                        .force_refresh(&route.auth().access)
+                        .await
+                        .map_err(auth_refresh_error)?;
+                    route = self.bind_route_with_auth(auth, ProtocolLane::ResponsesFull, None)?;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    pub(crate) async fn post_search_bound(
+        &self,
+        route: &CodexBoundRoute,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+    ) -> Result<SearchResponse, CodexError> {
+        let mut retries = 0_u32;
+        self.post_search_bound_with_retries(route, body, ctx, &mut retries)
+            .await
+    }
+
+    async fn post_search_bound_with_retries(
+        &self,
+        route: &CodexBoundRoute,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+        retries: &mut u32,
+    ) -> Result<SearchResponse, CodexError> {
+        route
+            .validate_protocol(ProtocolLane::ResponsesFull)
+            .map_err(protocol_error)?;
+        let body_json = serde_json::to_string(body).map_err(|error| CodexError {
             status: 500,
             message: "Failed to serialize search request".to_string(),
-            detail: Some(e.to_string()),
+            detail: Some(error.to_string()),
             retry_after: None,
             origin: CodexErrorOrigin::Http,
         })?;
-        let mut auth_refresh_attempted = false;
-        let mut retries = 0_u32;
-
         loop {
-            let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
-            if response.status == 401 && !auth_refresh_attempted {
-                auth_refresh_attempted = true;
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
-                continue;
-            }
+            let response = self
+                .attempt_post_search_bound(route, &body_json, ctx)
+                .await?;
             if should_retry_codex_status(response.status)
-                && retries < MAX_BUFFERED_TRANSPORT_RETRIES
+                && *retries < MAX_BUFFERED_TRANSPORT_RETRIES
             {
                 let retry_after = response
                     .headers
                     .iter()
                     .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
                     .map(|(_, value)| value.as_str());
-                let delay = compute_backoff_delay(retries, retry_after);
+                let delay = compute_backoff_delay(*retries, retry_after);
                 if delay.exceeds_budget {
                     return Err(codex_status_error(response));
                 }
-                retries += 1;
+                *retries += 1;
                 sleep(delay.wait_ms).await;
                 continue;
             }
             if !(200..300).contains(&response.status) {
                 return Err(codex_status_error(response));
             }
-            return serde_json::from_slice(&response.body).map_err(|e| CodexError {
+            return serde_json::from_slice(&response.body).map_err(|error| CodexError {
                 status: 502,
                 message: "Failed to decode Codex search response".to_string(),
-                detail: Some(e.to_string()),
+                detail: Some(error.to_string()),
                 retry_after: None,
                 origin: CodexErrorOrigin::Http,
             });
@@ -999,15 +1164,30 @@ impl CodexHttpClient {
         continuation: Option<&super::continuation::ContinuationReservation>,
         transport: crate::config::CodexTransport,
     ) -> Result<OwnerAwareCodexResponse, CodexError> {
+        let route = self
+            .bind_conversation_route(
+                None,
+                ProtocolLane::from_uses_responses_lite(request_uses_responses_lite(body)),
+            )
+            .await?;
+        self.post_codex_with_transport_route(route, body, ctx, continuation, transport, true)
+            .await
+    }
+
+    async fn post_codex_with_transport_route(
+        &self,
+        mut route: CodexBoundRoute,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+        transport: crate::config::CodexTransport,
+        allow_auth_refresh: bool,
+    ) -> Result<OwnerAwareCodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        route
+            .validate_responses_request(body)
+            .map_err(protocol_error)?;
 
         let initial_pool_owner = websocket_pool_owner(continuation).cloned();
         if should_reset_websocket_pool(continuation)
@@ -1032,18 +1212,12 @@ impl CodexHttpClient {
                         retry_after: None,
                         origin: CodexErrorOrigin::Http,
                     })?;
-                    self.attempt_post_http(
-                        &auth,
-                        &body_json,
-                        ctx,
-                        request_uses_responses_lite(body),
-                    )
-                    .await
-                    .map(|response| OwnerAwareCodexResponse::new(response, None))
+                    self.attempt_post_http_bound(&route, &body_json, ctx)
+                        .await
+                        .map(|response| OwnerAwareCodexResponse::new(response, None))
                 }
                 CodexTransport::WebSocket => {
-                    let ws_headers =
-                        build_codex_headers(&auth, ctx, request_uses_responses_lite(body))?;
+                    let ws_headers = build_bound_codex_headers(&route, ctx)?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(
                         body,
@@ -1055,7 +1229,7 @@ impl CodexHttpClient {
                     super::websocket::codex_websocket_request(
                         &self.websocket_client,
                         &self.websocket_proxy_config,
-                        &self.base_url,
+                        route.canonical_endpoint().as_str(),
                         &ws_headers,
                         &ws_body,
                         ctx,
@@ -1067,8 +1241,7 @@ impl CodexHttpClient {
                     .await
                 }
                 CodexTransport::Auto => {
-                    let ws_headers =
-                        build_codex_headers(&auth, ctx, request_uses_responses_lite(body))?;
+                    let ws_headers = build_bound_codex_headers(&route, ctx)?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(
                         body,
@@ -1081,7 +1254,7 @@ impl CodexHttpClient {
                     let ws_result = super::websocket::codex_websocket_request(
                         &self.websocket_client,
                         &self.websocket_proxy_config,
-                        &self.base_url,
+                        route.canonical_endpoint().as_str(),
                         &ws_headers,
                         &ws_body,
                         ctx,
@@ -1116,25 +1289,23 @@ impl CodexHttpClient {
                                     retry_after: None,
                                     origin: CodexErrorOrigin::Http,
                                 })?;
-                            self.attempt_post_http(
-                                &auth,
-                                &body_json,
-                                ctx,
-                                request_uses_responses_lite(body),
-                            )
-                            .await
-                            .map(|response| OwnerAwareCodexResponse::new(response, None))
+                            self.attempt_post_http_bound(&route, &body_json, ctx)
+                                .await
+                                .map(|response| OwnerAwareCodexResponse::new(response, None))
                         }
                         Err(err) => Err(err),
                     }
                 }
             };
 
-            if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
+            if allow_auth_refresh
+                && should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport)
+            {
                 auth_refresh_attempted = true;
-                match self.auth_manager.force_refresh(&auth.access).await {
+                match self.auth_manager.force_refresh(&route.auth().access).await {
                     Ok(new_auth) => {
-                        auth = new_auth;
+                        route =
+                            self.bind_route_with_auth(new_auth, route.protocol(), route.lane())?;
                         invalidate_live_continuation_pool(active_continuation.as_ref());
                         active_continuation =
                             full_context_continuation(active_continuation.as_ref());
@@ -1370,14 +1541,36 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let route = self
+            .bind_conversation_route(
+                None,
+                ProtocolLane::from_uses_responses_lite(request_uses_responses_lite(body)),
+            )
+            .await?;
+        self.start_bound_websocket_event_stream(route, body, ctx, continuation, true)
+    }
 
+    pub(crate) async fn stream_codex_websocket_events_bound(
+        self: &Arc<Self>,
+        route: &CodexBoundRoute,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        route
+            .validate_responses_request(body)
+            .map_err(protocol_error)?;
+        self.start_bound_websocket_event_stream(route.clone(), body, ctx, continuation, false)
+    }
+
+    fn start_bound_websocket_event_stream(
+        self: &Arc<Self>,
+        route: CodexBoundRoute,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+        allow_auth_refresh: bool,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let turn_id = continuation.and_then(super::continuation::ContinuationReservation::turn_id);
         if should_reset_websocket_pool(continuation)
             && let Some(owner) = websocket_pool_owner(continuation)
@@ -1397,7 +1590,8 @@ impl CodexHttpClient {
                     body,
                     ctx,
                     continuation,
-                    auth,
+                    route,
+                    allow_auth_refresh,
                     tx,
                     socket_id_publisher,
                 )
@@ -1413,7 +1607,8 @@ impl CodexHttpClient {
         body: ResponsesRequest,
         ctx: RequestContext,
         mut continuation: Option<super::continuation::ContinuationReservation>,
-        mut auth: StoredAuth,
+        mut route: CodexBoundRoute,
+        allow_auth_refresh: bool,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
     ) {
@@ -1426,19 +1621,18 @@ impl CodexHttpClient {
 
         'attempt: loop {
             socket_id_publisher.publish(None);
-            let ws_headers =
-                match build_codex_headers(&auth, &ctx, request_uses_responses_lite(&body)) {
-                    Ok(headers) => super::websocket::codex_websocket_headers(&headers),
-                    Err(err) => {
-                        if tx.send(Err(err)).await.is_err() {
-                            abort_abandoned_live_continuation(
-                                continuation.as_ref(),
-                                &socket_id_publisher,
-                            );
-                        }
-                        return;
+            let ws_headers = match build_bound_codex_headers(&route, &ctx) {
+                Ok(headers) => super::websocket::codex_websocket_headers(&headers),
+                Err(err) => {
+                    if tx.send(Err(err)).await.is_err() {
+                        abort_abandoned_live_continuation(
+                            continuation.as_ref(),
+                            &socket_id_publisher,
+                        );
                     }
-                };
+                    return;
+                }
+            };
             let ws_body = build_websocket_request(
                 &body,
                 continuation
@@ -1448,7 +1642,7 @@ impl CodexHttpClient {
             let start = super::websocket::codex_websocket_event_stream(
                 &self.websocket_client,
                 &self.websocket_proxy_config,
-                &self.base_url,
+                route.canonical_endpoint().as_str(),
                 &ws_headers,
                 &ws_body,
                 &ctx,
@@ -1468,11 +1662,14 @@ impl CodexHttpClient {
                 }
                 result = start => match result {
                     Ok(stream) => stream,
-                    Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
+                    Err(err) if allow_auth_refresh
+                        && err.status == 401
+                        && !auth_refresh_attempted
+                        && !forwarded_any => {
                         auth_refresh_attempted = true;
                         invalidate_live_continuation_pool(continuation.as_ref());
-                        let refresh = self.auth_manager.force_refresh(&auth.access);
-                        auth = match refresh.await {
+                        let refresh = self.auth_manager.force_refresh(&route.auth().access);
+                        route = match refresh.await {
                             Ok(auth) => {
                                 if tx.is_closed() {
                                     abort_abandoned_live_continuation(
@@ -1481,7 +1678,22 @@ impl CodexHttpClient {
                                     );
                                     return;
                                 }
-                                auth
+                                match self.bind_route_with_auth(
+                                    auth,
+                                    route.protocol(),
+                                    route.lane(),
+                                ) {
+                                    Ok(route) => route,
+                                    Err(error) => {
+                                        if tx.send(Err(error)).await.is_err() {
+                                            abort_abandoned_live_continuation(
+                                                continuation.as_ref(),
+                                                &socket_id_publisher,
+                                            );
+                                        }
+                                        return;
+                                    }
+                                }
                             },
                             Err(refresh_err) => {
                                 if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
@@ -1555,11 +1767,11 @@ impl CodexHttpClient {
                     Err(err) => err.status == 401,
                     Ok(payload) => super::websocket::event_error_status(payload) == Some(401),
                 };
-                if unauthorized && !auth_refresh_attempted && !forwarded_any {
+                if allow_auth_refresh && unauthorized && !auth_refresh_attempted && !forwarded_any {
                     auth_refresh_attempted = true;
                     invalidate_live_continuation_pool(continuation.as_ref());
-                    let refresh = self.auth_manager.force_refresh(&auth.access);
-                    auth = match refresh.await {
+                    let refresh = self.auth_manager.force_refresh(&route.auth().access);
+                    route = match refresh.await {
                         Ok(auth) => {
                             if tx.is_closed() {
                                 if let Some(reservation) = continuation.as_ref() {
@@ -1574,7 +1786,24 @@ impl CodexHttpClient {
                                 );
                                 return;
                             }
-                            auth
+                            match self.bind_route_with_auth(auth, route.protocol(), route.lane()) {
+                                Ok(route) => route,
+                                Err(error) => {
+                                    if tx.send(Err(error)).await.is_err() {
+                                        if let Some(reservation) = continuation.as_ref() {
+                                            super::websocket::invalidate_codex_websocket_pool_socket(
+                                                reservation,
+                                                stream.socket_id(),
+                                            );
+                                        }
+                                        abort_abandoned_live_continuation(
+                                            continuation.as_ref(),
+                                            &socket_id_publisher,
+                                        );
+                                    }
+                                    return;
+                                }
+                            }
                         }
                         Err(refresh_err) => {
                             if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
@@ -1640,9 +1869,34 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         use_responses_lite: bool,
     ) -> Result<CodexResponse, CodexError> {
-        let url = &self.base_url;
         let headers = build_codex_headers(auth, ctx, use_responses_lite)?;
+        self.attempt_post_http_at(&self.base_url, &headers, body_json, ctx)
+            .await
+    }
 
+    async fn attempt_post_http_bound(
+        &self,
+        route: &CodexBoundRoute,
+        body_json: &str,
+        ctx: &RequestContext,
+    ) -> Result<CodexResponse, CodexError> {
+        let headers = build_bound_codex_headers(route, ctx)?;
+        self.attempt_post_http_at(
+            route.canonical_endpoint().as_str(),
+            &headers,
+            body_json,
+            ctx,
+        )
+        .await
+    }
+
+    async fn attempt_post_http_at(
+        &self,
+        url: &str,
+        headers: &http::HeaderMap,
+        body_json: &str,
+        ctx: &RequestContext,
+    ) -> Result<CodexResponse, CodexError> {
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_codex_http_request_capture(traffic, url, &headers, body_json);
         }
@@ -1753,20 +2007,30 @@ impl CodexHttpClient {
         })
     }
 
-    async fn attempt_post_search(
+    async fn attempt_post_search_bound(
         &self,
-        auth: &StoredAuth,
+        route: &CodexBoundRoute,
         body_json: &str,
         ctx: &RequestContext,
     ) -> Result<CodexResponse, CodexError> {
-        let url = search_endpoint(&self.base_url);
-        let headers = build_codex_search_headers(auth, ctx)?;
+        let url = search_endpoint(route.canonical_endpoint().as_str());
+        let headers = build_bound_codex_search_headers(route, ctx)?;
+        self.attempt_post_search_at(&url, &headers, body_json, ctx)
+            .await
+    }
 
+    async fn attempt_post_search_at(
+        &self,
+        url: &str,
+        headers: &http::HeaderMap,
+        body_json: &str,
+        ctx: &RequestContext,
+    ) -> Result<CodexResponse, CodexError> {
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_codex_http_request_capture(traffic, &url, &headers, body_json);
         }
 
-        let mut request = self.client.post(&url);
+        let mut request = self.client.post(url);
         for (key, value) in headers.iter() {
             request = request.header(key.as_str(), value.as_bytes());
         }
@@ -1986,6 +2250,16 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
             .and_then(|v| v.as_array())
             .map(|items| items.len()),
     })
+}
+
+fn protocol_error(error: CodexProtocolError) -> CodexError {
+    CodexError {
+        status: 500,
+        message: "Codex route protocol mismatch".to_string(),
+        detail: Some(error.to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::Http,
+    }
 }
 
 fn auth_refresh_error(err: anyhow::Error) -> CodexError {
@@ -2373,6 +2647,61 @@ mod tests {
             },
             reasoning: None,
         }
+    }
+
+    #[test]
+    fn bound_headers_use_only_opaque_route_conversation_identity() {
+        let scope = crate::request_identity::RequestScope::legacy(
+            Some("raw-session"),
+            crate::request_identity::RequestPurpose::Conversation,
+        );
+        let route = CodexBoundRoute::new(
+            http_test_auth(),
+            "https://example.test/responses/",
+            ProtocolLane::ResponsesFull,
+            scope.provider_lane(crate::request_identity::LaneDomain::CodexConversation),
+        )
+        .unwrap();
+        let mut context = http_test_context();
+        context.session_id = Some("legacy-raw-session".to_string());
+        let headers = build_bound_codex_headers(&route, &context).unwrap();
+        let expected = route.conversation_key_encoded().unwrap();
+
+        for name in ["session_id", "x-client-request-id", "x-codex-window-id"] {
+            assert_eq!(headers.get(name).unwrap().to_str().unwrap(), expected);
+        }
+        let rendered = format!("{headers:?}");
+        assert!(!rendered.contains("raw-session"));
+        assert!(!rendered.contains("legacy-raw-session"));
+    }
+
+    #[tokio::test]
+    async fn bound_messages_and_live_websocket_validate_exact_protocol() {
+        let client = Arc::new(authenticated_http_test_client(
+            "http://127.0.0.1:1/responses".to_string(),
+        ));
+        let route = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let mut request = buffered_test_request();
+        request.client_metadata = Some(std::collections::HashMap::from([(
+            super::super::translate::request::RESPONSES_LITE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        )]));
+
+        let buffered = client
+            .post_codex_bound(&route, &request, &http_test_context(), None)
+            .await
+            .err()
+            .expect("mismatched buffered protocol must fail");
+        assert_eq!(buffered.status, 500);
+        let live = client
+            .stream_codex_websocket_events_bound(&route, &request, &http_test_context(), None)
+            .await
+            .err()
+            .expect("mismatched live protocol must fail");
+        assert_eq!(live.status, 500);
     }
 
     #[test]
@@ -2784,6 +3113,289 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn bound_route_uses_one_auth_snapshot_and_refreshes_only_the_next_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let route_a = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "rotated".into(),
+            refresh: "rotated-refresh".into(),
+            account_id: Some("acct".into()),
+            expires: u64::MAX,
+        });
+        let route_b = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+
+        let server = tokio::spawn(async move {
+            for expected in ["test", "rotated"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let request = String::from_utf8_lossy(&request);
+                assert!(
+                    request.contains(&format!("authorization: Bearer {expected}")),
+                    "request did not use expected immutable credential: {request}"
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        for route in [route_a, route_b] {
+            let response = client
+                .post_codex_with_transport_route(
+                    route,
+                    &buffered_test_request(),
+                    &http_test_context(),
+                    None,
+                    crate::config::CodexTransport::Http,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_route_transport_retry_preserves_auth_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let route = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "rotated".into(),
+            refresh: "rotated-refresh".into(),
+            account_id: Some("acct".into()),
+            expires: u64::MAX,
+        });
+
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.contains("authorization: Bearer test"));
+                if attempt == 0 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let response = client
+            .post_codex_with_transport_route(
+                route,
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_native_responses_validates_route_against_payload_metadata() {
+        let client = authenticated_http_test_client("http://127.0.0.1:1/v1/responses".to_string());
+        let route = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesLite)
+            .await
+            .unwrap();
+        let error = client
+            .post_native_responses_bound(
+                &route,
+                &serde_json::json!({"model":"gpt-5.4","input":"hello"}),
+                &http_test_context(),
+                false,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 500);
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("protocol mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_native_responses_preserves_route_identity_and_does_not_retry_401() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = authenticated_http_test_client(format!("http://{addr}/v1/responses"));
+        let route = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "rotated".into(),
+            refresh: "rotated-refresh".into(),
+            account_id: Some("acct-rotated".into()),
+            expires: u64::MAX,
+        });
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("authorization: Bearer test"));
+            assert!(request.contains("chatgpt-account-id: acct"));
+            assert!(!request.contains("rotated"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let response = client
+            .post_native_responses_bound(
+                &route,
+                &serde_json::json!({"model":"gpt-5.4","input":"hello"}),
+                &http_test_context(),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_search_rejects_responses_lite_route() {
+        let client = authenticated_http_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesLite)
+            .await
+            .unwrap();
+        let request = SearchRequest {
+            id: "search-test".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            reasoning: None,
+            input: None,
+            commands: super::super::search::SearchCommands {
+                search_query: vec![super::super::search::SearchQuery {
+                    q: "query".to_string(),
+                }],
+            },
+            settings: super::super::search::SearchSettings {
+                filters: None,
+                allowed_callers: vec!["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: 2_500,
+        };
+        let error = client
+            .post_search_bound(&route, &request, &http_test_context())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 500);
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("protocol mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_search_preserves_auth_snapshot_and_refreshes_only_next_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let full_route = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "rotated".into(),
+            refresh: "rotated-refresh".into(),
+            account_id: Some("acct-rotated".into()),
+            expires: u64::MAX,
+        });
+        let body = SearchRequest {
+            id: "search-test".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            reasoning: None,
+            input: None,
+            commands: super::super::search::SearchCommands {
+                search_query: vec![super::super::search::SearchQuery {
+                    q: "query".to_string(),
+                }],
+            },
+            settings: super::super::search::SearchSettings {
+                filters: None,
+                allowed_callers: vec!["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: 2_500,
+        };
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /alpha/search HTTP/1.1"));
+            assert!(request.contains("authorization: Bearer test"));
+            assert!(!request.contains("rotated"));
+            let body = br#"{"encrypted_output":null,"output":"ok","results":null}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let response = client
+            .post_search_bound(&full_route, &body, &http_test_context())
+            .await
+            .unwrap();
+        assert_eq!(response.output, "ok");
+        server.await.unwrap();
     }
 
     #[tokio::test]
