@@ -1583,27 +1583,30 @@ mod tests {
     }
 
     #[test]
-    fn provider_effort_bypass_marker_cannot_be_spoofed_or_serialized() {
+    fn provider_bypass_markers_cannot_be_spoofed_or_serialized() {
         let spoofed: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
             "messages": [{"role":"user", "content":"hello"}],
-            "bypass_provider_effort_override": true
+            "bypass_provider_model_override": true,
+            "bypass_provider_effort_override": true,
+            "auxiliary_request": true
         }))
         .unwrap();
+        assert!(!spoofed.bypass_provider_model_override);
         assert!(!spoofed.bypass_provider_effort_override);
+        assert!(!spoofed.auxiliary_request);
 
-        let mut internal: MessagesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.6-sol",
-            "messages": [{"role":"user", "content":"hello"}]
-        }))
-        .unwrap();
-        internal.bypass_provider_effort_override = true;
-        assert!(
-            serde_json::to_value(internal)
-                .unwrap()
-                .get("bypass_provider_effort_override")
-                .is_none()
-        );
+        let serialized = serde_json::to_value(spoofed).unwrap();
+        for reserved in [
+            "bypass_provider_model_override",
+            "bypass_provider_effort_override",
+            "auxiliary_request",
+        ] {
+            assert!(
+                serialized.get(reserved).is_none(),
+                "reserved key {reserved} survived a spoofed round-trip"
+            );
+        }
     }
 
     #[test]

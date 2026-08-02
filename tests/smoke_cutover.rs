@@ -1448,6 +1448,154 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_auto_review_preserves_compaction_for_lite_and_full_lanes() {
+    let _guard = env_lock();
+    clear_all_compactions_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let serialized = body.to_string();
+            let is_compaction = body["input"].as_array().is_some_and(|input| {
+                input.last().and_then(|item| item["type"].as_str())
+                    == Some("compaction_trigger")
+            });
+            captured.lock().unwrap().push(body);
+            if is_compaction {
+                concat!(
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque-auxiliary-history\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\",\"usage\":{\"input_tokens\":100,\"output_tokens\":1}}}\n\n"
+                )
+                .as_bytes()
+                .to_vec()
+            } else {
+                let text = if serialized.contains("Your task is to create a detailed summary") {
+                    "portable summary retained across the auxiliary classifier request"
+                } else if serialized
+                    .contains("You are a security monitor for autonomous AI coding agents.")
+                {
+                    "classifier ok"
+                } else {
+                    "ordinary replay ok"
+                };
+                format!(
+                    "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_up\"}}}}\n\n\
+                     data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"{text}\"}}\n\n\
+                     data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"message\"}}}}\n\n\
+                     data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_ok\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":2}}}}}}\n\n"
+                )
+                .into_bytes()
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+    let _continuation_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "0");
+    let _codex_model_env = EnvGuard::set("CCP_CODEX_MODEL", "gpt-5.6-sol");
+    let _review_model_env = EnvGuard::remove("CCP_AUTO_REVIEW_MODEL");
+    let _review_effort_env = EnvGuard::remove("CCP_AUTO_REVIEW_EFFORT");
+
+    for (full_lane, session_id) in [("0", "smoke-auxiliary-lite"), ("1", "smoke-auxiliary-full")] {
+        let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", full_lane);
+        let compact = call_messages_body_for_session(
+            json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 64,
+                "system": "You are Claude Code.",
+                "messages": [
+                    {"role":"user","content":"old conversation"},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{}}]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"tool-1","content":"result"},
+                        {"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}
+                    ]}
+                ]
+            }),
+            session_id,
+        )
+        .await;
+        assert_eq!(compact.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(compact.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let classifier = call_messages_body_for_session(
+            json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 64,
+                "stream": false,
+                "system": [{
+                    "type": "text",
+                    "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"
+                }],
+                "messages": [{"role":"user","content":"review this Bash command"}],
+                "tools": []
+            }),
+            session_id,
+        )
+        .await;
+        assert_eq!(classifier.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(classifier.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let ordinary = call_messages_body_for_session(
+            json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 64,
+                "system": "current instructions",
+                "messages": [
+                    {"role":"user","content":"<summary>portable summary retained across the auxiliary classifier request</summary>"},
+                    {"role":"user","content":"continue"}
+                ]
+            }),
+            session_id,
+        )
+        .await;
+        assert_eq!(ordinary.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(ordinary.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 8);
+    for (lane, expect_lite) in [(0, true), (4, false)] {
+        assert_eq!(
+            requests[lane].get("client_metadata").is_some(),
+            expect_lite,
+            "unexpected compaction lane"
+        );
+        assert_eq!(
+            requests[lane]["input"].as_array().unwrap().last().unwrap()["type"],
+            "compaction_trigger"
+        );
+        assert!(
+            !requests[lane + 2]
+                .to_string()
+                .contains("opaque-auxiliary-history")
+        );
+        assert_eq!(requests[lane + 2]["model"], "gpt-5.6-luna");
+        assert!(
+            requests[lane + 3]
+                .to_string()
+                .contains("opaque-auxiliary-history"),
+            "ordinary request did not replay compaction in {} lane",
+            if expect_lite { "Lite" } else { "M1 full" }
+        );
+    }
+    clear_all_compactions_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_compaction_failure_preserves_portable_summary() {
     let _guard = env_lock();
     clear_all_compactions_for_tests();

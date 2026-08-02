@@ -1660,6 +1660,8 @@ async fn dispatch_request(
         }
     };
 
+    body.auxiliary_request = !count_tokens && is_claude_auto_review_request(&body);
+
     let codex_auto_review_model = auto_review_route.is_some() && provider.name() == "codex";
     body.bypass_provider_model_override = codex_auto_review_model;
 
@@ -1744,9 +1746,14 @@ async fn dispatch_request(
         );
     }
 
+    let provider_session_id = if body.auxiliary_request && provider.name() == "codex" {
+        None
+    } else {
+        session_id.clone()
+    };
     let context = RequestContext {
         req_id: req_id.clone(),
-        session_id,
+        session_id: provider_session_id,
         session_seq: current.map(|s| s.seq),
         provider: provider.name().to_string(),
         traffic,
