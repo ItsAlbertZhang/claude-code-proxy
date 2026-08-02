@@ -9,6 +9,7 @@ pub mod images;
 pub mod native;
 pub mod request_summary;
 pub mod search;
+pub(crate) mod state;
 pub mod transcription;
 pub mod translate;
 pub mod websocket;
