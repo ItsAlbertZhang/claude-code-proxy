@@ -1,5 +1,6 @@
 use crate::config::AliasProvider;
 use crate::registry::normalize_incoming_model;
+use crate::request_identity::{ConversationIdentity, RequestScope};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
 
@@ -15,8 +16,8 @@ pub struct SessionState {
 
 #[derive(Default)]
 struct SessionStore {
-    map: HashMap<String, SessionState>,
-    order: VecDeque<String>,
+    map: HashMap<ConversationIdentity, SessionState>,
+    order: VecDeque<ConversationIdentity>,
 }
 
 static SESSIONS: LazyLock<Mutex<SessionStore>> =
@@ -30,16 +31,30 @@ fn now_millis() -> u64 {
     dur.as_millis() as u64
 }
 
-pub fn existing_session(session_id: Option<&str>, now: u64) -> Option<SessionState> {
-    let id = session_id?;
+pub(crate) fn existing_conversation(
+    identity: Option<&ConversationIdentity>,
+    now: u64,
+) -> Option<SessionState> {
+    let identity = identity?.validated()?;
     let mut store = SESSIONS.lock().expect("session lock");
-    let state = store.map.get(id).cloned()?;
+    let state = store.map.get(&identity).cloned()?;
     if now.saturating_sub(state.last_seen) > SESSION_IDLE_TTL_MS {
-        store.map.remove(id);
-        store.order.retain(|item| item != id);
+        store.map.remove(&identity);
+        store.order.retain(|item| item != &identity);
         return None;
     }
     Some(state)
+}
+
+pub(crate) fn existing_conversation_now(
+    identity: Option<&ConversationIdentity>,
+) -> Option<SessionState> {
+    existing_conversation(identity, now_millis())
+}
+
+pub fn existing_session(session_id: Option<&str>, now: u64) -> Option<SessionState> {
+    let identity = session_id.and_then(ConversationIdentity::from_legacy_main);
+    existing_conversation(identity.as_ref(), now)
 }
 
 pub fn existing_session_now(session_id: Option<&str>) -> Option<SessionState> {
@@ -53,7 +68,8 @@ pub fn record_session_request(
     model: &str,
     now: u64,
 ) -> Option<SessionState> {
-    record_session_request_with_affinity_update(session_id, prior, provider_name, model, true, now)
+    let identity = session_id.and_then(ConversationIdentity::from_legacy_main);
+    record_conversation_request(identity.as_ref(), prior, provider_name, model, true, now)
 }
 
 pub(crate) fn record_session_request_with_affinity_update(
@@ -64,15 +80,52 @@ pub(crate) fn record_session_request_with_affinity_update(
     update_affinity: bool,
     now: u64,
 ) -> Option<SessionState> {
-    let id = session_id?;
+    let identity = session_id.and_then(ConversationIdentity::from_legacy_main);
+    record_conversation_request(
+        identity.as_ref(),
+        prior,
+        provider_name,
+        model,
+        update_affinity,
+        now,
+    )
+}
+
+pub(crate) fn record_scoped_request(
+    scope: &RequestScope,
+    prior: Option<&SessionState>,
+    provider_name: &str,
+    model: &str,
+    update_affinity: bool,
+    now: u64,
+) -> Option<SessionState> {
+    record_conversation_request(
+        scope.conversational_lane(),
+        prior,
+        provider_name,
+        model,
+        update_affinity,
+        now,
+    )
+}
+
+pub(crate) fn record_conversation_request(
+    identity: Option<&ConversationIdentity>,
+    prior: Option<&SessionState>,
+    provider_name: &str,
+    model: &str,
+    update_affinity: bool,
+    now: u64,
+) -> Option<SessionState> {
+    let identity = identity?.validated()?;
     let mut store = SESSIONS.lock().expect("session lock");
     let stored = store
         .map
-        .get(id)
+        .get(&identity)
         .cloned()
         .filter(|state| now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS);
-    if stored.is_none() && store.map.remove(id).is_some() {
-        store.order.retain(|item| item != id);
+    if stored.is_none() && store.map.remove(&identity).is_some() {
+        store.order.retain(|item| item != &identity);
     }
     let mut next = stored
         .or_else(|| {
@@ -85,7 +138,10 @@ pub(crate) fn record_session_request_with_affinity_update(
             affinity_provider: None,
             last_seen: now,
         });
-    next.seq += 1;
+    next.seq = next
+        .seq
+        .checked_add(1)
+        .expect("conversation sequence exhausted");
     next.last_seen = now;
     if update_affinity
         && is_alias_routable_provider(provider_name)
@@ -98,10 +154,10 @@ pub(crate) fn record_session_request_with_affinity_update(
         });
     }
 
-    if !store.map.contains_key(id) {
-        store.order.push_back(id.to_string());
+    if !store.map.contains_key(&identity) {
+        store.order.push_back(identity.clone());
     }
-    store.map.insert(id.to_string(), next.clone());
+    store.map.insert(identity, next.clone());
 
     while store.order.len() > MAX_SESSIONS {
         if let Some(evict) = store.order.pop_front() {
@@ -132,9 +188,11 @@ pub fn affinity_provider_from_session(session: &SessionState) -> Option<AliasPro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request_identity::{RequestPurpose, RequestScope};
 
     #[test]
     fn concurrent_requests_increment_latest_sequence() {
+        reset_sessions_for_test();
         let session_id = "session-concurrent-sequence-test";
         let initial = record_session_request(Some(session_id), None, "codex", "gpt-5.6-sol", 1)
             .expect("initial session");
@@ -163,22 +221,50 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_request_does_not_change_session_affinity() {
-        let session_id = "session-affinity-auxiliary-request-test";
-        let initial = record_session_request(Some(session_id), None, "codex", "gpt-5.6-sol", 1)
-            .expect("initial session");
-        assert_eq!(initial.affinity_provider, Some(AliasProvider::Codex));
+    fn agent_lanes_keep_affinity_and_sequence_independent() {
+        reset_sessions_for_test();
+        let main = ConversationIdentity::Main("shared-session".to_string());
+        let first =
+            ConversationIdentity::Agent("shared-session".to_string(), "agent-one".to_string());
+        let second =
+            ConversationIdentity::Agent("shared-session".to_string(), "agent-two".to_string());
+        let first_state =
+            record_conversation_request(Some(&first), None, "codex", "gpt-5.6-sol", true, 1)
+                .unwrap();
+        let second_state =
+            record_conversation_request(Some(&second), None, "kimi", "kimi-for-coding", true, 2)
+                .unwrap();
+        let main_state =
+            record_conversation_request(Some(&main), None, "codex", "gpt-5.6-sol", true, 3)
+                .unwrap();
+        assert_eq!(first_state.seq, 1);
+        assert_eq!(second_state.seq, 1);
+        assert_eq!(main_state.seq, 1);
+        assert_eq!(first_state.affinity_provider, Some(AliasProvider::Codex));
+        assert_eq!(second_state.affinity_provider, Some(AliasProvider::Kimi));
+    }
 
-        let after_review = record_session_request_with_affinity_update(
-            Some(session_id),
-            Some(&initial),
-            "kimi",
-            "kimi-for-coding",
-            false,
-            2,
-        )
-        .expect("updated session");
-        assert_eq!(after_review.seq, 2);
-        assert_eq!(after_review.affinity_provider, Some(AliasProvider::Codex));
+    #[test]
+    fn auxiliary_request_does_not_mutate_session_state() {
+        reset_sessions_for_test();
+        let identity = ConversationIdentity::Main("session-auxiliary".to_string());
+        let initial =
+            record_conversation_request(Some(&identity), None, "codex", "gpt-5.6-sol", true, 1)
+                .unwrap();
+        for purpose in [
+            RequestPurpose::CountTokens,
+            RequestPurpose::AutoReview,
+            RequestPurpose::Auxiliary,
+        ] {
+            let scope = RequestScope::from_conversation_identity(Some(identity.clone()), purpose);
+            assert!(
+                record_scoped_request(&scope, Some(&initial), "kimi", "kimi-for-coding", true, 2,)
+                    .is_none()
+            );
+        }
+        let after = existing_conversation(Some(&identity), 3).unwrap();
+        assert_eq!(after.seq, 1);
+        assert_eq!(after.last_seen, 1);
+        assert_eq!(after.affinity_provider, Some(AliasProvider::Codex));
     }
 }

@@ -1,10 +1,15 @@
+use base64::Engine;
 use http::HeaderMap;
+use sha2::{Digest, Sha256};
 
 pub const CLAUDE_SESSION_HEADER: &str = "x-claude-code-session-id";
 pub const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
 pub const CLAUDE_PARENT_AGENT_HEADER: &str = "x-claude-code-parent-agent-id";
 
+const OPENAI_SESSION_HEADER: &str = "session_id";
+const OPENAI_REQUEST_HEADER: &str = "x-client-request-id";
 const MAX_IDENTITY_LEN: usize = 512;
+const OPAQUE_LANE_VERSION: &[u8] = b"ccp-opaque-lane-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConversationIdentity {
@@ -14,22 +19,229 @@ pub enum ConversationIdentity {
 
 impl ConversationIdentity {
     pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
+        RequestScope::from_headers(headers, RequestPurpose::Conversation)
+            .identity
+            .clone()
+    }
+
+    pub(crate) fn validated(&self) -> Option<Self> {
+        match self {
+            Self::Main(session) if valid_identity_text(session) => Some(self.clone()),
+            Self::Agent(session, agent)
+                if valid_identity_text(session) && valid_identity_text(agent) =>
+            {
+                Some(self.clone())
+            }
+            Self::Main(_) | Self::Agent(_, _) => None,
+        }
+    }
+
+    pub(crate) fn from_legacy_main(value: &str) -> Option<Self> {
+        valid_identity_text(value).then(|| Self::Main(trim_ows(value).to_string()))
+    }
+
+    pub(crate) fn session_component(&self) -> &str {
+        match self {
+            Self::Main(session) | Self::Agent(session, _) => session,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestPurpose {
+    Conversation,
+    CountTokens,
+    AutoReview,
+    Auxiliary,
+}
+
+impl RequestPurpose {
+    pub fn is_conversational(self) -> bool {
+        matches!(self, Self::Conversation)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestScope {
+    identity: Option<ConversationIdentity>,
+    parent_agent_id: Option<String>,
+    purpose: RequestPurpose,
+    claude_identity_headers_present: bool,
+}
+
+impl RequestScope {
+    /// Parses the complete Claude identity tuple exactly once.
+    pub fn from_headers(headers: &HeaderMap, purpose: RequestPurpose) -> Self {
+        let claude_identity_headers_present = [
+            CLAUDE_SESSION_HEADER,
+            CLAUDE_AGENT_HEADER,
+            CLAUDE_PARENT_AGENT_HEADER,
+        ]
+        .into_iter()
+        .any(|name| headers.get_all(name).iter().next().is_some());
         let session = read_identity_header(headers, CLAUDE_SESSION_HEADER);
         let agent = read_identity_header(headers, CLAUDE_AGENT_HEADER);
         let parent = read_identity_header(headers, CLAUDE_PARENT_AGENT_HEADER);
 
-        if session.is_invalid() || agent.is_invalid() || parent.is_invalid() {
-            return None;
-        }
+        let tuple_valid = !session.is_invalid() && !agent.is_invalid() && !parent.is_invalid();
+        let identity = tuple_valid
+            .then(|| match (session.value(), agent.value(), parent.value()) {
+                (Some(session_id), Some(agent_id), _) => Some(ConversationIdentity::Agent(
+                    session_id.to_string(),
+                    agent_id.to_string(),
+                )),
+                (Some(session_id), None, None) => {
+                    Some(ConversationIdentity::Main(session_id.to_string()))
+                }
+                _ => None,
+            })
+            .flatten();
+        let parent_agent_id = tuple_valid
+            .then(|| parent.value().map(str::to_string))
+            .flatten();
 
-        match (session.value(), agent.value(), parent.value()) {
-            (Some(session_id), Some(agent_id), _) => {
-                Some(Self::Agent(session_id.to_string(), agent_id.to_string()))
-            }
-            (Some(session_id), None, None) => Some(Self::Main(session_id.to_string())),
-            _ => None,
+        Self {
+            identity,
+            parent_agent_id,
+            purpose,
+            claude_identity_headers_present,
         }
     }
+
+    /// Parses native OpenAI identity without allowing malformed Claude headers
+    /// to fall through to a legacy identity.
+    pub fn from_openai_headers(headers: &HeaderMap, purpose: RequestPurpose) -> Self {
+        let claude = Self::from_headers(headers, purpose);
+        if claude.claude_identity_headers_present {
+            return claude;
+        }
+
+        let session = read_identity_header(headers, OPENAI_SESSION_HEADER);
+        let request = read_identity_header(headers, OPENAI_REQUEST_HEADER);
+        let identity = match session {
+            ParsedHeader::Valid(value) => Some(ConversationIdentity::Main(value.to_string())),
+            ParsedHeader::Invalid => None,
+            ParsedHeader::Missing => match request {
+                ParsedHeader::Valid(value) => Some(ConversationIdentity::Main(value.to_string())),
+                ParsedHeader::Missing | ParsedHeader::Invalid => None,
+            },
+        };
+        Self {
+            identity,
+            parent_agent_id: None,
+            purpose,
+            claude_identity_headers_present: false,
+        }
+    }
+
+    pub fn legacy(session_id: Option<&str>, purpose: RequestPurpose) -> Self {
+        Self {
+            identity: session_id.and_then(ConversationIdentity::from_legacy_main),
+            parent_agent_id: None,
+            purpose,
+            claude_identity_headers_present: false,
+        }
+    }
+
+    pub fn from_conversation_identity(
+        identity: Option<ConversationIdentity>,
+        purpose: RequestPurpose,
+    ) -> Self {
+        Self {
+            identity: identity.and_then(|identity| identity.validated()),
+            parent_agent_id: None,
+            purpose,
+            claude_identity_headers_present: false,
+        }
+    }
+
+    pub fn identity(&self) -> Option<&ConversationIdentity> {
+        self.identity.as_ref()
+    }
+
+    pub fn conversational_lane(&self) -> Option<&ConversationIdentity> {
+        self.purpose
+            .is_conversational()
+            .then_some(self.identity.as_ref())
+            .flatten()
+    }
+
+    pub fn purpose(&self) -> RequestPurpose {
+        self.purpose
+    }
+
+    pub(crate) fn with_purpose(mut self, purpose: RequestPurpose) -> Self {
+        self.purpose = purpose;
+        self
+    }
+
+    pub fn parent_agent_id(&self) -> Option<&str> {
+        self.parent_agent_id.as_deref()
+    }
+
+    pub fn claude_identity_headers_present(&self) -> bool {
+        self.claude_identity_headers_present
+    }
+
+    pub(crate) fn provider_lane(&self, domain: LaneDomain) -> Option<OpaqueLane> {
+        self.conversational_lane()
+            .map(|identity| OpaqueLane::derive(domain, identity))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LaneDomain {
+    CodexConversation,
+    CodexReadRewrite,
+    KimiPromptCache,
+    CursorToolBridge,
+}
+
+impl LaneDomain {
+    fn label(self) -> &'static [u8] {
+        match self {
+            Self::CodexConversation => b"codex-conversation",
+            Self::CodexReadRewrite => b"codex-read-rewrite",
+            Self::KimiPromptCache => b"kimi-prompt-cache",
+            Self::CursorToolBridge => b"cursor-tool-bridge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct OpaqueLane([u8; 32]);
+
+impl OpaqueLane {
+    fn derive(domain: LaneDomain, identity: &ConversationIdentity) -> Self {
+        let mut digest = Sha256::new();
+        update_length_prefixed(&mut digest, OPAQUE_LANE_VERSION);
+        update_length_prefixed(&mut digest, domain.label());
+        match identity {
+            ConversationIdentity::Main(session) => {
+                update_length_prefixed(&mut digest, b"main");
+                update_length_prefixed(&mut digest, session.as_bytes());
+            }
+            ConversationIdentity::Agent(session, agent) => {
+                update_length_prefixed(&mut digest, b"agent");
+                update_length_prefixed(&mut digest, session.as_bytes());
+                update_length_prefixed(&mut digest, agent.as_bytes());
+            }
+        }
+        Self(digest.finalize().into())
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub(crate) fn encode(&self) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0)
+    }
+}
+
+fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
 }
 
 #[derive(Debug)]
@@ -64,16 +276,27 @@ fn read_identity_header<'a>(headers: &'a HeaderMap, name: &str) -> ParsedHeader<
     let Ok(value) = value.to_str() else {
         return ParsedHeader::Invalid;
     };
-    let value = value.trim_matches(|character| matches!(character, ' ' | '\t'));
-    if value.is_empty()
-        || value.len() > MAX_IDENTITY_LEN
-        || value.contains(',')
-        || !value.bytes().all(|byte| byte.is_ascii_graphic())
-    {
+    let value = trim_ows(value);
+    if !valid_trimmed_identity_text(value) {
         return ParsedHeader::Invalid;
     }
 
     ParsedHeader::Valid(value)
+}
+
+fn trim_ows(value: &str) -> &str {
+    value.trim_matches(|character| matches!(character, ' ' | '\t'))
+}
+
+fn valid_identity_text(value: &str) -> bool {
+    valid_trimmed_identity_text(trim_ows(value))
+}
+
+fn valid_trimmed_identity_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_IDENTITY_LEN
+        && !value.contains(',')
+        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
 #[cfg(test)]
@@ -93,177 +316,90 @@ mod tests {
     }
 
     #[test]
-    fn parses_main_agent_and_lineage_shapes() {
-        let cases = [
-            (
-                "main",
-                vec![(CLAUDE_SESSION_HEADER, "session-a")],
-                Some(ConversationIdentity::Main("session-a".to_string())),
-            ),
-            (
-                "direct agent without parent",
-                vec![
-                    (CLAUDE_SESSION_HEADER, "session-a"),
-                    (CLAUDE_AGENT_HEADER, "agent-a"),
-                ],
-                Some(ConversationIdentity::Agent(
-                    "session-a".to_string(),
-                    "agent-a".to_string(),
-                )),
-            ),
-            (
-                "nested direct child",
-                vec![
-                    (CLAUDE_SESSION_HEADER, "session-a"),
-                    (CLAUDE_AGENT_HEADER, "agent-child"),
-                    (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
-                ],
-                Some(ConversationIdentity::Agent(
-                    "session-a".to_string(),
-                    "agent-child".to_string(),
-                )),
-            ),
-            (
-                "sibling one",
-                vec![
-                    (CLAUDE_SESSION_HEADER, "session-a"),
-                    (CLAUDE_AGENT_HEADER, "agent-sibling-one"),
-                    (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
-                ],
-                Some(ConversationIdentity::Agent(
-                    "session-a".to_string(),
-                    "agent-sibling-one".to_string(),
-                )),
-            ),
-            (
-                "sibling two",
-                vec![
-                    (CLAUDE_SESSION_HEADER, "session-a"),
-                    (CLAUDE_AGENT_HEADER, "agent-sibling-two"),
-                    (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
-                ],
-                Some(ConversationIdentity::Agent(
-                    "session-a".to_string(),
-                    "agent-sibling-two".to_string(),
-                )),
-            ),
-            (
-                "same agent in another session",
-                vec![
-                    (CLAUDE_SESSION_HEADER, "session-b"),
-                    (CLAUDE_AGENT_HEADER, "agent-a"),
-                ],
-                Some(ConversationIdentity::Agent(
-                    "session-b".to_string(),
-                    "agent-a".to_string(),
-                )),
-            ),
-            (
-                "outer space and tab",
-                vec![
-                    (CLAUDE_SESSION_HEADER, " \tsession-a\t "),
-                    (CLAUDE_AGENT_HEADER, "\tagent-a "),
-                    (CLAUDE_PARENT_AGENT_HEADER, " agent-parent\t"),
-                ],
-                Some(ConversationIdentity::Agent(
-                    "session-a".to_string(),
-                    "agent-a".to_string(),
-                )),
-            ),
-        ];
+    fn main_and_agent_lanes_are_distinct() {
+        let main = RequestScope::from_headers(
+            &headers(&[(CLAUDE_SESSION_HEADER, "session-a")]),
+            RequestPurpose::Conversation,
+        );
+        let agent = RequestScope::from_headers(
+            &headers(&[
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_AGENT_HEADER, "agent-a"),
+            ]),
+            RequestPurpose::Conversation,
+        );
+        let sibling = RequestScope::from_headers(
+            &headers(&[
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_AGENT_HEADER, "agent-b"),
+            ]),
+            RequestPurpose::Conversation,
+        );
+        assert_ne!(main.conversational_lane(), agent.conversational_lane());
+        assert_ne!(agent.conversational_lane(), sibling.conversational_lane());
+    }
 
-        for (name, values, expected) in cases {
-            assert_eq!(
-                ConversationIdentity::from_headers(&headers(&values)),
-                expected,
-                "{name}"
+    #[test]
+    fn nested_agent_uses_child_as_lane_and_parent_as_lineage() {
+        let scope = RequestScope::from_headers(
+            &headers(&[
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_AGENT_HEADER, "agent-child"),
+                (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+            ]),
+            RequestPurpose::Conversation,
+        );
+        assert_eq!(
+            scope.identity(),
+            Some(&ConversationIdentity::Agent(
+                "session-a".to_string(),
+                "agent-child".to_string()
+            ))
+        );
+        assert_eq!(scope.parent_agent_id(), Some("agent-parent"));
+    }
+
+    #[test]
+    fn empty_identity_is_stateless() {
+        let scope = RequestScope::from_headers(&HeaderMap::new(), RequestPurpose::Conversation);
+        assert!(scope.conversational_lane().is_none());
+        assert!(!scope.claude_identity_headers_present());
+    }
+
+    #[test]
+    fn ambiguous_identity_tuples_are_stateless() {
+        for values in [
+            vec![(CLAUDE_AGENT_HEADER, "agent-a")],
+            vec![(CLAUDE_PARENT_AGENT_HEADER, "agent-parent")],
+            vec![
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+            ],
+            vec![
+                (CLAUDE_AGENT_HEADER, "agent-a"),
+                (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+            ],
+        ] {
+            assert!(
+                RequestScope::from_headers(&headers(&values), RequestPurpose::Conversation)
+                    .conversational_lane()
+                    .is_none()
             );
         }
     }
 
     #[test]
-    fn parent_is_validation_only_and_never_changes_the_owner() {
-        let direct = ConversationIdentity::from_headers(&headers(&[
-            (CLAUDE_SESSION_HEADER, "session-a"),
-            (CLAUDE_AGENT_HEADER, "agent-child"),
-        ]));
-        let nested = ConversationIdentity::from_headers(&headers(&[
-            (CLAUDE_SESSION_HEADER, "session-a"),
-            (CLAUDE_AGENT_HEADER, "agent-child"),
-            (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
-        ]));
-        let reparented = ConversationIdentity::from_headers(&headers(&[
-            (CLAUDE_SESSION_HEADER, "session-a"),
-            (CLAUDE_AGENT_HEADER, "agent-child"),
-            (CLAUDE_PARENT_AGENT_HEADER, "another-parent"),
-        ]));
-
-        assert_eq!(direct, nested);
-        assert_eq!(nested, reparented);
-    }
-
-    #[test]
-    fn ambiguous_or_absent_tuples_are_stateless() {
-        let cases = [
-            ("all missing", vec![]),
-            (
-                "agent without session",
-                vec![(CLAUDE_AGENT_HEADER, "agent-a")],
-            ),
-            (
-                "parent without direct agent",
-                vec![
-                    (CLAUDE_SESSION_HEADER, "session-a"),
-                    (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
-                ],
-            ),
-            (
-                "parent alone",
-                vec![(CLAUDE_PARENT_AGENT_HEADER, "agent-parent")],
-            ),
-            (
-                "agent and parent without session",
-                vec![
-                    (CLAUDE_AGENT_HEADER, "agent-a"),
-                    (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
-                ],
-            ),
-        ];
-
-        for (name, values) in cases {
-            assert_eq!(
-                ConversationIdentity::from_headers(&headers(&values)),
-                None,
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_malformed_text_in_every_identity_field() {
-        let malformed = [
-            ("empty", ""),
-            ("spaces only", "   "),
-            ("tabs only", "\t\t"),
-            ("internal space", "two values"),
-            ("internal tab", "two\tvalues"),
-            ("leading comma", ",value"),
-            ("trailing comma", "value,"),
-            ("coalesced", "first, second"),
-            ("oversize", "oversize-placeholder"),
-        ];
-
+    fn malformed_identity_headers_are_stateless() {
+        let malformed = ["", "   ", "two values", "two\tvalues"];
+        // http::HeaderValue rejects DEL before ingress; keep the validator
+        // characterization explicit for legacy string adapters.
+        assert!(!valid_identity_text("x\u{7f}"));
         for field in [
             CLAUDE_SESSION_HEADER,
             CLAUDE_AGENT_HEADER,
             CLAUDE_PARENT_AGENT_HEADER,
         ] {
-            for (shape, placeholder) in malformed {
-                let value = if shape == "oversize" {
-                    "x".repeat(MAX_IDENTITY_LEN + 1)
-                } else {
-                    placeholder.to_string()
-                };
+            for value in malformed {
                 let mut values = vec![
                     (CLAUDE_SESSION_HEADER, "session-a"),
                     (CLAUDE_AGENT_HEADER, "agent-a"),
@@ -273,18 +409,19 @@ mod tests {
                     .iter_mut()
                     .find(|(name, _)| *name == field)
                     .unwrap()
-                    .1 = &value;
-                assert_eq!(
-                    ConversationIdentity::from_headers(&headers(&values)),
-                    None,
-                    "field={field} shape={shape}"
+                    .1 = value;
+                assert!(
+                    RequestScope::from_headers(&headers(&values), RequestPurpose::Conversation)
+                        .conversational_lane()
+                        .is_none(),
+                    "field={field} value={value:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn rejects_duplicate_headers_in_every_identity_field() {
+    fn comma_in_identity_header_is_rejected() {
         for field in [
             CLAUDE_SESSION_HEADER,
             CLAUDE_AGENT_HEADER,
@@ -295,17 +432,21 @@ mod tests {
                 (CLAUDE_AGENT_HEADER, "agent-a"),
                 (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
             ];
-            values.push((field, "duplicate"));
-            assert_eq!(
-                ConversationIdentity::from_headers(&headers(&values)),
-                None,
-                "field={field}"
+            values
+                .iter_mut()
+                .find(|(name, _)| *name == field)
+                .unwrap()
+                .1 = "a,b";
+            assert!(
+                RequestScope::from_headers(&headers(&values), RequestPurpose::Conversation)
+                    .conversational_lane()
+                    .is_none()
             );
         }
     }
 
     #[test]
-    fn rejects_nontext_headers_in_every_identity_field() {
+    fn duplicate_identity_headers_fall_back_to_stateless() {
         for field in [
             CLAUDE_SESSION_HEADER,
             CLAUDE_AGENT_HEADER,
@@ -316,23 +457,123 @@ mod tests {
                 (CLAUDE_AGENT_HEADER, "agent-a"),
                 (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
             ]);
-            values.insert(field, HeaderValue::from_bytes(&[0x80]).unwrap());
-            assert_eq!(
-                ConversationIdentity::from_headers(&values),
-                None,
-                "field={field}"
+            values.append(field, HeaderValue::from_static("duplicate"));
+            assert!(
+                RequestScope::from_headers(&values, RequestPurpose::Conversation)
+                    .conversational_lane()
+                    .is_none()
             );
         }
     }
 
     #[test]
-    fn malformed_agent_cannot_downgrade_a_valid_session_to_main() {
-        for malformed_agent in ["", "agent one", "agent-a,agent-b"] {
-            let identity = ConversationIdentity::from_headers(&headers(&[
+    fn opaque_tokens_are_stable_and_domain_separated() {
+        let scope = RequestScope::from_headers(
+            &headers(&[
                 (CLAUDE_SESSION_HEADER, "session-a"),
-                (CLAUDE_AGENT_HEADER, malformed_agent),
-            ]));
-            assert_eq!(identity, None, "agent={malformed_agent:?}");
+                (CLAUDE_AGENT_HEADER, "agent-a"),
+            ]),
+            RequestPurpose::Conversation,
+        );
+        let codex = scope.provider_lane(LaneDomain::CodexConversation).unwrap();
+        assert_eq!(
+            codex,
+            scope.provider_lane(LaneDomain::CodexConversation).unwrap()
+        );
+        assert_ne!(
+            codex,
+            scope.provider_lane(LaneDomain::KimiPromptCache).unwrap()
+        );
+        assert!(!codex.encode().contains("session-a"));
+        assert!(!codex.encode().contains("agent-a"));
+    }
+
+    #[test]
+    fn auxiliary_scope_has_no_conversational_lane() {
+        for purpose in [
+            RequestPurpose::CountTokens,
+            RequestPurpose::AutoReview,
+            RequestPurpose::Auxiliary,
+        ] {
+            let scope = RequestScope::from_headers(
+                &headers(&[(CLAUDE_SESSION_HEADER, "session-a")]),
+                purpose,
+            );
+            assert!(scope.identity().is_some());
+            assert!(scope.conversational_lane().is_none());
+            assert!(scope.provider_lane(LaneDomain::CodexConversation).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_agent_never_downgrades_to_main_and_fallback_is_suppressed() {
+        let scope = RequestScope::from_openai_headers(
+            &headers(&[
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_AGENT_HEADER, "malformed agent"),
+                (OPENAI_SESSION_HEADER, "legacy-session"),
+            ]),
+            RequestPurpose::Conversation,
+        );
+        assert!(scope.identity().is_none());
+        assert!(scope.claude_identity_headers_present());
+    }
+
+    #[test]
+    fn openai_fallback_uses_the_same_strict_validation() {
+        let valid = RequestScope::from_openai_headers(
+            &headers(&[(OPENAI_SESSION_HEADER, " \tlegacy-session\t ")]),
+            RequestPurpose::Conversation,
+        );
+        assert_eq!(
+            valid.identity(),
+            Some(&ConversationIdentity::Main("legacy-session".to_string()))
+        );
+        let invalid = RequestScope::from_openai_headers(
+            &headers(&[
+                (OPENAI_SESSION_HEADER, "bad session"),
+                (OPENAI_REQUEST_HEADER, "valid-fallback"),
+            ]),
+            RequestPurpose::Conversation,
+        );
+        assert!(invalid.identity().is_none());
+    }
+
+    #[test]
+    fn nontext_and_oversized_fields_invalidate_the_tuple() {
+        for field in [
+            CLAUDE_SESSION_HEADER,
+            CLAUDE_AGENT_HEADER,
+            CLAUDE_PARENT_AGENT_HEADER,
+        ] {
+            let mut nontext = headers(&[
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_AGENT_HEADER, "agent-a"),
+                (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+            ]);
+            nontext.insert(field, HeaderValue::from_bytes(&[0x80]).unwrap());
+            assert!(
+                RequestScope::from_headers(&nontext, RequestPurpose::Conversation)
+                    .identity()
+                    .is_none()
+            );
+
+            let oversized = "x".repeat(MAX_IDENTITY_LEN + 1);
+            let mut values = vec![
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_AGENT_HEADER, "agent-a"),
+                (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+            ];
+            values
+                .iter_mut()
+                .find(|(name, _)| *name == field)
+                .unwrap()
+                .1 = &oversized;
+            assert!(
+                RequestScope::from_headers(&headers(&values), RequestPurpose::Conversation)
+                    .identity()
+                    .is_none()
+            );
         }
     }
 }
