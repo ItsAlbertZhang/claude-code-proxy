@@ -30,6 +30,7 @@ use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::registry;
+use crate::request_identity::ConversationIdentity;
 use crate::retry::{compute_backoff_delay, sleep};
 
 use self::auth::browser_login::run_browser_login;
@@ -42,7 +43,8 @@ use self::compaction::{
     request_compaction, store_compaction_for_request,
 };
 use self::continuation::{
-    ContinuationCandidate, abort_continuation, continuation_candidate, record_continuation,
+    ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
+    record_continuation_for_owner,
 };
 use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
@@ -87,30 +89,13 @@ impl CodexProvider {
     }
 }
 
-#[async_trait]
-impl Provider for CodexProvider {
-    fn name(&self) -> &'static str {
-        "codex"
-    }
-
-    fn supported_models(&self) -> Vec<String> {
-        let mut models: Vec<String> = registry::CODEX_MODELS
-            .iter()
-            .map(|m| m.to_string())
-            .collect();
-        for m in registry::CODEX_MODELS {
-            models.push(format!("{m}-fast"));
-        }
-        models.sort_unstable();
-        models.dedup();
-        models
-    }
-
-    fn cli(&self) -> &'static dyn CliHandlers {
-        &CODEX_CLI
-    }
-
-    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+impl CodexProvider {
+    async fn handle_messages_inner(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
@@ -290,12 +275,11 @@ impl Provider for CodexProvider {
 
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
-        let continuation = continuation_candidate(
-            ctx.session_id.as_deref(),
+        let continuation = continuation_candidate_for_owner(
+            conversation_identity.as_ref(),
             &translated,
             previous_response_id_enabled,
         );
-        let turn_id = continuation.turn_id;
 
         // Post to upstream with continuation
         let client = self.client.clone();
@@ -316,11 +300,12 @@ impl Provider for CodexProvider {
             .await;
         }
 
+        let request_continuation = continuation.clone();
         let mut continuation = Some(continuation);
         let mut attempt = 0_u32;
         let upstream = loop {
             let response = match client
-                .post_codex(&translated, &ctx, continuation.as_ref())
+                .post_codex_for_owner(&translated, &ctx, continuation.as_ref())
                 .await
             {
                 Ok(r) => r,
@@ -330,7 +315,7 @@ impl Provider for CodexProvider {
                         compact_boundary,
                         &translated,
                     );
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation_for_owner(&request_continuation);
                     return map_codex_error_to_response(&e);
                 }
             };
@@ -343,13 +328,13 @@ impl Provider for CodexProvider {
             drop_live_continuation_for_retry(&mut continuation);
             if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
                 abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
             let delay = compute_backoff_delay(attempt, None);
             if delay.exceeds_budget {
                 abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
             attempt += 1;
@@ -372,7 +357,7 @@ impl Provider for CodexProvider {
                         compact_boundary,
                         &translated,
                     );
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation_for_owner(&request_continuation);
                     return map_codex_failure_to_response(&format!(
                         "Stream translation error: {e}"
                     ));
@@ -390,9 +375,10 @@ impl Provider for CodexProvider {
             }
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
-                turn_id,
+                &request_continuation,
                 &translated,
                 &upstream.body,
+                upstream.socket_id,
                 compact_boundary,
             );
 
@@ -420,9 +406,10 @@ impl Provider for CodexProvider {
                     }
                     update_continuation_from_upstream(
                         ctx.session_id.as_deref(),
-                        turn_id,
+                        &request_continuation,
                         &translated,
                         &upstream.body,
+                        upstream.socket_id,
                         compact_boundary,
                     );
                     (StatusCode::OK, Json(json)).into_response()
@@ -433,11 +420,49 @@ impl Provider for CodexProvider {
                         compact_boundary,
                         &translated,
                     );
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation_for_owner(&request_continuation);
                     map_codex_failure_to_response(&format!("Accumulation error: {e}"))
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl Provider for CodexProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        let mut models: Vec<String> = registry::CODEX_MODELS
+            .iter()
+            .map(|m| m.to_string())
+            .collect();
+        for m in registry::CODEX_MODELS {
+            models.push(format!("{m}-fast"));
+        }
+        models.sort_unstable();
+        models.dedup();
+        models
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &CODEX_CLI
+    }
+
+    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        self.handle_messages_inner(body, ctx, None).await
+    }
+
+    async fn handle_messages_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Response {
+        self.handle_messages_inner(body, ctx, conversation_identity)
+            .await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -533,17 +558,69 @@ fn log_compaction_event(
 
 fn abort_request_state(
     session_id: Option<&str>,
-    turn_id: Option<u64>,
+    continuation: &ContinuationReservation,
     compact_boundary: bool,
     request: &translate::request::ResponsesRequest,
 ) {
     abort_compaction_attempt(session_id, compact_boundary, request);
-    abort_continuation(session_id, turn_id);
+    abort_continuation_for_owner(continuation);
+}
+
+struct LiveRequestStateCleanup {
+    continuation: ContinuationReservation,
+    session_id: Option<String>,
+    compact_boundary: bool,
+    request: translate::request::ResponsesRequest,
+    armed: bool,
+}
+
+impl LiveRequestStateCleanup {
+    fn new(
+        continuation: ContinuationReservation,
+        session_id: Option<String>,
+        compact_boundary: bool,
+        request: translate::request::ResponsesRequest,
+    ) -> Self {
+        Self {
+            continuation,
+            session_id,
+            compact_boundary,
+            request,
+            armed: true,
+        }
+    }
+
+    fn abort(&mut self) {
+        if self.armed {
+            abort_request_state(
+                self.session_id.as_deref(),
+                &self.continuation,
+                self.compact_boundary,
+                &self.request,
+            );
+            self.armed = false;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LiveRequestStateCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            abort_continuation_for_owner(&self.continuation);
+        }
+    }
 }
 
 enum LiveStreamStart {
     Response(Response),
-    Retry { error: client::CodexError },
+    Retry {
+        error: client::CodexError,
+        full_context_retry_attempted: bool,
+    },
 }
 
 async fn live_stream_response(
@@ -552,17 +629,23 @@ async fn live_stream_response(
     model: &str,
     ctx: RequestContext,
     request_body: translate::request::ResponsesRequest,
-    continuation: ContinuationCandidate,
+    continuation: ContinuationReservation,
     compact_boundary: bool,
 ) -> Response {
     let model = model.to_string();
-    let turn_id = continuation.turn_id;
+    let request_continuation = continuation.clone();
+    let mut cleanup = LiveRequestStateCleanup::new(
+        request_continuation.clone(),
+        ctx.session_id.clone(),
+        compact_boundary,
+        request_body.clone(),
+    );
     let mut attempt = 0_u32;
     let mut continuation = Some(continuation);
 
     loop {
         let upstream_events = match client
-            .stream_codex_websocket_events(&request_body, &ctx, continuation.as_ref())
+            .stream_codex_websocket_events_for_owner(&request_body, &ctx, continuation.as_ref())
             .await
         {
             Ok(events) => events,
@@ -573,22 +656,12 @@ async fn live_stream_response(
                     continue;
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    abort_request_state(
-                        ctx.session_id.as_deref(),
-                        turn_id,
-                        compact_boundary,
-                        &request_body,
-                    );
+                    cleanup.abort();
                     return map_codex_error_to_response(&err);
                 }
                 let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
                 if delay.exceeds_budget {
-                    abort_request_state(
-                        ctx.session_id.as_deref(),
-                        turn_id,
-                        compact_boundary,
-                        &request_body,
-                    );
+                    cleanup.abort();
                     return map_codex_error_to_response(&err);
                 }
                 attempt += 1;
@@ -596,12 +669,7 @@ async fn live_stream_response(
                 continue;
             }
             Err(err) => {
-                abort_request_state(
-                    ctx.session_id.as_deref(),
-                    turn_id,
-                    compact_boundary,
-                    &request_body,
-                );
+                cleanup.abort();
                 return map_codex_error_to_response(&err);
             }
         };
@@ -611,36 +679,36 @@ async fn live_stream_response(
             message_id.clone(),
             &model,
             ctx.clone(),
-            turn_id,
+            request_continuation.clone(),
             request_body.clone(),
             compact_boundary,
         )
         .await
         {
-            LiveStreamStart::Response(response) => return response,
-            LiveStreamStart::Retry { error } => {
+            LiveStreamStart::Response(response) => {
+                cleanup.disarm();
+                return response;
+            }
+            LiveStreamStart::Retry {
+                error,
+                full_context_retry_attempted,
+            } => {
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
+                if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
+                    cleanup.abort();
+                    return map_codex_error_to_response(&error);
+                }
                 if dropped && is_missing_previous_response_error(&error) {
                     attempt += 1;
                     continue;
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    abort_request_state(
-                        ctx.session_id.as_deref(),
-                        turn_id,
-                        compact_boundary,
-                        &request_body,
-                    );
+                    cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
-                    abort_request_state(
-                        ctx.session_id.as_deref(),
-                        turn_id,
-                        compact_boundary,
-                        &request_body,
-                    );
+                    cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
                 attempt += 1;
@@ -650,12 +718,25 @@ async fn live_stream_response(
     }
 }
 
+fn provider_retry(
+    upstream_events: &websocket::CodexWebSocketEventStream,
+    error: client::CodexError,
+) -> LiveStreamStart {
+    let full_context_retry_attempted = upstream_events.used_full_context_retry();
+    upstream_events.mark_provider_retry_handoff();
+    LiveStreamStart::Retry {
+        error,
+        full_context_retry_attempted,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn live_stream_response_once(
-    mut upstream_events: websocket::CodexWebSocketEventReceiver,
+    mut upstream_events: websocket::CodexWebSocketEventStream,
     message_id: String,
     model: &str,
     ctx: RequestContext,
-    turn_id: Option<u64>,
+    request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compact_boundary: bool,
 ) -> LiveStreamStart {
@@ -676,11 +757,11 @@ async fn live_stream_response_once(
             Ok(payload) => payload,
             Err(err) => {
                 if retryable_live_start_codex_error(&err) {
-                    return LiveStreamStart::Retry { error: err };
+                    return provider_retry(&upstream_events, err);
                 }
                 abort_request_state(
                     ctx.session_id.as_deref(),
-                    turn_id,
+                    &request_continuation,
                     compact_boundary,
                     &request_body,
                 );
@@ -721,19 +802,20 @@ async fn live_stream_response_once(
                             503
                         }
                     });
-                    return LiveStreamStart::Retry {
-                        error: client::CodexError {
+                    return provider_retry(
+                        &upstream_events,
+                        client::CodexError {
                             status,
                             message: message.clone(),
                             detail: Some(message),
                             retry_after: retry_after_from_live_payload(&payload),
                             origin: client::CodexErrorOrigin::WebSocket,
                         },
-                    };
+                    );
                 }
                 abort_request_state(
                     ctx.session_id.as_deref(),
-                    turn_id,
+                    &request_continuation,
                     compact_boundary,
                     &request_body,
                 );
@@ -745,9 +827,7 @@ async fn live_stream_response_once(
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
         {
-            return LiveStreamStart::Retry {
-                error: empty_live_completion_error(),
-            };
+            return provider_retry(&upstream_events, empty_live_completion_error());
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
@@ -755,9 +835,10 @@ async fn live_stream_response_once(
             if terminal {
                 update_continuation_from_upstream(
                     ctx.session_id.as_deref(),
-                    turn_id,
+                    &request_continuation,
                     &request_body,
                     &upstream_sse_body,
+                    upstream_events.socket_id(),
                     compact_boundary,
                 );
                 return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
@@ -767,7 +848,7 @@ async fn live_stream_response_once(
                 translator,
                 pending_chunk,
                 ctx,
-                turn_id,
+                request_continuation,
                 request_body,
                 upstream_sse_body,
                 compact_boundary,
@@ -776,9 +857,10 @@ async fn live_stream_response_once(
         if terminal {
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
-                turn_id,
+                &request_continuation,
                 &request_body,
                 &upstream_sse_body,
+                upstream_events.socket_id(),
                 compact_boundary,
             );
             if pending_chunk.is_empty() {
@@ -790,15 +872,16 @@ async fn live_stream_response_once(
         }
     }
 
-    LiveStreamStart::Retry {
-        error: client::CodexError {
+    provider_retry(
+        &upstream_events,
+        client::CodexError {
             status: 0,
             message: "WebSocket connection closed before terminal Codex response event".to_string(),
             detail: Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
             retry_after: None,
             origin: client::CodexErrorOrigin::WebSocket,
         },
-    }
+    )
 }
 
 fn empty_live_completion_error() -> client::CodexError {
@@ -871,11 +954,11 @@ fn empty_live_stream_response() -> Response {
 
 #[allow(clippy::too_many_arguments)]
 fn remaining_live_stream_response(
-    mut upstream_events: websocket::CodexWebSocketEventReceiver,
+    mut upstream_events: websocket::CodexWebSocketEventStream,
     mut translator: LiveStreamTranslator,
     first_chunk: Vec<u8>,
     ctx: RequestContext,
-    turn_id: Option<u64>,
+    request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
     compact_boundary: bool,
@@ -885,13 +968,29 @@ fn remaining_live_stream_response(
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
                 ctx.session_id.as_deref(),
-                turn_id,
+                &request_continuation,
                 compact_boundary,
                 &request_body,
             );
             return;
         }
-        while let Some(item) = upstream_events.recv().await {
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = tx.closed() => {
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        &request_continuation,
+                        compact_boundary,
+                        &request_body,
+                    );
+                    return;
+                }
+                item = upstream_events.recv() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item {
                 Ok(payload) => {
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
@@ -904,7 +1003,7 @@ fn remaining_live_stream_response(
                         Err(message) => {
                             abort_request_state(
                                 ctx.session_id.as_deref(),
-                                turn_id,
+                                &request_continuation,
                                 compact_boundary,
                                 &request_body,
                             );
@@ -925,7 +1024,7 @@ fn remaining_live_stream_response(
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
                                 ctx.session_id.as_deref(),
-                                turn_id,
+                                &request_continuation,
                                 compact_boundary,
                                 &request_body,
                             );
@@ -935,9 +1034,10 @@ fn remaining_live_stream_response(
                     if terminal {
                         update_continuation_from_upstream(
                             ctx.session_id.as_deref(),
-                            turn_id,
+                            &request_continuation,
                             &request_body,
                             &upstream_sse_body,
+                            upstream_events.socket_id(),
                             compact_boundary,
                         );
                         return;
@@ -946,7 +1046,7 @@ fn remaining_live_stream_response(
                 Err(err) => {
                     abort_request_state(
                         ctx.session_id.as_deref(),
-                        turn_id,
+                        &request_continuation,
                         compact_boundary,
                         &request_body,
                     );
@@ -974,7 +1074,7 @@ fn remaining_live_stream_response(
 
         abort_request_state(
             ctx.session_id.as_deref(),
-            turn_id,
+            &request_continuation,
             compact_boundary,
             &request_body,
         );
@@ -1093,22 +1193,24 @@ fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
 }
 
 fn is_missing_previous_response_error(err: &client::CodexError) -> bool {
-    err.detail.as_deref() == Some("previous_response_not_found")
+    matches!(
+        err.detail.as_deref(),
+        Some("previous_response_not_found")
+            | Some(websocket::WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL)
+    )
 }
 
-fn drop_live_continuation_for_retry(continuation: &mut Option<ContinuationCandidate>) -> bool {
+fn drop_live_continuation_for_retry(continuation: &mut Option<ContinuationReservation>) -> bool {
     if continuation
         .as_ref()
-        .and_then(|candidate| candidate.previous_response_id.as_deref())
+        .and_then(|reservation| reservation.candidate().previous_response_id.as_deref())
         .is_none()
     {
         return false;
     }
 
-    if let Some(candidate) = continuation.as_mut() {
-        candidate.previous_response_id = None;
-        candidate.input_delta = None;
-        candidate.disabled_reason = Some("full_context_retry".to_string());
+    if let Some(reservation) = continuation.as_ref() {
+        *continuation = Some(reservation.full_context_retry());
     }
     true
 }
@@ -1150,11 +1252,13 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_continuation_from_upstream(
     session_id: Option<&str>,
-    turn_id: Option<u64>,
+    continuation: &ContinuationReservation,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
+    socket_id: Option<u64>,
     compact_boundary: bool,
 ) {
     match finish_metadata_from_upstream(upstream_body) {
@@ -1162,17 +1266,17 @@ fn update_continuation_from_upstream(
             if compact_boundary {
                 activate_compaction_for_request(session_id, request_body, &finish.output_items);
             }
-            record_continuation(
-                session_id,
-                turn_id,
+            record_continuation_for_owner(
+                continuation,
                 request_body,
                 finish.response_id.as_deref(),
+                socket_id,
                 &finish.output_items,
             );
         }
         _ => {
             abort_compaction_attempt(session_id, compact_boundary, request_body);
-            abort_continuation(session_id, turn_id);
+            abort_continuation_for_owner(continuation);
         }
     }
 }
@@ -1359,7 +1463,93 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
 
 #[cfg(test)]
 mod tests {
+    use futures_util::{SinkExt, StreamExt};
+    use http_body_util::BodyExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::tungstenite::Message;
+
     use super::*;
+
+    fn live_test_request(text: &str) -> translate::request::ResponsesRequest {
+        translate::request::ResponsesRequest {
+            model: "gpt-5.6-sol".to_string(),
+            instructions: None,
+            input: vec![translate::request::ResponsesInputItem::Message {
+                role: "user".to_string(),
+                content: vec![translate::request::ResponsesContentPart::InputText {
+                    text: text.to_string(),
+                }],
+            }],
+            tools: None,
+            tool_choice: None,
+            store: false,
+            stream: true,
+            parallel_tool_calls: true,
+            include: None,
+            client_metadata: None,
+            service_tier: None,
+            prompt_cache_key: None,
+            text: translate::request::ResponsesText {
+                verbosity: None,
+                format: None,
+            },
+            reasoning: None,
+        }
+    }
+
+    fn live_test_context(session_id: &str) -> RequestContext {
+        RequestContext {
+            req_id: format!("request-{session_id}"),
+            session_id: Some(session_id.to_string()),
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    fn authenticated_live_test_client(base_url: String) -> Arc<CodexHttpClient> {
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url,
+            1_000,
+            1_000,
+            0,
+        );
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "test".to_string(),
+                refresh: String::new(),
+                expires: u64::MAX,
+                account_id: Some("acct".to_string()),
+            });
+        Arc::new(client)
+    }
+
+    async fn next_live_websocket_request(
+        websocket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    ) -> serde_json::Value {
+        loop {
+            match websocket.next().await {
+                Some(Ok(Message::Ping(payload))) => {
+                    websocket.send(Message::Pong(payload)).await.unwrap();
+                }
+                Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).unwrap(),
+                other => panic!("unexpected WebSocket request frame: {other:?}"),
+            }
+        }
+    }
+
+    async fn emit_live_event(
+        websocket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+        event: &serde_json::Value,
+    ) {
+        websocket
+            .send(Message::Text(event.to_string()))
+            .await
+            .unwrap();
+    }
 
     fn upstream_sse(events: &[serde_json::Value]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1710,5 +1900,363 @@ mod tests {
             }),
             "bad request",
         ));
+    }
+
+    async fn run_live_failure_case(
+        session_id: &str,
+        event: serde_json::Value,
+        expected_attempts: usize,
+    ) -> StatusCode {
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = live_test_request("one");
+        let continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..expected_attempts {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let _ = next_live_websocket_request(&mut websocket).await;
+                emit_live_event(&mut websocket, &event).await;
+                drop(websocket);
+            }
+        });
+        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            live_stream_response(
+                client,
+                "message".to_string(),
+                &request.model,
+                live_test_context(session_id),
+                request.clone(),
+                continuation.clone(),
+                false,
+            ),
+        )
+        .await
+        .expect("live failure case timed out");
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("live failure server timed out")
+            .expect("live failure server failed");
+
+        assert!(!continuation::is_current_turn_for_owner(&continuation));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        response.status()
+    }
+
+    #[tokio::test]
+    async fn dropping_live_stream_during_retry_backoff_aborts_request_state() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let session_id = "live-retry-backoff-cleanup";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = live_test_request("one");
+        let continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (event_sent_tx, event_sent_rx) = tokio::sync::oneshot::channel();
+        let (socket_closed_tx, socket_closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_live_websocket_request(&mut websocket).await;
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {"allowed": false, "limit_reached": true}
+                }),
+            )
+            .await;
+            event_sent_tx.send(()).unwrap();
+            drop(websocket);
+            socket_closed_tx.send(()).unwrap();
+        });
+        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let task_request = request.clone();
+        let task_continuation = continuation.clone();
+        let response_task = tokio::spawn(async move {
+            let model = task_request.model.clone();
+            live_stream_response(
+                client,
+                "message".to_string(),
+                &model,
+                live_test_context(session_id),
+                task_request,
+                task_continuation,
+                false,
+            )
+            .await
+        });
+
+        event_sent_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), socket_closed_rx)
+            .await
+            .expect("retry handoff did not close the abandoned attempt socket")
+            .expect("retry handoff socket-close sender dropped");
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !response_task.is_finished(),
+            "logical request must still be waiting in retry backoff"
+        );
+        response_task.abort();
+        assert!(response_task.await.unwrap_err().is_cancelled());
+
+        assert!(!continuation::is_current_turn_for_owner(&continuation));
+        server.await.unwrap();
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    #[tokio::test]
+    async fn dropping_live_response_body_after_first_chunk_aborts_request_state() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let session_id = "live-response-body-drop-cleanup";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = live_test_request("one");
+        let continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (socket_closed_tx, socket_closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_live_websocket_request(&mut websocket).await;
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "message", "id": "msg-partial"}
+                }),
+            )
+            .await;
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "partial"
+                }),
+            )
+            .await;
+            while websocket.next().await.is_some() {}
+            socket_closed_tx.send(()).unwrap();
+        });
+        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            live_stream_response(
+                client,
+                "message".to_string(),
+                &request.model,
+                live_test_context(session_id),
+                request.clone(),
+                continuation.clone(),
+                false,
+            ),
+        )
+        .await
+        .expect("live response did not publish the first chunk");
+        let mut body = response.into_body();
+        tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+            .await
+            .expect("first downstream chunk timed out")
+            .expect("live response body ended before the first chunk")
+            .expect("first downstream chunk failed");
+        drop(body);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), socket_closed_rx)
+            .await
+            .expect("dropping the downstream body did not close the upstream socket")
+            .expect("socket-close acknowledgement sender dropped");
+        assert!(!continuation::is_current_turn_for_owner(&continuation));
+        server.await.unwrap();
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    #[tokio::test]
+    async fn stale_request_cleanup_preserves_newer_continuation_turn() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let session_id = "stale-live-request-cleanup";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        compaction::clear_compaction(session_id);
+        let request = live_test_request("one");
+        let stale_continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let stale_cleanup = LiveRequestStateCleanup::new(
+            stale_continuation,
+            Some(session_id.to_string()),
+            true,
+            request.clone(),
+        );
+
+        let newer_continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        assert!(store_compaction_for_request(
+            session_id,
+            &request,
+            vec![translate::request::ResponsesInputItem::Compaction {
+                encrypted_content: "newer-native-history".to_string(),
+            }],
+        ));
+        drop(stale_cleanup);
+
+        assert!(continuation::is_current_turn_for_owner(&newer_continuation));
+        let summary: Vec<translate::request::ResponsesInputItem> =
+            serde_json::from_value(serde_json::json!([{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "newer portable summary with enough detail for safe activation"
+                }]
+            }]))
+            .unwrap();
+        assert!(activate_compaction_for_request(
+            Some(session_id),
+            &request,
+            &summary,
+        ));
+        abort_request_state(Some(session_id), &newer_continuation, true, &request);
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_aborts_live_request_state_after_eleven_attempts() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let status = run_live_failure_case(
+            "live-retry-exhaustion-cleanup",
+            serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "allowed": false,
+                    "limit_reached": true,
+                    "primary": {"reset_after_seconds": 0}
+                }
+            }),
+            11,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn excessive_retry_after_aborts_live_request_state() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let status = run_live_failure_case(
+            "live-excessive-retry-after-cleanup",
+            serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "allowed": false,
+                    "limit_reached": true,
+                    "primary": {"reset_after_seconds": 31}
+                }
+            }),
+            1,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn nonretryable_live_error_aborts_request_state() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let status = run_live_failure_case(
+            "live-nonretryable-cleanup",
+            serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"message": "invalid request"}
+                }
+            }),
+            1,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_replacement_startup_is_blocked_aborts_request_state() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let session_id = "live-blocked-replacement-cleanup";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = live_test_request("one");
+        let continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (replacement_accepted_tx, replacement_accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_replacement_tx, release_replacement_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (first_socket, _) = listener.accept().await.unwrap();
+            let mut first_websocket = tokio_tungstenite::accept_async(first_socket).await.unwrap();
+            let _ = next_live_websocket_request(&mut first_websocket).await;
+            emit_live_event(
+                &mut first_websocket,
+                &serde_json::json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {
+                        "allowed": false,
+                        "limit_reached": true,
+                        "primary": {"reset_after_seconds": 0}
+                    }
+                }),
+            )
+            .await;
+            drop(first_websocket);
+
+            let (_replacement_socket, _) = listener.accept().await.unwrap();
+            replacement_accepted_tx.send(()).unwrap();
+            let _ = release_replacement_rx.await;
+        });
+        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let task_request = request.clone();
+        let task_continuation = continuation.clone();
+        let response_task = tokio::spawn(async move {
+            let model = task_request.model.clone();
+            live_stream_response(
+                client,
+                "message".to_string(),
+                &model,
+                live_test_context(session_id),
+                task_request,
+                task_continuation,
+                false,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), replacement_accepted_rx)
+            .await
+            .expect("replacement startup did not reach the blocked handshake")
+            .expect("replacement startup acknowledgement sender dropped");
+        response_task.abort();
+        assert!(response_task.await.unwrap_err().is_cancelled());
+        let _ = release_replacement_tx.send(());
+        server.await.unwrap();
+
+        assert!(!continuation::is_current_turn_for_owner(&continuation));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
     }
 }
