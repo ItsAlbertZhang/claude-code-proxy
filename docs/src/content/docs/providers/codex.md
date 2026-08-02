@@ -24,6 +24,14 @@ Use `claude-code-proxy models` as the current catalog. Model access depends on y
 
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-5.6-sol-fast` selects `gpt-5.6-sol` with fast service. `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence.
 
+## Responses lanes and parallel tool calls
+
+Translated `/v1/messages` and `/v1/messages/count_tokens` requests use the Responses Lite lane for the GPT-5.6 family by default. Lite requires `parallel_tool_calls: false`, so independent Claude Code tools may need separate assistant turns.
+
+Set `CCP_CODEX_FULL_LANE=1` or `codex.fullLane: true` to route `gpt-5.6-sol` and `gpt-5.6-terra` through the full Responses lane, where parallel tool calls remain enabled. `gpt-5.6-luna` always stays on Lite because it is not available on the full lane. Hosted web search still selects the full lane and upgrades Luna to Sol when necessary. Forced Claude web-search subrequests continue using the standalone `/alpha/search` endpoint and ignore this option.
+
+This option affects only Anthropic Messages translation and its token-count shape. Native `/v1/responses` and `/v1/chat/completions` requests retain their existing lane behavior. The full-lane contract is specific to the default ChatGPT backend; custom `CCP_CODEX_BASE_URL` endpoints may not support it.
+
 ## Reasoning
 
 Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`, `high`, `xhigh`, or `max`. A proxy override can also force `none`.
@@ -68,7 +76,7 @@ This is most useful for long coding sessions where continuity after `/compact` o
 
 1. Claude Code reaches a manual or automatic compaction boundary.
 2. The proxy sends the translated conversation to Codex with a trailing `compaction_trigger`.
-3. Codex returns an encrypted `compaction` item, which the proxy keeps in memory for that Claude Code session and model.
+3. Codex returns an encrypted `compaction` item, which the proxy keeps in memory for that Claude Code session, model, and Responses lane.
 4. Claude Code completes its normal summary request. The proxy uses the resulting summary as an exact anchor.
 5. On subsequent matching turns, the proxy replaces the portable summary with the encrypted item, retained recent context, and post-compaction messages.
 
@@ -94,7 +102,7 @@ CCP_CODEX_SERVER_COMPACTION=1 claude-code-proxy serve
 
 ### Fallbacks and visibility
 
-Replay requires the same Claude Code session and Codex model with append-only history. A branch, proxy restart, provider or model change, malformed response, upstream failure, memory limit, or 30 minutes without matching activity discards the native state and uses Claude Code's portable summary instead.
+Replay requires the same Claude Code session, Codex model, and Responses lane with append-only history. A branch, proxy restart, provider, model, or lane change, malformed response, upstream failure, memory limit, or 30 minutes without matching activity discards the native state and uses Claude Code's portable summary instead.
 
 While the native request is active, the monitor shows `compacting`. Structured log events named `server_compaction_triggered`, `server_compaction_completed`, and `server_compaction_failed` report each attempt and outcome.
 

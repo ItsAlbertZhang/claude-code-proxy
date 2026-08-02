@@ -120,6 +120,17 @@ pub fn uses_responses_lite(model: &str) -> bool {
     matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
 }
 
+/// Applies the opt-in full-lane policy for translated Anthropic requests.
+/// Native Responses and Chat Completions intentionally keep using
+/// [`uses_responses_lite`].
+pub(crate) fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
+    match model {
+        "gpt-5.6-luna" => true,
+        "gpt-5.6-sol" | "gpt-5.6-terra" => !full_lane,
+        _ => false,
+    }
+}
+
 /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
 /// Responses API resolves it to a `-free` variant and returns 404 (Model not
 /// found gpt-5.6-luna-free-...). Hosted web_search requests must run on the
@@ -200,6 +211,26 @@ mod tests {
         let r = resolve_model_request("gpt-5.6-sol-fast");
         assert_eq!(r.model, "gpt-5.6-sol");
         assert_eq!(r.service_tier, Some(ServiceTier::Priority));
+    }
+
+    #[test]
+    fn translated_full_lane_policy_applies_only_to_sol_and_terra() {
+        for (model, full_lane, expected_lite) in [
+            ("gpt-5.6-luna", false, true),
+            ("gpt-5.6-luna", true, true),
+            ("gpt-5.6-sol", false, true),
+            ("gpt-5.6-sol", true, false),
+            ("gpt-5.6-terra", false, true),
+            ("gpt-5.6-terra", true, false),
+            ("gpt-5.5", false, false),
+            ("gpt-5.5", true, false),
+        ] {
+            assert_eq!(
+                uses_responses_lite_with_full_lane(model, full_lane),
+                expected_lite,
+                "model={model}, full_lane={full_lane}"
+            );
+        }
     }
 
     #[test]

@@ -554,4 +554,39 @@ mod tests {
         abort_continuation(Some("s1"), second.turn_id);
         assert!(has_continuation_for_tests("s1"));
     }
+
+    #[test]
+    fn lane_switch_changes_continuation_prompt_signature() {
+        let input = vec![ResponsesInputItem::Message {
+            role: "user".to_string(),
+            content: vec![
+                super::super::translate::request::ResponsesContentPart::InputText {
+                    text: "one".to_string(),
+                },
+            ],
+        }];
+        let lite = request_with_input(
+            input.clone(),
+            Some(json!({
+                "parallel_tool_calls": false,
+                "client_metadata": {
+                    "ws_request_header_x_openai_internal_codex_responses_lite": "true"
+                }
+            })),
+        );
+        let full = request_with_input(input.clone(), None);
+        let state = ContinuationState {
+            response_id: "resp_1".to_string(),
+            prompt_signature: prompt_signature(&lite),
+            transcript: input,
+            transcript_bytes: 0,
+            updated_at: now_ms(),
+        };
+
+        let candidate = continuation_candidate_from_state(1, &full, Some(state), false, now_ms());
+
+        assert_eq!(candidate.disabled_reason.as_deref(), Some("prompt_changed"));
+        assert!(candidate.previous_response_id.is_none());
+        assert!(candidate.input_delta.is_none());
+    }
 }
