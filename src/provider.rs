@@ -1,6 +1,6 @@
 use crate::anthropic::schema::MessagesRequest;
 use crate::monitor::MonitorHandle;
-use crate::request_identity::ConversationIdentity;
+use crate::request_identity::{ConversationIdentity, RequestPurpose, RequestScope};
 use crate::traffic::TrafficCapture;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -34,11 +34,36 @@ pub trait Provider: Send + Sync {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        let _ = conversation_identity;
+        let identity = compatible_explicit_identity(&ctx, conversation_identity);
+        let _ = identity;
         self.handle_messages(body, ctx).await
     }
 
+    #[doc(hidden)]
+    async fn handle_messages_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: ScopedRequestContext,
+    ) -> Response {
+        let (legacy, scope) = ctx.into_parts();
+        self.handle_messages_with_conversation_identity(
+            body,
+            legacy,
+            scope.conversational_lane().cloned(),
+        )
+        .await
+    }
+
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
+
+    #[doc(hidden)]
+    async fn handle_count_tokens_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: ScopedRequestContext,
+    ) -> Response {
+        self.handle_count_tokens(body, ctx.into_legacy()).await
+    }
 
     async fn generate_anthropic_stream(
         &self,
@@ -53,6 +78,16 @@ pub trait Provider: Send + Sync {
                 self.name()
             ),
         ))
+    }
+
+    #[doc(hidden)]
+    async fn generate_anthropic_stream_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: ScopedRequestContext,
+    ) -> Result<Generation, ProviderError> {
+        self.generate_anthropic_stream(body, ctx.into_legacy())
+            .await
     }
 }
 
@@ -123,4 +158,48 @@ pub struct RequestContext {
     pub provider: String,
     pub traffic: Option<Arc<TrafficCapture>>,
     pub monitor: Option<MonitorHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScopedRequestContext {
+    legacy: RequestContext,
+    scope: RequestScope,
+}
+
+impl ScopedRequestContext {
+    pub(crate) fn new(legacy: RequestContext, scope: RequestScope) -> Self {
+        Self { legacy, scope }
+    }
+
+    pub(crate) fn legacy(&self) -> &RequestContext {
+        &self.legacy
+    }
+
+    pub(crate) fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+
+    pub(crate) fn into_legacy(self) -> RequestContext {
+        self.legacy
+    }
+
+    pub(crate) fn into_parts(self) -> (RequestContext, RequestScope) {
+        (self.legacy, self.scope)
+    }
+}
+
+pub(crate) fn compatible_explicit_identity(
+    ctx: &RequestContext,
+    identity: Option<ConversationIdentity>,
+) -> Option<ConversationIdentity> {
+    let identity = identity.and_then(|identity| identity.validated())?;
+    let legacy = ctx
+        .session_id
+        .as_deref()
+        .and_then(ConversationIdentity::from_legacy_main)?;
+    (identity.session_component() == legacy.session_component()).then_some(identity)
+}
+
+pub(crate) fn legacy_scope(ctx: &RequestContext, purpose: RequestPurpose) -> RequestScope {
+    RequestScope::legacy(ctx.session_id.as_deref(), purpose)
 }

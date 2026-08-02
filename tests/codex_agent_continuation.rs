@@ -597,7 +597,7 @@ impl IdentityHeaders {
                 (SESSION_HEADER, session.to_string()),
                 (AGENT_HEADER, raw_agent.to_string()),
             ],
-            upstream_session: Some(session.to_string()),
+            upstream_session: None,
         }
     }
 }

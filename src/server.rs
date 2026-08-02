@@ -8,7 +8,7 @@ use crate::{
         stream::openai_response as render_openai_response,
     },
     project,
-    provider::RequestContext,
+    provider::{RequestContext, ScopedRequestContext},
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
         images::{
@@ -25,7 +25,10 @@ use crate::{
         },
     },
     registry::{Registry, normalize_incoming_model},
-    request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity},
+    request_identity::{
+        CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, CLAUDE_SESSION_HEADER, RequestPurpose,
+        RequestScope,
+    },
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
@@ -869,7 +872,10 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         ])),
     );
 
-    let session_id = native_session_id(&headers);
+    let request_scope = RequestScope::from_openai_headers(&headers, RequestPurpose::Conversation);
+    let session_id = request_scope
+        .identity()
+        .map(|identity| identity.session_component().to_string());
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Responses);
     }
@@ -914,7 +920,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
     let now = current_millis();
-    let session_state = session::existing_session(session_id.as_deref(), now);
+    let session_state = session::existing_conversation(request_scope.conversational_lane(), now);
     let affinity = session_state
         .as_ref()
         .and_then(|session| session.affinity_provider.as_ref());
@@ -949,15 +955,16 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         }
     };
     if provider.name() != "codex"
-        && let Some(session_id) = session_id.as_deref()
+        && let Some(identity) = request_scope.conversational_lane()
     {
-        crate::providers::codex::clear_session_compaction(session_id);
+        crate::providers::codex::clear_conversation_state(identity);
     }
-    let current = session::record_session_request(
-        session_id.as_deref(),
+    let current = session::record_scoped_request(
+        &request_scope,
         session_state.as_ref(),
         provider.name(),
         &normalized_model,
+        true,
         now,
     );
     let effort = parsed
@@ -1024,7 +1031,10 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     };
     let response = if let Some(parsed) = parsed {
         match provider
-            .generate_anthropic_stream(parsed.messages, context)
+            .generate_anthropic_stream_scoped(
+                parsed.messages,
+                ScopedRequestContext::new(context, request_scope),
+            )
             .await
         {
             Ok(generation) => {
@@ -1096,7 +1106,10 @@ async fn handler_chat_completions(
         ])),
     );
 
-    let session_id = native_session_id(&headers);
+    let request_scope = RequestScope::from_openai_headers(&headers, RequestPurpose::Conversation);
+    let session_id = request_scope
+        .identity()
+        .map(|identity| identity.session_component().to_string());
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(
             &req_id,
@@ -1146,7 +1159,7 @@ async fn handler_chat_completions(
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
     let now = current_millis();
-    let session_state = session::existing_session(session_id.as_deref(), now);
+    let session_state = session::existing_conversation(request_scope.conversational_lane(), now);
     let affinity = session_state
         .as_ref()
         .and_then(|session| session.affinity_provider.as_ref());
@@ -1183,15 +1196,16 @@ async fn handler_chat_completions(
         (None, Some(parsed))
     };
     if provider.name() != "codex"
-        && let Some(session_id) = session_id.as_deref()
+        && let Some(identity) = request_scope.conversational_lane()
     {
-        crate::providers::codex::clear_session_compaction(session_id);
+        crate::providers::codex::clear_conversation_state(identity);
     }
-    let current = session::record_session_request(
-        session_id.as_deref(),
+    let current = session::record_scoped_request(
+        &request_scope,
         session_state.as_ref(),
         provider.name(),
         &normalized_model,
+        true,
         now,
     );
     let effort = translated
@@ -1276,7 +1290,10 @@ async fn handler_chat_completions(
     } else {
         let parsed = parsed.expect("non-Codex request was parsed");
         match provider
-            .generate_anthropic_stream(parsed.messages, context)
+            .generate_anthropic_stream_scoped(
+                parsed.messages,
+                ScopedRequestContext::new(context, request_scope),
+            )
             .await
         {
             Ok(generation) => {
@@ -1316,19 +1333,9 @@ async fn handler_chat_completions(
 }
 
 fn native_session_id(headers: &http::HeaderMap) -> Option<String> {
-    [
-        "x-claude-code-session-id",
-        "session_id",
-        "x-client-request-id",
-    ]
-    .into_iter()
-    .find_map(|name| {
-        headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
+    RequestScope::from_openai_headers(headers, RequestPurpose::Auxiliary)
+        .identity()
+        .map(|identity| identity.session_component().to_string())
 }
 
 #[allow(clippy::result_large_err)]
@@ -1409,9 +1416,14 @@ async fn dispatch_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let conversation_identity = (!count_tokens)
-        .then(|| ConversationIdentity::from_headers(&headers))
-        .flatten();
+    let mut request_scope = RequestScope::from_headers(
+        &headers,
+        if count_tokens {
+            RequestPurpose::CountTokens
+        } else {
+            RequestPurpose::Conversation
+        },
+    );
     let path = uri.path().to_string();
     let query = redacted_query(&uri);
     let endpoint = if count_tokens {
@@ -1428,11 +1440,9 @@ async fn dispatch_request(
             ("query".to_string(), json!(&query)),
         ])),
     );
-    let session_id = req
-        .headers()
-        .get("x-claude-code-session-id")
-        .and_then(|value| value.to_str().ok())
-        .map(std::string::ToString::to_string);
+    let session_id = request_scope
+        .identity()
+        .map(|identity| identity.session_component().to_string());
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(&req_id, session_id.clone(), None, endpoint);
     }
@@ -1579,11 +1589,10 @@ async fn dispatch_request(
 
     let mut normalized_model = normalize_incoming_model(model);
     body.model = Some(normalized_model.clone());
-    let session_state = if let Some(session_id) = session_id.as_deref() {
-        session::existing_session(Some(session_id), now)
-    } else {
-        None
-    };
+    if !count_tokens && is_claude_auto_review_request(&body) {
+        request_scope = request_scope.with_purpose(RequestPurpose::AutoReview);
+    }
+    let session_state = session::existing_conversation(request_scope.conversational_lane(), now);
     let session_affinity = session_state
         .as_ref()
         .and_then(|state| state.affinity_provider.as_ref());
@@ -1690,17 +1699,17 @@ async fn dispatch_request(
     if !count_tokens
         && auto_review_route.is_none()
         && provider.name() != "codex"
-        && let Some(session_id) = session_id.as_deref()
+        && let Some(identity) = request_scope.conversational_lane()
     {
-        crate::providers::codex::clear_session_compaction(session_id);
+        crate::providers::codex::clear_conversation_state(identity);
     }
 
     let effort = crate::providers::translate_shared::read_effort(&body)
         .ok()
         .flatten()
         .map(str::to_string);
-    let current = session::record_session_request_with_affinity_update(
-        session_id.as_deref(),
+    let current = session::record_scoped_request(
+        &request_scope,
         session_state.as_ref(),
         provider.name(),
         &normalized_model,
@@ -1748,29 +1757,22 @@ async fn dispatch_request(
         );
     }
 
-    let context = RequestContext {
-        req_id: req_id.clone(),
-        session_id,
-        session_seq: current.map(|s| s.seq),
-        provider: provider.name().to_string(),
-        traffic,
-        monitor: state.monitor.clone(),
-    };
+    let context = ScopedRequestContext::new(
+        RequestContext {
+            req_id: req_id.clone(),
+            session_id,
+            session_seq: current.map(|s| s.seq),
+            provider: provider.name().to_string(),
+            traffic,
+            monitor: state.monitor.clone(),
+        },
+        request_scope,
+    );
 
     let response = if count_tokens {
-        provider.handle_count_tokens(body, context).await
+        provider.handle_count_tokens_scoped(body, context).await
     } else {
-        provider
-            .handle_messages_with_conversation_identity(
-                body,
-                context,
-                if auto_review_route.is_some() {
-                    None
-                } else {
-                    conversation_identity
-                },
-            )
-            .await
+        provider.handle_messages_scoped(body, context).await
     };
     log_request_completed(
         &log,
@@ -2091,7 +2093,11 @@ fn headers_to_record(headers: &http::HeaderMap) -> Value {
         if let Ok(raw) = value.to_str() {
             let value = if matches!(
                 key.as_str(),
-                CLAUDE_AGENT_HEADER | CLAUDE_PARENT_AGENT_HEADER
+                CLAUDE_SESSION_HEADER
+                    | CLAUDE_AGENT_HEADER
+                    | CLAUDE_PARENT_AGENT_HEADER
+                    | "session_id"
+                    | "x-client-request-id"
             ) {
                 format!("[redacted len={}]", raw.len())
             } else {

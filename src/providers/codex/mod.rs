@@ -28,9 +28,12 @@ use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
-use crate::provider::{CliHandlers, Provider, RequestContext};
+use crate::provider::{
+    CliHandlers, Provider, RequestContext, ScopedRequestContext, compatible_explicit_identity,
+    legacy_scope,
+};
 use crate::registry;
-use crate::request_identity::ConversationIdentity;
+use crate::request_identity::{ConversationIdentity, RequestPurpose, RequestScope};
 use crate::retry::{compute_backoff_delay, sleep};
 
 use self::auth::browser_login::run_browser_login;
@@ -71,6 +74,11 @@ pub(crate) fn clear_session_compaction(session_id: &str) {
     compaction::clear_compaction(session_id);
 }
 
+pub(crate) fn clear_conversation_state(identity: &ConversationIdentity) {
+    continuation::clear_continuation_for_owner(Some(identity));
+    websocket::invalidate_codex_websocket_pool_owner(identity);
+}
+
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
 }
@@ -93,9 +101,10 @@ impl CodexProvider {
     async fn handle_messages_inner(
         &self,
         body: MessagesRequest,
-        ctx: RequestContext,
-        conversation_identity: Option<ConversationIdentity>,
+        scoped: ScopedRequestContext,
     ) -> Response {
+        let (ctx, scope) = scoped.into_parts();
+        let conversation_identity = scope.conversational_lane().cloned();
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
@@ -452,7 +461,9 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        self.handle_messages_inner(body, ctx, None).await
+        let scope = legacy_scope(&ctx, RequestPurpose::Conversation);
+        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope))
+            .await
     }
 
     async fn handle_messages_with_conversation_identity(
@@ -461,8 +472,19 @@ impl Provider for CodexProvider {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        self.handle_messages_inner(body, ctx, conversation_identity)
+        let identity = compatible_explicit_identity(&ctx, conversation_identity);
+        let scope =
+            RequestScope::from_conversation_identity(identity, RequestPurpose::Conversation);
+        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope))
             .await
+    }
+
+    async fn handle_messages_scoped(
+        &self,
+        body: MessagesRequest,
+        ctx: ScopedRequestContext,
+    ) -> Response {
+        self.handle_messages_inner(body, ctx).await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
