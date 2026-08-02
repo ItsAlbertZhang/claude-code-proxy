@@ -17,7 +17,7 @@ use crate::traffic::{
     MAX_STREAM_CAPTURE_FRAME_BYTES,
 };
 
-use super::client::{CodexError, CodexHttpClient};
+use super::client::{AuthRejectionBudget, CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
     ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
     uses_responses_lite,
@@ -47,7 +47,7 @@ impl CodexNativeBackend {
         }
     }
 
-    pub async fn handle(&self, mut body: Value, mut ctx: RequestContext) -> Response {
+    pub async fn handle(&self, mut body: Value, ctx: RequestContext) -> Response {
         let resolved = match shape_native_request(&mut body) {
             Ok(resolved) => resolved,
             Err(response) => return response,
@@ -55,7 +55,8 @@ impl CodexNativeBackend {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
-        let route = match self
+        let lane_token = ctx.session_id.clone();
+        let mut route = match self
             .client
             .conversation_route(resolved.use_responses_lite)
             .await
@@ -63,23 +64,45 @@ impl CodexNativeBackend {
             Ok(route) => route,
             Err(error) => return local_codex_error(error),
         };
-        if let Some(lane_token) = ctx.session_id.as_deref() {
-            ctx.session_id = Some(route.bind_lane(lane_token));
-        }
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
+        let rejection_budget = Arc::new(AuthRejectionBudget::default());
+        let can_replay_after_rebind = body
+            .get("previous_response_id")
+            .is_none_or(serde_json::Value::is_null);
 
-        let upstream = match self
-            .client
-            .post_native_responses_bound(&route, &body, &ctx, resolved.stream)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return local_codex_error(error),
-        };
-
-        passthrough_response(upstream, ctx, self.client.body_idle_timeout_ms())
+        loop {
+            let mut route_ctx = ctx.clone();
+            if let Some(lane_token) = lane_token.as_deref() {
+                route_ctx.session_id = Some(route.bind_lane(lane_token));
+            }
+            let upstream = match self
+                .client
+                .post_native_responses_bound_with_rejection_budget(
+                    &route,
+                    &body,
+                    &route_ctx,
+                    resolved.stream,
+                    rejection_budget.clone(),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => return local_codex_error(error),
+            };
+            if upstream.status() == StatusCode::UNAUTHORIZED && rejection_budget.try_claim() {
+                let next_route = self
+                    .client
+                    .refresh_conversation_route_after_rejection(&route)
+                    .await;
+                if can_replay_after_rebind && let Some(next_route) = next_route {
+                    route = next_route;
+                    continue;
+                }
+            }
+            return passthrough_response(upstream, route_ctx, self.client.body_idle_timeout_ms());
+        }
     }
 }
 
@@ -676,6 +699,17 @@ mod tests {
         }
     }
 
+    fn request_parts(request: &[u8]) -> (String, Value) {
+        let header_end = request
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        (
+            String::from_utf8_lossy(&request[..header_end]).into_owned(),
+            serde_json::from_slice(&request[header_end + 4..]).unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn native_backend_route_binds_sibling_agent_lanes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -750,6 +784,400 @@ mod tests {
             assert!(!headers.contains("raw-agent-lane-b"));
             assert!(headers.contains(&format!("x-codex-window-id: {}:0", sessions[index])));
             assert!(headers.contains(&format!("x-client-request-id: native-agent-{index}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_header_401_rebuilds_same_account_route_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "native-route-a".into(),
+            refresh: "refresh-a".into(),
+            account_id: Some("native-account".into()),
+            expires: u64::MAX,
+        });
+        let backend = CodexNativeBackend::with_client(client);
+        let server_client = backend.client.clone();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(request_parts(&read_request(&mut socket).await));
+                if attempt == 0 {
+                    server_client.auth_manager().set_test_auth(StoredAuth {
+                        access: "native-route-b".into(),
+                        refresh: "refresh-b".into(),
+                        account_id: Some("native-account".into()),
+                        expires: u64::MAX,
+                    });
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 5\r\nconnection: close\r\n\r\nstale",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let body = br#"{"id":"resp_b","object":"response","status":"completed"}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                }
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err(),
+                "same-account rebind must stop after route B"
+            );
+            captured
+        });
+
+        let mut ctx = observer_context();
+        ctx.req_id = "native-route-rebind".into();
+        ctx.session_id = Some("native-raw-lane".into());
+        let response = backend
+            .handle(
+                json!({"model":"gpt-5.4","input":"unchanged","stream":false}),
+                ctx,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let captured = server.await.unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].1, captured[1].1);
+        assert!(
+            captured[0]
+                .0
+                .contains("authorization: Bearer native-route-a")
+        );
+        assert!(
+            captured[1]
+                .0
+                .contains("authorization: Bearer native-route-b")
+        );
+        let session = |headers: &str| {
+            headers
+                .lines()
+                .find_map(|line| line.strip_prefix("session_id: "))
+                .unwrap()
+                .to_string()
+        };
+        let session_a = session(&captured[0].0);
+        let session_b = session(&captured[1].0);
+        assert_ne!(session_a, session_b);
+        assert!(
+            captured[0]
+                .0
+                .contains(&format!("x-codex-window-id: {session_a}:0"))
+        );
+        assert!(
+            captured[1]
+                .0
+                .contains(&format!("x-codex-window-id: {session_b}:0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn native_continuation_401_refreshes_later_auth_without_replaying_delta() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "continuation-a".into(),
+            refresh: "refresh-a".into(),
+            account_id: Some("continuation-account".into()),
+            expires: u64::MAX,
+        });
+        let backend = CodexNativeBackend::with_client(client);
+        let server_client = backend.client.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let captured = request_parts(&read_request(&mut socket).await);
+            server_client.auth_manager().set_test_auth(StoredAuth {
+                access: "continuation-b".into(),
+                refresh: "refresh-b".into(),
+                account_id: Some("continuation-account".into()),
+                expires: u64::MAX,
+            });
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 14\r\nconnection: close\r\n\r\nstale response",
+                )
+                .await
+                .unwrap();
+            (
+                captured,
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await,
+            )
+        });
+
+        let body = json!({
+            "model":"gpt-5.4",
+            "previous_response_id":"resp_route_a",
+            "input":[{"role":"user","content":"delta only"}],
+            "stream":false
+        });
+        let response = backend.handle(body.clone(), observer_context()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response_body).contains("stale response"));
+        assert_eq!(
+            backend
+                .client
+                .auth_manager()
+                .get_auth()
+                .await
+                .unwrap()
+                .access,
+            "continuation-b"
+        );
+
+        let ((headers, captured_body), second) = server.await.unwrap();
+        assert!(
+            second.is_err(),
+            "continuation delta was replayed on route B"
+        );
+        assert!(headers.contains("authorization: Bearer continuation-a"));
+        assert_eq!(captured_body["previous_response_id"], "resp_route_a");
+        assert_eq!(captured_body["input"], body["input"]);
+    }
+
+    #[tokio::test]
+    async fn native_second_401_does_not_refresh_or_send_route_c() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "native-a".into(),
+            refresh: "refresh-a".into(),
+            account_id: Some("native-account".into()),
+            expires: u64::MAX,
+        });
+        let backend = CodexNativeBackend::with_client(client);
+        let server_client = backend.client.clone();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(request_parts(&read_request(&mut socket).await));
+                server_client.auth_manager().set_test_auth(StoredAuth {
+                    access: if attempt == 0 { "native-b" } else { "native-c" }.into(),
+                    refresh: format!("refresh-{}", attempt + 2),
+                    account_id: Some("native-account".into()),
+                    expires: u64::MAX,
+                });
+                let body = if attempt == 0 { b"route-a" } else { b"route-b" };
+                let head = format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+            (
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await,
+                captured,
+            )
+        });
+
+        let response = backend
+            .handle(
+                json!({"model":"gpt-5.4","input":"hello","stream":false}),
+                observer_context(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("route-b"));
+        assert_eq!(backend.client.route_rejection_refresh_count(), 1);
+        let (third, captured) = server.await.unwrap();
+        assert!(third.is_err(), "a third route was sent");
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].0.contains("authorization: Bearer native-a"));
+        assert!(captured[1].0.contains("authorization: Bearer native-b"));
+        assert_eq!(captured[0].1, captured[1].1);
+    }
+
+    #[tokio::test]
+    async fn native_header_then_in_band_401_uses_one_total_refresh_budget() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let token_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{upstream_address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_auth_token_endpoint(format!("http://{token_address}/oauth/token"));
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "mixed-a".into(),
+            refresh: "refresh-a".into(),
+            account_id: Some("mixed-account".into()),
+            expires: u64::MAX,
+        });
+        let backend = CodexNativeBackend::with_client(client);
+
+        let token_server = tokio::spawn(async move {
+            let (mut socket, _) = token_listener.accept().await.unwrap();
+            let request = String::from_utf8_lossy(&read_request(&mut socket).await).into_owned();
+            assert!(request.contains("refresh_token=refresh-a"));
+            let body =
+                br#"{"access_token":"mixed-b","refresh_token":"refresh-b","expires_in":3600}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(150), token_listener.accept()).await
+        });
+        let upstream_server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = upstream_listener.accept().await.unwrap();
+                captured.push(request_parts(&read_request(&mut socket).await));
+                if attempt == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 7\r\nconnection: close\r\n\r\nroute-a",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let body = br#"{"type":"response.failed","status_code":401,"response":{"error":{"status":401,"message":"route-b in-band"}}}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                }
+            }
+            captured
+        });
+
+        let response = backend
+            .handle(
+                json!({"model":"gpt-5.4","input":"mixed form","stream":false}),
+                observer_context(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("route-b in-band"));
+        assert_eq!(backend.client.route_rejection_refresh_count(), 1);
+        assert_eq!(
+            backend
+                .client
+                .auth_manager()
+                .get_auth()
+                .await
+                .unwrap()
+                .access,
+            "mixed-b"
+        );
+        assert!(
+            token_server.await.unwrap().is_err(),
+            "route B in-band 401 attempted a second refresh"
+        );
+        let captured = upstream_server.await.unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].0.contains("authorization: Bearer mixed-a"));
+        assert!(captured[1].0.contains("authorization: Bearer mixed-b"));
+    }
+
+    #[tokio::test]
+    async fn native_changed_or_unknown_account_does_not_replay_current_request() {
+        for (case, rejected_account, refreshed_account) in [
+            ("changed", Some("account-a"), Some("account-b")),
+            ("unknown", None, None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = CodexHttpClient::new_for_test(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                format!("http://{address}/v1/responses"),
+                1_000,
+                1_000,
+                0,
+            );
+            client.auth_manager().set_test_auth(StoredAuth {
+                access: format!("{case}-a"),
+                refresh: "refresh-a".into(),
+                account_id: rejected_account.map(str::to_string),
+                expires: u64::MAX,
+            });
+            let backend = CodexNativeBackend::with_client(client);
+            let server_client = backend.client.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                server_client.auth_manager().set_test_auth(StoredAuth {
+                    access: format!("{case}-b"),
+                    refresh: "refresh-b".into(),
+                    account_id: refreshed_account.map(str::to_string),
+                    expires: u64::MAX,
+                });
+                socket
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 8\r\nconnection: close\r\n\r\noriginal",
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            });
+
+            let response = backend
+                .handle(
+                    json!({"model":"gpt-5.4","input":"hello","stream":false}),
+                    observer_context(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("original"),
+                "{case}"
+            );
+            assert!(server.await.unwrap().is_err(), "{case} replayed");
         }
     }
 

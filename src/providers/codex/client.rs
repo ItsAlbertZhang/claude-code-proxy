@@ -383,6 +383,60 @@ const MAX_NATIVE_FAILURE_EVENT_BYTES: usize = 64 * 1024;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
 
+#[derive(Default)]
+pub(crate) struct BufferedRetryState {
+    transport_failures: u32,
+}
+
+#[derive(Default)]
+pub(crate) struct AuthRejectionBudget {
+    claimed: std::sync::atomic::AtomicBool,
+}
+
+impl AuthRejectionBudget {
+    pub(crate) fn try_claim(&self) -> bool {
+        self.claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+struct NativeAuthState {
+    auth: StoredAuth,
+    allow_refresh: bool,
+    rejection_budget: Arc<AuthRejectionBudget>,
+}
+
+#[derive(Clone)]
+struct BackgroundAuthRefresher {
+    auth_manager: Arc<CodexAuthManager<DefaultCodexAuthStore>>,
+    #[cfg(test)]
+    refreshes: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl BackgroundAuthRefresher {
+    fn schedule(&self, auth: StoredAuth, budget: Arc<AuthRejectionBudget>) {
+        if !budget.try_claim() {
+            return;
+        }
+        let auth_manager = self.auth_manager.clone();
+        #[cfg(test)]
+        let refreshes = self.refreshes.clone();
+        tokio::spawn(async move {
+            let _ = auth_manager.refresh_after_rejection(&auth).await;
+            #[cfg(test)]
+            if let Some(refreshes) = refreshes {
+                refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
+}
+
 struct NativeFailureDetector {
     kind: NativeResponseBodyKind,
     buffer: Vec<u8>,
@@ -688,6 +742,12 @@ pub struct CodexHttpClient {
     auth_manager: Arc<CodexAuthManager<DefaultCodexAuthStore>>,
     #[cfg(test)]
     native_rejection_refreshes: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    route_rejection_refreshes: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    transport_override: Option<crate::config::CodexTransport>,
+    #[cfg(test)]
+    previous_response_id_override: Option<bool>,
     base_url: String,
     header_timeout_ms: u64,
     body_idle_timeout_ms: u64,
@@ -717,6 +777,12 @@ impl CodexHttpClient {
             auth_manager: Arc::new(CodexAuthManager::new(file_store())),
             #[cfg(test)]
             native_rejection_refreshes: None,
+            #[cfg(test)]
+            route_rejection_refreshes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            transport_override: None,
+            #[cfg(test)]
+            previous_response_id_override: None,
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
@@ -742,6 +808,12 @@ impl CodexHttpClient {
             auth_manager: Arc::new(auth_manager),
             #[cfg(test)]
             native_rejection_refreshes: None,
+            #[cfg(test)]
+            route_rejection_refreshes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            transport_override: None,
+            #[cfg(test)]
+            previous_response_id_override: None,
             base_url,
             header_timeout_ms: 60_000,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
@@ -765,11 +837,22 @@ impl CodexHttpClient {
             client,
             auth_manager: Arc::new(CodexAuthManager::new(file_store())),
             native_rejection_refreshes: None,
+            route_rejection_refreshes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            transport_override: None,
+            #[cfg(test)]
+            previous_response_id_override: None,
             base_url,
             header_timeout_ms,
             body_idle_timeout_ms,
             header_timeout_retries,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_auth_token_endpoint(mut self, token_endpoint: String) -> Self {
+        self.auth_manager = Arc::new(CodexAuthManager::new_for_test(file_store(), token_endpoint));
+        self
     }
 
     pub fn auth_manager(&self) -> &CodexAuthManager<DefaultCodexAuthStore> {
@@ -778,6 +861,34 @@ impl CodexHttpClient {
 
     pub fn body_idle_timeout_ms(&self) -> u64 {
         self.body_idle_timeout_ms
+    }
+
+    pub(crate) fn transport(&self) -> crate::config::CodexTransport {
+        #[cfg(test)]
+        if let Some(transport) = self.transport_override {
+            return transport;
+        }
+        crate::config::codex_transport()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_transport(mut self, transport: crate::config::CodexTransport) -> Self {
+        self.transport_override = Some(transport);
+        self
+    }
+
+    pub(crate) fn previous_response_id_enabled(&self) -> bool {
+        #[cfg(test)]
+        if let Some(enabled) = self.previous_response_id_override {
+            return enabled;
+        }
+        crate::config::codex_previous_response_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_previous_response_id(mut self, enabled: bool) -> Self {
+        self.previous_response_id_override = Some(enabled);
+        self
     }
 
     pub(crate) async fn post_transcription(
@@ -881,12 +992,79 @@ impl CodexHttpClient {
                 origin: CodexErrorOrigin::Auth,
             })?;
         let protocol_lane = ProtocolLane::from_responses_lite(use_responses_lite);
+        Ok(self.conversation_route_with_auth(auth, protocol_lane))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_rejection_refresh_count(&self) -> usize {
+        self.route_rejection_refreshes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) async fn refresh_conversation_route_after_rejection(
+        &self,
+        rejected: &CodexConversationRoute,
+    ) -> Option<CodexConversationRoute> {
+        #[cfg(test)]
+        self.route_rejection_refreshes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let refreshed = self
+            .auth_manager
+            .refresh_after_rejection(&rejected.auth)
+            .await
+            .ok()?;
+        self.route_after_rejected_refresh(rejected, refreshed)
+    }
+
+    pub(crate) fn refresh_conversation_auth_after_rejection_in_background(
+        &self,
+        rejected: &CodexConversationRoute,
+        budget: Arc<AuthRejectionBudget>,
+    ) {
+        self.route_background_auth_refresher()
+            .schedule(rejected.auth.clone(), budget);
+    }
+
+    fn route_background_auth_refresher(&self) -> BackgroundAuthRefresher {
+        BackgroundAuthRefresher {
+            auth_manager: self.auth_manager.clone(),
+            #[cfg(test)]
+            refreshes: Some(self.route_rejection_refreshes.clone()),
+        }
+    }
+
+    fn native_background_auth_refresher(&self) -> BackgroundAuthRefresher {
+        BackgroundAuthRefresher {
+            auth_manager: self.auth_manager.clone(),
+            #[cfg(test)]
+            refreshes: self.native_rejection_refreshes.clone(),
+        }
+    }
+
+    fn route_after_rejected_refresh(
+        &self,
+        rejected: &CodexConversationRoute,
+        refreshed: StoredAuth,
+    ) -> Option<CodexConversationRoute> {
+        let rejected_account = rejected.auth.account_id.as_deref()?;
+        if refreshed.account_id.as_deref() != Some(rejected_account) {
+            return None;
+        }
+        let refreshed = self.conversation_route_with_auth(refreshed, rejected.protocol_lane);
+        (refreshed.binding != rejected.binding).then_some(refreshed)
+    }
+
+    fn conversation_route_with_auth(
+        &self,
+        auth: StoredAuth,
+        protocol_lane: ProtocolLane,
+    ) -> CodexConversationRoute {
         let binding = ConversationBinding::for_request(&self.base_url, &auth, protocol_lane);
-        Ok(CodexConversationRoute {
+        CodexConversationRoute {
             auth,
             binding,
             protocol_lane,
-        })
+        }
     }
 
     pub async fn conversation_binding(
@@ -999,8 +1177,19 @@ impl CodexHttpClient {
                 retry_after: None,
                 origin: CodexErrorOrigin::Auth,
             })?;
-        self.post_native_responses_with_auth(body, ctx, use_responses_lite, stream, auth, true)
-            .await
+        let rejection_budget = Arc::new(AuthRejectionBudget::default());
+        self.post_native_responses_with_auth(
+            body,
+            ctx,
+            use_responses_lite,
+            stream,
+            NativeAuthState {
+                auth,
+                allow_refresh: true,
+                rejection_budget,
+            },
+        )
+        .await
     }
 
     pub async fn post_native_responses_bound(
@@ -1009,6 +1198,24 @@ impl CodexHttpClient {
         body: &serde_json::Value,
         ctx: &RequestContext,
         stream: bool,
+    ) -> Result<reqwest::Response, CodexError> {
+        self.post_native_responses_bound_with_rejection_budget(
+            route,
+            body,
+            ctx,
+            stream,
+            Arc::new(AuthRejectionBudget::default()),
+        )
+        .await
+    }
+
+    pub(crate) async fn post_native_responses_bound_with_rejection_budget(
+        &self,
+        route: &CodexConversationRoute,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+        stream: bool,
+        rejection_budget: Arc<AuthRejectionBudget>,
     ) -> Result<reqwest::Response, CodexError> {
         let use_responses_lite = body
             .get("client_metadata")
@@ -1027,8 +1234,11 @@ impl CodexHttpClient {
             ctx,
             use_responses_lite,
             stream,
-            route.auth.clone(),
-            false,
+            NativeAuthState {
+                auth: route.auth.clone(),
+                allow_refresh: false,
+                rejection_budget,
+            },
         )
         .await
     }
@@ -1039,8 +1249,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         use_responses_lite: bool,
         stream: bool,
-        mut auth: StoredAuth,
-        allow_auth_refresh: bool,
+        mut auth_state: NativeAuthState,
     ) -> Result<reqwest::Response, CodexError> {
         let body_json = serde_json::to_string(body).map_err(|err| CodexError {
             status: 500,
@@ -1049,11 +1258,11 @@ impl CodexHttpClient {
             retry_after: None,
             origin: CodexErrorOrigin::Http,
         })?;
-        let mut refresh_attempted = false;
 
         loop {
             let started_at = Instant::now();
-            let headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream)?;
+            let headers =
+                build_native_codex_headers(&auth_state.auth, ctx, use_responses_lite, stream)?;
             if let Some(traffic) = ctx.traffic.as_deref() {
                 write_codex_http_request_capture(traffic, &self.base_url, &headers, &body_json);
             }
@@ -1062,26 +1271,26 @@ impl CodexHttpClient {
                 .attempt_native_responses(&headers, body_json.clone())
                 .await?;
             let status = response.status().as_u16();
-            if status == 401 && !refresh_attempted {
-                refresh_attempted = true;
-                if allow_auth_refresh {
-                    drop(response);
-                    auth = self
-                        .auth_manager
-                        .force_refresh(&auth.access)
-                        .await
-                        .map_err(auth_refresh_error)?;
-                    continue;
-                }
-                // Preserve this request's immutable route. Refresh or observed
-                // rotation is available only when the next route binds.
-                let _ = self.auth_manager.refresh_after_rejection(&auth).await;
+            if status == 401 && auth_state.allow_refresh && auth_state.rejection_budget.try_claim()
+            {
+                drop(response);
+                auth_state.auth = self
+                    .auth_manager
+                    .force_refresh(&auth_state.auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
             }
 
             if let Some(traffic) = ctx.traffic.as_deref() {
                 write_live_upstream_response_headers(traffic, &response, started_at.elapsed());
             }
-            return Ok(self.wrap_native_response_body(response, auth, stream));
+            return Ok(self.wrap_native_response_body(
+                response,
+                auth_state.auth,
+                stream,
+                auth_state.rejection_budget,
+            ));
         }
     }
 
@@ -1090,6 +1299,7 @@ impl CodexHttpClient {
         response: reqwest::Response,
         auth: StoredAuth,
         stream: bool,
+        rejection_budget: Arc<AuthRejectionBudget>,
     ) -> reqwest::Response {
         if response.status() != reqwest::StatusCode::OK {
             return response;
@@ -1109,43 +1319,29 @@ impl CodexHttpClient {
 
         let source = http_body_util::BodyDataStream::new(body);
         let detector = NativeFailureDetector::new(stream);
-        let auth_manager = self.auth_manager.clone();
-        #[cfg(test)]
-        let refreshes = self.native_rejection_refreshes.clone();
+        let refresher = self.native_background_auth_refresher();
         let body_stream = futures_util::stream::unfold(
-            (source, detector, auth_manager, auth),
-            move |(mut source, mut detector, auth_manager, auth)| {
-                #[cfg(test)]
-                let refreshes = refreshes.clone();
-                async move {
-                    match futures_util::StreamExt::next(&mut source).await {
-                        Some(item) => {
-                            let unauthorized = match &item {
-                                Ok(chunk) => detector.observe(chunk),
-                                Err(_) => {
-                                    detector.abort();
-                                    false
-                                }
-                            };
-                            if unauthorized {
-                                let _ = auth_manager.refresh_after_rejection(&auth).await;
-                                #[cfg(test)]
-                                if let Some(refreshes) = refreshes.as_ref() {
-                                    refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                }
+            (source, detector, refresher, auth, rejection_budget),
+            move |(mut source, mut detector, refresher, auth, rejection_budget)| async move {
+                match futures_util::StreamExt::next(&mut source).await {
+                    Some(item) => {
+                        let unauthorized = match &item {
+                            Ok(chunk) => detector.observe(chunk),
+                            Err(_) => {
+                                detector.abort();
+                                false
                             }
-                            Some((item, (source, detector, auth_manager, auth)))
+                        };
+                        if unauthorized {
+                            refresher.schedule(auth.clone(), rejection_budget.clone());
                         }
-                        None => {
-                            if detector.finish() {
-                                let _ = auth_manager.refresh_after_rejection(&auth).await;
-                                #[cfg(test)]
-                                if let Some(refreshes) = refreshes.as_ref() {
-                                    refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                }
-                            }
-                            None
+                        Some((item, (source, detector, refresher, auth, rejection_budget)))
+                    }
+                    None => {
+                        if detector.finish() {
+                            refresher.schedule(auth, rejection_budget);
                         }
+                        None
                     }
                 }
             },
@@ -1196,8 +1392,15 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
     ) -> Result<CodexResponse, CodexError> {
-        self.post_codex_with_transport(body, ctx, continuation, crate::config::codex_transport())
-            .await
+        let mut retry_state = BufferedRetryState::default();
+        self.post_codex_with_transport_and_retry_state(
+            body,
+            ctx,
+            continuation,
+            self.transport(),
+            &mut retry_state,
+        )
+        .await
     }
 
     pub async fn post_codex_bound(
@@ -1207,23 +1410,38 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
     ) -> Result<CodexResponse, CodexError> {
-        self.post_codex_bound_with_transport(
+        let mut retry_state = BufferedRetryState::default();
+        self.post_codex_bound_with_retry_state(route, body, ctx, continuation, &mut retry_state)
+            .await
+    }
+
+    pub(crate) async fn post_codex_bound_with_retry_state(
+        &self,
+        route: &CodexConversationRoute,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+        retry_state: &mut BufferedRetryState,
+    ) -> Result<CodexResponse, CodexError> {
+        self.post_codex_bound_with_transport_and_retry_state(
             route,
             body,
             ctx,
             continuation,
-            crate::config::codex_transport(),
+            self.transport(),
+            retry_state,
         )
         .await
     }
 
-    async fn post_codex_bound_with_transport(
+    async fn post_codex_bound_with_transport_and_retry_state(
         &self,
         route: &CodexConversationRoute,
         body: &ResponsesRequest,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
         transport: crate::config::CodexTransport,
+        retry_state: &mut BufferedRetryState,
     ) -> Result<CodexResponse, CodexError> {
         if !route.matches_request(body) {
             return Err(CodexError {
@@ -1241,6 +1459,28 @@ impl CodexHttpClient {
             transport,
             route.auth.clone(),
             false,
+            retry_state,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn post_codex_bound_with_transport(
+        &self,
+        route: &CodexConversationRoute,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+        transport: crate::config::CodexTransport,
+    ) -> Result<CodexResponse, CodexError> {
+        let mut retry_state = BufferedRetryState::default();
+        self.post_codex_bound_with_transport_and_retry_state(
+            route,
+            body,
+            ctx,
+            continuation,
+            transport,
+            &mut retry_state,
         )
         .await
     }
@@ -1257,7 +1497,9 @@ impl CodexHttpClient {
             retry_after: None,
             origin: CodexErrorOrigin::Auth,
         })?;
-        self.post_search_with_auth(body, ctx, auth, true).await
+        let mut retry_state = BufferedRetryState::default();
+        self.post_search_with_auth(body, ctx, auth, true, &mut retry_state)
+            .await
     }
 
     pub async fn post_search_bound(
@@ -1266,7 +1508,28 @@ impl CodexHttpClient {
         body: &SearchRequest,
         ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
-        self.post_search_with_auth(body, ctx, route.auth.clone(), false)
+        let mut retry_state = BufferedRetryState::default();
+        self.post_search_bound_with_retry_state(route, body, ctx, &mut retry_state)
+            .await
+    }
+
+    pub(crate) async fn post_search_bound_with_retry_state(
+        &self,
+        route: &CodexConversationRoute,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+        retry_state: &mut BufferedRetryState,
+    ) -> Result<SearchResponse, CodexError> {
+        if !route.matches_protocol(false) {
+            return Err(CodexError {
+                status: 500,
+                message: "Codex route protocol mismatch".to_string(),
+                detail: None,
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            });
+        }
+        self.post_search_with_auth(body, ctx, route.auth.clone(), false, retry_state)
             .await
     }
 
@@ -1276,6 +1539,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         mut auth: StoredAuth,
         allow_auth_refresh: bool,
+        retry_state: &mut BufferedRetryState,
     ) -> Result<SearchResponse, CodexError> {
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
             status: 500,
@@ -1285,41 +1549,34 @@ impl CodexHttpClient {
             origin: CodexErrorOrigin::Http,
         })?;
         let mut auth_refresh_attempted = false;
-        let mut retries = 0_u32;
 
         loop {
             let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
-            if response.status == 401 && !auth_refresh_attempted {
+            if response.status == 401 && !auth_refresh_attempted && allow_auth_refresh {
                 auth_refresh_attempted = true;
-                match self.auth_manager.refresh_after_rejection(&auth).await {
-                    Ok(new_auth) if allow_auth_refresh => {
-                        auth = new_auth;
-                        continue;
-                    }
-                    Ok(_) | Err(_) if !allow_auth_refresh => {
-                        // Keep this search on its immutable route. Any refresh or
-                        // observed rotation is available when the next route binds.
-                    }
-                    Err(error) => return Err(auth_refresh_error(error)),
-                    Ok(_) => unreachable!("refresh-enabled branch handled above"),
-                }
+                auth = self
+                    .auth_manager
+                    .refresh_after_rejection(&auth)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
             }
             if response.status == 401 {
                 return Err(codex_status_error(response));
             }
             if should_retry_codex_status(response.status)
-                && retries < MAX_BUFFERED_TRANSPORT_RETRIES
+                && retry_state.transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES
             {
                 let retry_after = response
                     .headers
                     .iter()
                     .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
                     .map(|(_, value)| value.as_str());
-                let delay = compute_backoff_delay(retries, retry_after);
+                let delay = compute_backoff_delay(retry_state.transport_failures, retry_after);
                 if delay.exceeds_budget {
                     return Err(codex_status_error(response));
                 }
-                retries += 1;
+                retry_state.transport_failures += 1;
                 sleep(delay.wait_ms).await;
                 continue;
             }
@@ -1336,12 +1593,13 @@ impl CodexHttpClient {
         }
     }
 
-    async fn post_codex_with_transport(
+    async fn post_codex_with_transport_and_retry_state(
         &self,
         body: &ResponsesRequest,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
         transport: crate::config::CodexTransport,
+        retry_state: &mut BufferedRetryState,
     ) -> Result<CodexResponse, CodexError> {
         let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
@@ -1350,10 +1608,38 @@ impl CodexHttpClient {
             retry_after: None,
             origin: CodexErrorOrigin::Auth,
         })?;
-        self.post_codex_with_transport_auth(body, ctx, continuation, transport, auth, true)
-            .await
+        self.post_codex_with_transport_auth(
+            body,
+            ctx,
+            continuation,
+            transport,
+            auth,
+            true,
+            retry_state,
+        )
+        .await
     }
 
+    #[cfg(test)]
+    async fn post_codex_with_transport(
+        &self,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+        transport: crate::config::CodexTransport,
+    ) -> Result<CodexResponse, CodexError> {
+        let mut retry_state = BufferedRetryState::default();
+        self.post_codex_with_transport_and_retry_state(
+            body,
+            ctx,
+            continuation,
+            transport,
+            &mut retry_state,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn post_codex_with_transport_auth(
         &self,
         body: &ResponsesRequest,
@@ -1362,6 +1648,7 @@ impl CodexHttpClient {
         transport: crate::config::CodexTransport,
         mut auth: StoredAuth,
         allow_auth_refresh: bool,
+        retry_state: &mut BufferedRetryState,
     ) -> Result<CodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
@@ -1381,7 +1668,6 @@ impl CodexHttpClient {
         let turn_id = continuation.and_then(|candidate| candidate.turn_id);
         let mut active_continuation = continuation.cloned();
         let mut auth_refresh_attempted = false;
-        let mut transport_failures = 0u32;
         loop {
             let pool_key = websocket_pool_key(
                 ctx,
@@ -1456,7 +1742,10 @@ impl CodexHttpClient {
                                     active_continuation.as_ref(),
                                 ) =>
                         {
-                            // Fall back to HTTP only if WebSocket failed before sending
+                            // Fall back to HTTP only if WebSocket failed before sending.
+                            // A handshake auth rejection still wins over a failed
+                            // same-credential fallback so the route can be rebuilt.
+                            let preserve_auth_rejection = err.status == 401;
                             let body_json =
                                 serde_json::to_string(body).map_err(|e| CodexError {
                                     status: 500,
@@ -1465,13 +1754,23 @@ impl CodexHttpClient {
                                     retry_after: None,
                                     origin: CodexErrorOrigin::Http,
                                 })?;
-                            self.attempt_post_http(
-                                &auth,
-                                &body_json,
-                                ctx,
-                                body.client_metadata.is_some(),
-                            )
-                            .await
+                            let fallback = self
+                                .attempt_post_http(
+                                    &auth,
+                                    &body_json,
+                                    ctx,
+                                    body.client_metadata.is_some(),
+                                )
+                                .await;
+                            if preserve_auth_rejection
+                                && !fallback
+                                    .as_ref()
+                                    .is_ok_and(|response| (200..300).contains(&response.status))
+                            {
+                                Err(err)
+                            } else {
+                                fallback
+                            }
                         }
                         Err(err) => Err(err),
                     }
@@ -1497,27 +1796,14 @@ impl CodexHttpClient {
                         turn_id,
                     );
                 }
-                match self.auth_manager.refresh_after_rejection(&auth).await {
-                    Ok(new_auth) if allow_auth_refresh => {
-                        auth = new_auth;
-                        active_continuation =
-                            full_context_continuation(active_continuation.as_ref());
-                        continue;
-                    }
-                    Ok(_) | Err(_) if !allow_auth_refresh => {
-                        // Keep this request on its immutable route. The refresh or
-                        // observed rotation is available when the next route binds.
-                    }
-                    Err(e) => {
-                        return Err(CodexError {
-                            status: 401,
-                            message: "Unauthorized".to_string(),
-                            detail: Some(e.to_string()),
-                            retry_after: None,
-                            origin: CodexErrorOrigin::Http,
-                        });
-                    }
-                    Ok(_) => unreachable!("refresh-enabled branch handled above"),
+                if allow_auth_refresh {
+                    auth = self
+                        .auth_manager
+                        .refresh_after_rejection(&auth)
+                        .await
+                        .map_err(auth_refresh_error)?;
+                    active_continuation = full_context_continuation(active_continuation.as_ref());
+                    continue;
                 }
             }
 
@@ -1538,9 +1824,11 @@ impl CodexHttpClient {
                 && (200..300).contains(&response.status)
                 && let Some(failure) = super::events::first_retryable_failure(&response.body)
             {
-                if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
-                    let delay =
-                        compute_backoff_delay(transport_failures, failure.retry_after.as_deref());
+                if retry_state.transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
+                    let delay = compute_backoff_delay(
+                        retry_state.transport_failures,
+                        failure.retry_after.as_deref(),
+                    );
                     if delay.exceeds_budget {
                         return Err(CodexError {
                             status: failure.status,
@@ -1556,13 +1844,13 @@ impl CodexHttpClient {
                     log_buffered_retry(
                         ctx,
                         transport,
-                        transport_failures + 1,
+                        retry_state.transport_failures + 1,
                         delay.wait_ms,
                         failure.status,
                         "upstream_event",
                         &failure.message,
                     );
-                    transport_failures += 1;
+                    retry_state.transport_failures += 1;
                     active_continuation = full_context_continuation(active_continuation.as_ref());
                     sleep(delay.wait_ms).await;
                     continue;
@@ -1611,9 +1899,11 @@ impl CodexHttpClient {
                         .iter()
                         .find(|(k, _)| k.to_lowercase() == "retry-after")
                         .map(|(_, v)| v.clone());
-                    if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let delay =
-                            compute_backoff_delay(transport_failures, retry_after.as_deref());
+                    if retry_state.transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
+                        let delay = compute_backoff_delay(
+                            retry_state.transport_failures,
+                            retry_after.as_deref(),
+                        );
                         if delay.exceeds_budget {
                             let detail = String::from_utf8_lossy(&response.body).to_string();
                             return Err(CodexError {
@@ -1627,13 +1917,13 @@ impl CodexHttpClient {
                         log_buffered_retry(
                             ctx,
                             transport,
-                            transport_failures + 1,
+                            retry_state.transport_failures + 1,
                             delay.wait_ms,
                             response.status,
                             "upstream",
                             "rate limited",
                         );
-                        transport_failures += 1;
+                        retry_state.transport_failures += 1;
                         sleep(delay.wait_ms).await;
                         continue;
                     }
@@ -1654,26 +1944,27 @@ impl CodexHttpClient {
                     });
                 }
                 Ok(response) if should_retry_codex_status(response.status) => {
-                    if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
+                    if retry_state.transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
                         let retry_after = response
                             .headers
                             .iter()
                             .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
                             .map(|(_, value)| value.as_str());
-                        let delay = compute_backoff_delay(transport_failures, retry_after);
+                        let delay =
+                            compute_backoff_delay(retry_state.transport_failures, retry_after);
                         if delay.exceeds_budget {
                             return Err(codex_status_error(response));
                         }
                         log_buffered_retry(
                             ctx,
                             transport,
-                            transport_failures + 1,
+                            retry_state.transport_failures + 1,
                             delay.wait_ms,
                             response.status,
                             "upstream",
                             "retryable upstream status",
                         );
-                        transport_failures += 1;
+                        retry_state.transport_failures += 1;
                         sleep(delay.wait_ms).await;
                         continue;
                     }
@@ -1706,22 +1997,25 @@ impl CodexHttpClient {
                 Err(err) => {
                     // Determine if retryable
                     let retryable = is_retryable_transport_error(&err);
-                    if retryable && transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let delay =
-                            compute_backoff_delay(transport_failures, err.retry_after.as_deref());
+                    if retryable && retry_state.transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES
+                    {
+                        let delay = compute_backoff_delay(
+                            retry_state.transport_failures,
+                            err.retry_after.as_deref(),
+                        );
                         if delay.exceeds_budget {
                             return Err(err);
                         }
                         log_buffered_retry(
                             ctx,
                             transport,
-                            transport_failures + 1,
+                            retry_state.transport_failures + 1,
                             delay.wait_ms,
                             err.status,
                             codex_error_origin_name(err.origin),
                             &err.message,
                         );
-                        transport_failures += 1;
+                        retry_state.transport_failures += 1;
                         sleep(delay.wait_ms).await;
                         continue;
                     }
@@ -1895,7 +2189,11 @@ impl CodexHttpClient {
                 }
                 result = start => match result {
                     Ok(stream) => stream,
-                    Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
+                    Err(err)
+                        if err.status == 401
+                            && !auth_refresh_attempted
+                            && (!forwarded_any || !allow_auth_refresh) =>
+                    {
                         auth_refresh_attempted = true;
                         if let Some(key) = pool_key.as_deref() {
                             super::websocket::invalidate_codex_websocket_pool_turn(
@@ -1904,8 +2202,12 @@ impl CodexHttpClient {
                                 turn_id,
                             );
                         }
+                        if !allow_auth_refresh {
+                            let _ = tx.send(Err(err)).await;
+                            return;
+                        }
                         match self.auth_manager.refresh_after_rejection(&auth).await {
-                            Ok(new_auth) if allow_auth_refresh => {
+                            Ok(new_auth) => {
                                 if tx.is_closed() {
                                     return;
                                 }
@@ -1921,15 +2223,10 @@ impl CodexHttpClient {
                                 continuation = full_context_continuation(continuation.as_ref());
                                 continue 'attempt;
                             }
-                            Ok(_) | Err(_) if !allow_auth_refresh => {
-                                let _ = tx.send(Err(err)).await;
-                                return;
-                            }
                             Err(refresh_err) => {
                                 let _ = tx.send(Err(auth_refresh_error(refresh_err))).await;
                                 return;
                             }
-                            Ok(_) => unreachable!("refresh-enabled branch handled above"),
                         }
                     }
                     Err(err) if continuation_retry_available && is_continuation_retry_error(&err) => {
@@ -1974,7 +2271,10 @@ impl CodexHttpClient {
                     Err(err) => err.status == 401,
                     Ok(payload) => super::websocket::event_error_status(payload) == Some(401),
                 };
-                if unauthorized && !auth_refresh_attempted && !forwarded_any {
+                if unauthorized
+                    && !auth_refresh_attempted
+                    && (!forwarded_any || !allow_auth_refresh)
+                {
                     auth_refresh_attempted = true;
                     if let Some(key) = pool_key.as_deref() {
                         super::websocket::invalidate_codex_websocket_pool_turn(
@@ -1983,8 +2283,22 @@ impl CodexHttpClient {
                             turn_id,
                         );
                     }
+                    if !allow_auth_refresh {
+                        let error = match item {
+                            Err(err) => err,
+                            Ok(payload) => CodexError {
+                                status: 401,
+                                message: "Unauthorized".to_string(),
+                                detail: Some(payload.to_string()),
+                                retry_after: None,
+                                origin: CodexErrorOrigin::WebSocket,
+                            },
+                        };
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
                     match self.auth_manager.refresh_after_rejection(&auth).await {
-                        Ok(new_auth) if allow_auth_refresh => {
+                        Ok(new_auth) => {
                             if tx.is_closed() {
                                 return;
                             }
@@ -2001,25 +2315,10 @@ impl CodexHttpClient {
                             continuation_retry_available = false;
                             continue 'attempt;
                         }
-                        Ok(_) | Err(_) if !allow_auth_refresh => {
-                            let error = match item {
-                                Err(err) => err,
-                                Ok(payload) => CodexError {
-                                    status: 401,
-                                    message: "Unauthorized".to_string(),
-                                    detail: Some(payload.to_string()),
-                                    retry_after: None,
-                                    origin: CodexErrorOrigin::WebSocket,
-                                },
-                            };
-                            let _ = tx.send(Err(error)).await;
-                            return;
-                        }
                         Err(refresh_err) => {
                             let _ = tx.send(Err(auth_refresh_error(refresh_err))).await;
                             return;
                         }
-                        Ok(_) => unreachable!("refresh-enabled branch handled above"),
                     }
                 }
 
@@ -2567,18 +2866,14 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
 fn should_refresh_after_unauthorized(
     result: &Result<CodexResponse, CodexError>,
     auth_refresh_attempted: bool,
-    transport: crate::config::CodexTransport,
+    _transport: crate::config::CodexTransport,
 ) -> bool {
     if auth_refresh_attempted {
         return false;
     }
     match result {
         Ok(response) => response.status == 401,
-        Err(err) => {
-            err.status == 401
-                && (err.origin != CodexErrorOrigin::WebSocketHandshake
-                    || transport == crate::config::CodexTransport::WebSocket)
-        }
+        Err(err) => err.status == 401,
     }
 }
 
@@ -2771,10 +3066,141 @@ mod tests {
         }
     }
 
+    fn search_test_request() -> super::super::search::SearchRequest {
+        super::super::search::SearchRequest {
+            id: "search-session".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+            reasoning: None,
+            input: None,
+            commands: super::super::search::SearchCommands {
+                search_query: vec![super::super::search::SearchQuery {
+                    q: "find Codex".to_string(),
+                }],
+            },
+            settings: super::super::search::SearchSettings {
+                filters: None,
+                allowed_callers: vec!["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: 2_500,
+        }
+    }
+
     fn authenticated_http_test_client(base_url: String) -> CodexHttpClient {
         let client = http_test_client(base_url, 100);
         client.auth_manager().set_test_auth(http_test_auth());
         client
+    }
+
+    #[test]
+    fn rejected_refresh_requires_changed_route_for_same_known_account() {
+        let client = http_test_client("http://codex.test/responses".to_string(), 100);
+        let rejected = client.conversation_route_with_auth(
+            StoredAuth {
+                access: "token-a".into(),
+                refresh: "refresh-a".into(),
+                account_id: Some("acct".into()),
+                expires: u64::MAX,
+            },
+            ProtocolLane::ResponsesFull,
+        );
+
+        assert!(
+            client
+                .route_after_rejected_refresh(&rejected, rejected.auth.clone())
+                .is_none(),
+            "an unchanged credential generation must not replay the rejected route"
+        );
+        assert!(
+            client
+                .route_after_rejected_refresh(
+                    &rejected,
+                    StoredAuth {
+                        access: "token-a".into(),
+                        refresh: "replacement-refresh".into(),
+                        account_id: Some("acct".into()),
+                        expires: u64::MAX,
+                    },
+                )
+                .is_none(),
+            "a refresh-token-only change must not replay the rejected access token"
+        );
+        assert!(
+            client
+                .route_after_rejected_refresh(
+                    &rejected,
+                    StoredAuth {
+                        access: "token-b".into(),
+                        refresh: "refresh-b".into(),
+                        account_id: Some("other-acct".into()),
+                        expires: u64::MAX,
+                    },
+                )
+                .is_none(),
+            "a changed account must not replay the current request"
+        );
+        assert!(
+            client
+                .route_after_rejected_refresh(
+                    &rejected,
+                    StoredAuth {
+                        access: "token-b".into(),
+                        refresh: "refresh-b".into(),
+                        account_id: None,
+                        expires: u64::MAX,
+                    },
+                )
+                .is_none(),
+            "an unknown refreshed account must not replay the current request"
+        );
+        let unknown_rejected = client.conversation_route_with_auth(
+            StoredAuth {
+                access: "unknown-a".into(),
+                refresh: "refresh-a".into(),
+                account_id: None,
+                expires: u64::MAX,
+            },
+            ProtocolLane::ResponsesFull,
+        );
+        assert!(
+            client
+                .route_after_rejected_refresh(
+                    &unknown_rejected,
+                    StoredAuth {
+                        access: "unknown-b".into(),
+                        refresh: "refresh-b".into(),
+                        account_id: None,
+                        expires: u64::MAX,
+                    },
+                )
+                .is_none(),
+            "an unknown rejected account must not replay the current request"
+        );
+        let rebound = client
+            .route_after_rejected_refresh(
+                &rejected,
+                StoredAuth {
+                    access: "token-b".into(),
+                    refresh: "refresh-b".into(),
+                    account_id: Some("acct".into()),
+                    expires: u64::MAX,
+                },
+            )
+            .expect("same-account credential rotation should produce a new route");
+        assert_ne!(rebound.binding, rejected.binding);
+        assert_eq!(rebound.protocol_lane, rejected.protocol_lane);
+    }
+
+    #[tokio::test]
+    async fn bound_search_rejects_responses_lite_route() {
+        let client = authenticated_http_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client.conversation_route(true).await.unwrap();
+        let error = client
+            .post_search_bound(&route, &search_test_request(), &http_test_context())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 500);
+        assert_eq!(error.message, "Codex route protocol mismatch");
     }
 
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -2978,23 +3404,7 @@ mod tests {
             second.write_all(&response).await.unwrap();
         });
 
-        let request = super::super::search::SearchRequest {
-            id: "search-session".to_string(),
-            model: "gpt-5.6-luna".to_string(),
-            reasoning: None,
-            input: None,
-            commands: super::super::search::SearchCommands {
-                search_query: vec![super::super::search::SearchQuery {
-                    q: "find Codex".to_string(),
-                }],
-            },
-            settings: super::super::search::SearchSettings {
-                filters: None,
-                allowed_callers: vec!["direct"],
-                external_web_access: true,
-            },
-            max_output_tokens: 2_500,
-        };
+        let request = search_test_request();
         let error = client
             .post_search_bound(&route_a, &request, &http_test_context())
             .await
@@ -3323,6 +3733,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_in_band_failure_does_not_wait_for_slow_background_refresh() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let token_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{upstream_address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_auth_token_endpoint(format!("http://{token_address}/oauth/token"));
+        client.native_rejection_refreshes = Some(refreshes.clone());
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "slow-refresh-a".into(),
+            refresh: "refresh-a".into(),
+            account_id: Some("slow-refresh-account".into()),
+            expires: u64::MAX,
+        });
+        let client = Arc::new(client);
+        let route = client.conversation_route(false).await.unwrap();
+
+        let upstream_server = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_http_request(&mut socket).await).to_string();
+            assert!(request.contains("authorization: Bearer slow-refresh-a"));
+            let body = b"data: {\"type\":\"response.failed\",\"status_code\":401,\"response\":{\"error\":{\"message\":\"expired\"}}}\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        let (refresh_started_tx, refresh_started_rx) = tokio::sync::oneshot::channel();
+        let (release_refresh_tx, release_refresh_rx) = tokio::sync::oneshot::channel();
+        let token_server = tokio::spawn(async move {
+            let (mut socket, _) = token_listener.accept().await.unwrap();
+            let request =
+                String::from_utf8_lossy(&read_http_request(&mut socket).await).to_string();
+            assert!(request.contains("refresh_token=refresh-a"));
+            refresh_started_tx.send(()).unwrap();
+            release_refresh_rx.await.unwrap();
+            let body = br#"{"access_token":"slow-refresh-b","refresh_token":"refresh-b","expires_in":3600}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+
+        let response = client
+            .post_native_responses_bound(
+                &route,
+                &serde_json::json!({"model":"gpt-5.4","input":"hello","stream":true}),
+                &http_test_context(),
+                true,
+            )
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_millis(150), response.bytes())
+            .await
+            .expect("in-band failure waited for the background auth refresh")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&delivered).contains("response.failed"));
+        tokio::time::timeout(Duration::from_secs(5), refresh_started_rx)
+            .await
+            .expect("background refresh did not start")
+            .unwrap();
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        release_refresh_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client.auth_manager().get_auth().await.unwrap().access == "slow-refresh-b" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned background refresh did not finish after response delivery");
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        upstream_server.await.unwrap();
+        token_server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn bound_native_sse_401_refreshes_next_route_without_changing_stream() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3428,6 +3929,13 @@ mod tests {
             received.extend_from_slice(&chunk);
         }
         assert_eq!(received, expected);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while refreshes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background auth refresh did not run");
         assert_eq!(
             refreshes.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -3505,6 +4013,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.bytes().await.unwrap(), expected);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while refreshes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background auth refresh did not run");
         assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
             client.conversation_route(false).await.unwrap().auth.access,
@@ -4575,7 +5090,7 @@ mod tests {
             false,
             crate::config::CodexTransport::Auto
         ));
-        assert!(!should_refresh_after_unauthorized(
+        assert!(should_refresh_after_unauthorized(
             &rejected_handshake,
             false,
             crate::config::CodexTransport::Auto

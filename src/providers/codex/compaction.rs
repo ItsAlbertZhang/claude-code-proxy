@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::sse::parse_sse_events;
 use crate::provider::RequestContext;
-use crate::providers::codex::client::{CodexConversationRoute, CodexError, CodexHttpClient};
+use crate::providers::codex::client::{
+    BufferedRetryState, CodexConversationRoute, CodexError, CodexHttpClient,
+};
 
 use super::translate::request::{
     ResponsesContentPart, ResponsesInputItem, ResponsesRequest, is_compact_message_text,
@@ -149,14 +151,10 @@ pub struct CompactionStartPermit {
     lane_token: String,
     operation_id: String,
     start_order: u64,
-    active: bool,
 }
 
 impl Drop for CompactionStartPermit {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
         let mut guard = REGISTRY.lock().unwrap();
         if let Some(registry) = guard.as_mut() {
             let key = (self.lane_token.clone(), self.operation_id.clone());
@@ -170,11 +168,20 @@ impl Drop for CompactionStartPermit {
 
 static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
 
-pub async fn request_compaction(
+#[cfg(test)]
+static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_compaction_registry_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    TEST_REGISTRY_LOCK.lock().unwrap()
+}
+
+pub(crate) async fn request_compaction(
     client: &CodexHttpClient,
     route: &CodexConversationRoute,
     request: &ResponsesRequest,
     ctx: &RequestContext,
+    retry_state: &mut BufferedRetryState,
 ) -> Result<Vec<ResponsesInputItem>, CompactionError> {
     let (envelope, conversation) = split_input_envelope(&request.input);
     let conversation = without_compaction_instruction(conversation);
@@ -190,7 +197,7 @@ pub async fn request_compaction(
     compaction_request.include = Some(vec!["reasoning.encrypted_content".to_string()]);
 
     let response = client
-        .post_codex_bound(route, &compaction_request, ctx, None)
+        .post_codex_bound_with_retry_state(route, &compaction_request, ctx, None, retry_state)
         .await
         .map_err(CompactionError::Upstream)?;
     let compaction = parse_compaction_response(&response.body)?;
@@ -218,7 +225,6 @@ pub fn reserve_compaction_start(
         lane_token: lane_token.to_string(),
         operation_id: operation_id.to_string(),
         start_order,
-        active: true,
     })
 }
 
@@ -257,7 +263,7 @@ pub fn begin_compaction_for_lane(
 pub fn begin_compaction_with_permit(
     session_id: Option<&str>,
     model: &str,
-    mut permit: CompactionStartPermit,
+    permit: &CompactionStartPermit,
 ) -> Option<CompactionLease> {
     let session_id = session_id?;
     let now = now_ms();
@@ -265,12 +271,9 @@ pub fn begin_compaction_with_permit(
     let registry = guard.get_or_insert_with(CompactionRegistry::default);
     let key = (permit.lane_token.clone(), permit.operation_id.clone());
     if registry.pending_starts.get(&key) != Some(&permit.start_order) {
-        permit.active = false;
         return None;
     }
-    registry.pending_starts.remove(&key);
-    permit.active = false;
-    let lease = begin_compaction_locked(
+    begin_compaction_locked(
         registry,
         session_id,
         &permit.lane_token,
@@ -278,9 +281,7 @@ pub fn begin_compaction_with_permit(
         &permit.operation_id,
         permit.start_order,
         now,
-    );
-    cleanup_lane_start_order(registry, &permit.lane_token);
-    lease
+    )
 }
 
 fn begin_compaction_locked(
@@ -995,7 +996,6 @@ mod tests {
         "portable summary with enough detail to identify this compacted conversation";
     const STALE_SUMMARY: &str =
         "stale portable summary from an older overlapping compaction attempt";
-    static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
     fn request(input: serde_json::Value) -> ResponsesRequest {
         serde_json::from_value(json!({
@@ -1562,7 +1562,7 @@ mod tests {
         let older = reserve_compaction_start(Some("lane"), "operation-older").unwrap();
         let newer = reserve_compaction_start(Some("lane"), "operation-newer").unwrap();
         let newer_lease =
-            begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", newer).unwrap();
+            begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", &newer).unwrap();
         assert!(store_compaction(
             &newer_lease,
             "gpt-5.6-sol",
@@ -1576,7 +1576,7 @@ mod tests {
             &output(SUMMARY),
         ));
 
-        assert!(begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", older).is_none());
+        assert!(begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", &older).is_none());
         let next = request(json!([
             {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
@@ -1589,6 +1589,41 @@ mod tests {
     }
 
     #[test]
+    fn rebound_older_reservation_cannot_replace_newer_route_state() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let older = reserve_compaction_start(Some("raw-lane"), "operation-older").unwrap();
+        let older_a = begin_compaction_with_permit(Some("bound-a"), "gpt-5.6-sol", &older).unwrap();
+        abort_compaction_attempt(Some(&older_a));
+
+        let newer = reserve_compaction_start(Some("raw-lane"), "operation-newer").unwrap();
+        let newer_b = begin_compaction_with_permit(Some("bound-b"), "gpt-5.6-sol", &newer).unwrap();
+        assert!(store_compaction(
+            &newer_b,
+            "gpt-5.6-sol",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "newer-b".to_string(),
+            }],
+        ));
+        assert!(activate_compaction(
+            Some(&newer_b),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+
+        assert!(begin_compaction_with_permit(Some("bound-b"), "gpt-5.6-sol", &older).is_none());
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay = apply_compaction_replay(Some("bound-b"), &next, "following").unwrap();
+        assert!(replay.request.input.iter().any(|item| matches!(
+            item,
+            ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "newer-b"
+        )));
+    }
+
+    #[test]
     fn aborted_newer_start_still_rejects_older_pending_permit() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
@@ -1596,7 +1631,7 @@ mod tests {
         let newer = reserve_compaction_start(Some("ordered-lane"), "operation-newer").unwrap();
         let newer_order = newer.start_order;
         let newer_lease =
-            begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", newer).unwrap();
+            begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", &newer).unwrap();
 
         abort_compaction_attempt(Some(&newer_lease));
         {
@@ -1609,7 +1644,9 @@ mod tests {
             assert!(!registry.states.contains_key("bound"));
         }
 
-        assert!(begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", older).is_none());
+        assert!(begin_compaction_with_permit(Some("bound"), "gpt-5.6-sol", &older).is_none());
+        drop(newer);
+        drop(older);
         let guard = REGISTRY.lock().unwrap();
         let registry = guard.as_ref().unwrap();
         assert!(registry.pending_starts.is_empty());
@@ -1716,10 +1753,12 @@ mod tests {
 
         clear_compactions_for_lane("lane-a");
 
-        assert!(begin_compaction_with_permit(Some("bound-a"), "gpt-5.6-sol", stale).is_none());
-        assert!(begin_compaction_with_permit(Some("bound-b"), "gpt-5.6-sol", unaffected).is_some());
+        assert!(begin_compaction_with_permit(Some("bound-a"), "gpt-5.6-sol", &stale).is_none());
+        assert!(
+            begin_compaction_with_permit(Some("bound-b"), "gpt-5.6-sol", &unaffected).is_some()
+        );
         let fresh = reserve_compaction_start(Some("lane-a"), "operation-fresh").unwrap();
-        assert!(begin_compaction_with_permit(Some("bound-a"), "gpt-5.6-sol", fresh).is_some());
+        assert!(begin_compaction_with_permit(Some("bound-a"), "gpt-5.6-sol", &fresh).is_some());
     }
 
     #[test]
@@ -1728,7 +1767,9 @@ mod tests {
         clear_all_compactions_for_tests();
         let permit = reserve_compaction_start(Some("lane-a"), "operation-a").unwrap();
 
-        assert!(begin_compaction_with_permit(None, "gpt-5.6-sol", permit).is_none());
+        assert!(begin_compaction_with_permit(None, "gpt-5.6-sol", &permit).is_none());
+        assert!(reserve_compaction_start(Some("lane-a"), "operation-a").is_none());
+        drop(permit);
         assert!(reserve_compaction_start(Some("lane-a"), "operation-a").is_some());
     }
 

@@ -34,6 +34,14 @@ struct ContinuationRegistry {
 static REGISTRY: Mutex<Option<ContinuationRegistry>> = Mutex::new(None);
 static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_continuation_registry_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    TEST_REGISTRY_LOCK.lock().unwrap()
+}
+
 #[derive(Clone)]
 pub struct ContinuationCandidate {
     pub turn_id: Option<u64>,
@@ -51,10 +59,24 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+pub fn reserve_continuation_turn(session_id: Option<&str>, enabled: bool) -> Option<u64> {
+    (enabled && session_id.is_some()).then(|| NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed))
+}
+
 pub fn continuation_candidate(
     session_id: Option<&str>,
     body: &ResponsesRequest,
     enabled: bool,
+) -> ContinuationCandidate {
+    let turn_id = reserve_continuation_turn(session_id, enabled);
+    continuation_candidate_for_turn(session_id, body, enabled, turn_id)
+}
+
+pub fn continuation_candidate_for_turn(
+    session_id: Option<&str>,
+    body: &ResponsesRequest,
+    enabled: bool,
+    turn_id: Option<u64>,
 ) -> ContinuationCandidate {
     if !enabled {
         return ContinuationCandidate {
@@ -77,30 +99,38 @@ pub fn continuation_candidate(
             disabled_reason: Some("missing_session".to_string()),
         };
     };
+    let turn_id = turn_id.unwrap_or_else(|| NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed));
 
-    let turn_id = NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed);
     let now = now_ms();
     let (state, superseded_turn) = {
         let mut guard = REGISTRY.lock().unwrap();
         let registry = guard.get_or_insert_with(ContinuationRegistry::default);
-        let existing = registry.sessions.remove(session_id);
-        let superseded_turn = existing.is_some();
-        let state = existing.and_then(|session| session.continuation);
-        if let Some(state) = &state {
-            registry.total_transcript_bytes = registry
-                .total_transcript_bytes
-                .saturating_sub(state.transcript_bytes);
+        if registry
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.current_turn > turn_id)
+        {
+            (None, true)
+        } else {
+            let existing = registry.sessions.remove(session_id);
+            let superseded_turn = existing.is_some();
+            let state = existing.and_then(|session| session.continuation);
+            if let Some(state) = &state {
+                registry.total_transcript_bytes = registry
+                    .total_transcript_bytes
+                    .saturating_sub(state.transcript_bytes);
+            }
+            registry.sessions.insert(
+                session_id.to_string(),
+                SessionState {
+                    current_turn: turn_id,
+                    continuation: None,
+                    updated_at: now,
+                },
+            );
+            evict_oldest(registry);
+            (state, superseded_turn)
         }
-        registry.sessions.insert(
-            session_id.to_string(),
-            SessionState {
-                current_turn: turn_id,
-                continuation: None,
-                updated_at: now,
-            },
-        );
-        evict_oldest(registry);
-        (state, superseded_turn)
     };
 
     continuation_candidate_from_state(turn_id, body, state, superseded_turn, now)
@@ -456,6 +486,7 @@ mod tests {
 
     #[test]
     fn continuation_behaviors() {
+        let _registry_guard = lock_continuation_registry_for_tests();
         // All tests run in sequence to avoid global state interference
 
         // disabled_when_not_enabled
@@ -594,5 +625,71 @@ mod tests {
         assert!(has_continuation_for_tests("s1"));
         abort_continuation(Some("s1"), second.turn_id);
         assert!(has_continuation_for_tests("s1"));
+
+        // An older logical request keeps its original ordering when it moves
+        // from route A to route B and cannot replace newer route-B state.
+        clear_all_continuations_for_tests();
+        let old_turn = reserve_continuation_turn(Some("raw-lane"), true);
+        let old_a = continuation_candidate_for_turn(Some("bound-a"), &req, true, old_turn);
+        assert_eq!(old_a.turn_id, old_turn);
+
+        let newer_turn = reserve_continuation_turn(Some("raw-lane"), true);
+        let newer_b = continuation_candidate_for_turn(Some("bound-b"), &req, true, newer_turn);
+        record_continuation(
+            Some("bound-b"),
+            newer_b.turn_id,
+            &req,
+            Some("resp_b"),
+            Some(22),
+            &[],
+        );
+
+        let rebound_request = request_with_input(
+            vec![
+                ResponsesInputItem::Message {
+                    role: "user".to_string(),
+                    content: vec![
+                        super::super::translate::request::ResponsesContentPart::InputText {
+                            text: "one".to_string(),
+                        },
+                    ],
+                },
+                ResponsesInputItem::Message {
+                    role: "user".to_string(),
+                    content: vec![
+                        super::super::translate::request::ResponsesContentPart::InputText {
+                            text: "two".to_string(),
+                        },
+                    ],
+                },
+            ],
+            None,
+        );
+        let old_rebound =
+            continuation_candidate_for_turn(Some("bound-b"), &rebound_request, true, old_turn);
+        assert_eq!(
+            old_rebound.disabled_reason.as_deref(),
+            Some("superseded_turn")
+        );
+        assert!(old_rebound.previous_response_id.is_none());
+        record_continuation(
+            Some("bound-b"),
+            old_rebound.turn_id,
+            &rebound_request,
+            Some("resp_old"),
+            Some(11),
+            &[],
+        );
+        abort_continuation(Some("bound-b"), old_rebound.turn_id);
+
+        let following_turn = reserve_continuation_turn(Some("raw-lane"), true);
+        let following = continuation_candidate_for_turn(
+            Some("bound-b"),
+            &rebound_request,
+            true,
+            following_turn,
+        );
+        assert_eq!(following.previous_response_id.as_deref(), Some("resp_b"));
+        assert_eq!(following.socket_id, Some(22));
     }
 }

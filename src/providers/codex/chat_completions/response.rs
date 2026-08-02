@@ -158,6 +158,17 @@ pub fn completion_value(state: &CompletionState) -> Value {
 }
 
 pub fn event_error(event: &Value) -> ChatError {
+    if let Some(failure) = super::super::events::classify_event_failure(event)
+        && failure.status == 401
+    {
+        return ChatError::new(
+            http::StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            failure.message,
+            None,
+            None,
+        );
+    }
     let message = event
         .pointer("/response/error/message")
         .or_else(|| event.pointer("/error/message"))

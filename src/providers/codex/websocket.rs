@@ -298,6 +298,8 @@ static POOL_ACTIVITY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static POOLED_VALIDATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<PoolEntry>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
     once_cell::sync::Lazy::new(|| WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
 
@@ -315,6 +317,11 @@ fn now_ms() -> u64 {
 pub fn clear_codex_websocket_pool_for_tests() {
     let mut guard = WS_POOL.lock().unwrap();
     guard.clear();
+}
+
+#[cfg(test)]
+pub(crate) async fn lock_codex_websocket_pool_for_tests() -> tokio::sync::MutexGuard<'static, ()> {
+    WS_POOL_TEST_LOCK.lock().await
 }
 
 pub fn invalidate_codex_websocket_pool_key(session_id: &str) {
@@ -2287,10 +2294,8 @@ mod tests {
 
     use super::*;
 
-    static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
-
     async fn lock_ws_pool_tests() -> tokio::sync::MutexGuard<'static, ()> {
-        WS_POOL_TEST_LOCK.lock().await
+        lock_codex_websocket_pool_for_tests().await
     }
 
     fn test_websocket_client() -> reqwest::Client {

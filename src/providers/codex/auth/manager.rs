@@ -42,6 +42,11 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(store: CodexTokenStore<S>, token_endpoint: String) -> Self {
+        Self::new_with_token_endpoint(store, token_endpoint)
+    }
+
     fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -164,6 +169,13 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             expires,
             account_id,
         };
+        #[cfg(test)]
+        if let Ok(mut test_auth) = self.test_auth.lock()
+            && test_auth.is_some()
+        {
+            *test_auth = Some(next.clone());
+            return Ok(next);
+        }
         self.store.save_auth(next.clone())?;
         Ok(next)
     }
