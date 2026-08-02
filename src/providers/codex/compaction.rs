@@ -8,6 +8,7 @@ use crate::providers::codex::client::{CodexError, CodexHttpClient};
 
 use super::translate::request::{
     ResponsesContentPart, ResponsesInputItem, ResponsesRequest, is_compact_message_text,
+    request_uses_responses_lite,
 };
 
 const RETAINED_MESSAGE_TOKEN_BUDGET: u64 = 20_000;
@@ -39,6 +40,7 @@ enum CompactionPhase {
 
 struct CompactionState {
     model: String,
+    use_responses_lite: Option<bool>,
     native_history: Vec<ResponsesInputItem>,
     phase: CompactionPhase,
     updated_at: u64,
@@ -83,8 +85,31 @@ pub fn store_compaction(
     model: &str,
     native_history: Vec<ResponsesInputItem>,
 ) -> bool {
+    store_compaction_state(session_id, model, None, native_history)
+}
+
+pub(crate) fn store_compaction_for_request(
+    session_id: &str,
+    request: &ResponsesRequest,
+    native_history: Vec<ResponsesInputItem>,
+) -> bool {
+    store_compaction_state(
+        session_id,
+        &request.model,
+        Some(request_uses_responses_lite(request)),
+        native_history,
+    )
+}
+
+fn store_compaction_state(
+    session_id: &str,
+    model: &str,
+    use_responses_lite: Option<bool>,
+    native_history: Vec<ResponsesInputItem>,
+) -> bool {
     let state = CompactionState {
         model: model.to_string(),
+        use_responses_lite,
         native_history,
         phase: CompactionPhase::Unconfirmed,
         updated_at: now_ms(),
@@ -108,6 +133,28 @@ pub fn activate_compaction(
     model: &str,
     output: &[ResponsesInputItem],
 ) -> bool {
+    activate_compaction_state(session_id, model, None, output)
+}
+
+pub(crate) fn activate_compaction_for_request(
+    session_id: Option<&str>,
+    request: &ResponsesRequest,
+    output: &[ResponsesInputItem],
+) -> bool {
+    activate_compaction_state(
+        session_id,
+        &request.model,
+        Some(request_uses_responses_lite(request)),
+        output,
+    )
+}
+
+fn activate_compaction_state(
+    session_id: Option<&str>,
+    model: &str,
+    use_responses_lite: Option<bool>,
+    output: &[ResponsesInputItem],
+) -> bool {
     let Some(session_id) = session_id else {
         return false;
     };
@@ -125,7 +172,13 @@ pub fn activate_compaction(
     let Some(state) = registry.states.get_mut(session_id) else {
         return false;
     };
-    if state.model != model || !matches!(state.phase, CompactionPhase::Unconfirmed) {
+    if state.model != model
+        || matches!(
+            (state.use_responses_lite, use_responses_lite),
+            (Some(stored_lane), Some(request_lane)) if stored_lane != request_lane
+        )
+        || !matches!(state.phase, CompactionPhase::Unconfirmed)
+    {
         registry.states.remove(session_id);
         update_total_bytes(registry);
         return false;
@@ -151,7 +204,11 @@ pub fn apply_compaction_replay(
     let registry = guard.as_mut()?;
     evict_states(registry, now);
     let state = registry.states.get_mut(session_id)?;
-    if state.model != request.model {
+    if state.model != request.model
+        || state
+            .use_responses_lite
+            .is_some_and(|stored_lane| stored_lane != request_uses_responses_lite(request))
+    {
         registry.states.remove(session_id);
         update_total_bytes(registry);
         return None;
@@ -464,7 +521,11 @@ fn state_size(session_id: &str, state: &CompactionState) -> usize {
         CompactionPhase::Unconfirmed => 0,
         CompactionPhase::Anchored { portable_summary } => portable_summary.len(),
     };
-    session_id.len() + state.model.len() + summary_len + serialized_size(&state.native_history)
+    session_id.len()
+        + state.model.len()
+        + std::mem::size_of::<Option<bool>>()
+        + summary_len
+        + serialized_size(&state.native_history)
 }
 
 fn now_ms() -> u64 {
@@ -515,16 +576,26 @@ mod tests {
     static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
     fn request(input: serde_json::Value) -> ResponsesRequest {
-        serde_json::from_value(json!({
+        request_for_lane(input, true)
+    }
+
+    fn request_for_lane(input: serde_json::Value, use_responses_lite: bool) -> ResponsesRequest {
+        let mut request: ResponsesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
             "input": input,
             "store": false,
             "stream": true,
-            "parallel_tool_calls": false,
-            "client_metadata": {"lite":"true"},
+            "parallel_tool_calls": !use_responses_lite,
             "text": {"verbosity":"low"}
         }))
-        .unwrap()
+        .unwrap();
+        if use_responses_lite {
+            request.client_metadata = Some(HashMap::from([(
+                super::super::translate::request::RESPONSES_LITE_METADATA_KEY.to_string(),
+                "true".to_string(),
+            )]));
+        }
+        request
     }
 
     fn output(text: &str) -> Vec<ResponsesInputItem> {
@@ -690,6 +761,61 @@ mod tests {
         ]));
         changed.model = "gpt-5.4".to_string();
         assert!(apply_compaction_replay(Some("session"), &changed).is_none());
+    }
+
+    #[test]
+    fn replay_clears_on_lane_change() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let stored = request(json!([]));
+        assert!(store_compaction_for_request(
+            "session",
+            &stored,
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "opaque".to_string(),
+            }],
+        ));
+        assert!(activate_compaction_for_request(
+            Some("session"),
+            &stored,
+            &output(SUMMARY),
+        ));
+        let input = json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]);
+
+        let full = request_for_lane(input.clone(), false);
+        assert!(apply_compaction_replay(Some("session"), &full).is_none());
+
+        let lite = request_for_lane(input, true);
+        assert!(apply_compaction_replay(Some("session"), &lite).is_none());
+    }
+
+    #[test]
+    fn activation_clears_on_lane_change() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let lite = request(json!([]));
+        assert!(store_compaction_for_request(
+            "session",
+            &lite,
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "opaque".to_string(),
+            }],
+        ));
+        let full = request_for_lane(json!([]), false);
+
+        assert!(!activate_compaction_for_request(
+            Some("session"),
+            &full,
+            &output(SUMMARY),
+        ));
+        assert!(!activate_compaction_for_request(
+            Some("session"),
+            &lite,
+            &output(SUMMARY),
+        ));
     }
 
     #[test]

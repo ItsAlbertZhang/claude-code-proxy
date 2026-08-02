@@ -12,7 +12,7 @@ use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIG
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
 use super::search::{SearchRequest, SearchResponse};
-use super::translate::request::ResponsesRequest;
+use super::translate::request::{ResponsesRequest, request_uses_responses_lite};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -989,12 +989,17 @@ impl CodexHttpClient {
                         retry_after: None,
                         origin: CodexErrorOrigin::Http,
                     })?;
-                    self.attempt_post_http(&auth, &body_json, ctx, body.client_metadata.is_some())
-                        .await
+                    self.attempt_post_http(
+                        &auth,
+                        &body_json,
+                        ctx,
+                        request_uses_responses_lite(body),
+                    )
+                    .await
                 }
                 CodexTransport::WebSocket => {
                     let ws_headers =
-                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
+                        build_codex_headers(&auth, ctx, request_uses_responses_lite(body))?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(body, active_continuation.as_ref());
 
@@ -1015,7 +1020,7 @@ impl CodexHttpClient {
                 }
                 CodexTransport::Auto => {
                     let ws_headers =
-                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
+                        build_codex_headers(&auth, ctx, request_uses_responses_lite(body))?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(body, active_continuation.as_ref());
 
@@ -1053,7 +1058,7 @@ impl CodexHttpClient {
                                 &auth,
                                 &body_json,
                                 ctx,
-                                body.client_metadata.is_some(),
+                                request_uses_responses_lite(body),
                             )
                             .await
                         }
@@ -1344,14 +1349,14 @@ impl CodexHttpClient {
         let mut forwarded_any = false;
 
         'attempt: loop {
-            let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
-            {
-                Ok(headers) => super::websocket::codex_websocket_headers(&headers),
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    return;
-                }
-            };
+            let ws_headers =
+                match build_codex_headers(&auth, &ctx, request_uses_responses_lite(&body)) {
+                    Ok(headers) => super::websocket::codex_websocket_headers(&headers),
+                    Err(err) => {
+                        let _ = tx.send(Err(err)).await;
+                        return;
+                    }
+                };
             let ws_body = build_websocket_request(&body, continuation.as_ref());
             let start = super::websocket::codex_websocket_event_stream(
                 &self.websocket_client,
@@ -2175,6 +2180,43 @@ mod tests {
             },
             reasoning: None,
         }
+    }
+
+    #[test]
+    fn translated_request_headers_require_semantic_lite_metadata() {
+        let mut request = buffered_test_request();
+        request.client_metadata = Some(std::collections::HashMap::from([(
+            "unrelated".to_string(),
+            "true".to_string(),
+        )]));
+        let headers = build_codex_headers(
+            &http_test_auth(),
+            &http_test_context(),
+            request_uses_responses_lite(&request),
+        )
+        .unwrap();
+        assert!(
+            headers
+                .get("x-openai-internal-codex-responses-lite")
+                .is_none()
+        );
+
+        request.client_metadata = Some(std::collections::HashMap::from([(
+            super::super::translate::request::RESPONSES_LITE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        )]));
+        let headers = build_codex_headers(
+            &http_test_auth(),
+            &http_test_context(),
+            request_uses_responses_lite(&request),
+        )
+        .unwrap();
+        assert_eq!(
+            headers
+                .get("x-openai-internal-codex-responses-lite")
+                .unwrap(),
+            "true"
+        );
     }
 
     fn authenticated_http_test_client(base_url: String) -> CodexHttpClient {
