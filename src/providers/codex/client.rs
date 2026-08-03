@@ -4593,11 +4593,6 @@ mod tests {
             .await
             .unwrap();
 
-        let synthetic = events.recv().await.unwrap().unwrap();
-        assert_eq!(
-            synthetic.get("type").and_then(|value| value.as_str()),
-            Some("keepalive")
-        );
         let first_upstream = tokio::time::timeout(Duration::from_millis(200), events.recv())
             .await
             .expect("first upstream event must arrive before the response completes")

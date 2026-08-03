@@ -1664,14 +1664,17 @@ mod tests {
     }
 
     #[test]
-    fn progress_events_start_message_and_emit_pings() {
+    fn progress_events_are_quiet_and_explicit_pings_start_the_message() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let first = String::from_utf8(
+        let progress = String::from_utf8(
             translator
                 .accept(&json!({"type": "response.created"}), None)
                 .unwrap(),
         )
         .unwrap();
+        assert!(progress.is_empty());
+
+        let first = String::from_utf8(translator.ping_chunk(None)).unwrap();
         assert_eq!(first.matches("event: message_start").count(), 1);
         assert_eq!(first.matches("event: ping").count(), 1);
 
