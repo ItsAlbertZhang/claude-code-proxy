@@ -420,10 +420,10 @@ pub fn build_codex_image_headers(
             header_value("ChatGPT-Account-Id", account_id)?,
         );
     }
-    if let Some(session_id) = ctx.session_id.as_deref() {
+    if let Some(session_id) = legacy_upstream_session_id(ctx) {
         headers.insert(
             "x-client-request-id",
-            header_value("x-client-request-id", session_id)?,
+            header_value("x-client-request-id", &session_id)?,
         );
     }
     let user_agent = config::codex_user_agent(&default_user_agent(false));
@@ -456,10 +456,10 @@ pub fn build_codex_transcription_headers(
             header_value("ChatGPT-Account-Id", account_id)?,
         );
     }
-    if let Some(session_id) = ctx.session_id.as_deref() {
+    if let Some(session_id) = legacy_upstream_session_id(ctx) {
         headers.insert(
             "x-client-request-id",
-            header_value("x-client-request-id", session_id)?,
+            header_value("x-client-request-id", &session_id)?,
         );
     }
     let user_agent = config::codex_user_agent(&default_user_agent(false));
@@ -4990,9 +4990,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_search_does_not_dispatch_to_alpha_endpoint() {
+    async fn standalone_search_posts_json_to_alpha_endpoint() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let header_end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("POST /alpha/search HTTP/1.1"));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("accept: application/json")
+            );
+            assert!(headers.contains("authorization: Bearer test"));
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end + 4..]).unwrap();
+            assert_eq!(body["model"], "gpt-5.6-luna");
+            assert!(body.get("reasoning").is_none());
+            assert_eq!(body["commands"]["search_query"][0]["q"], "find Codex");
+
+            let response = serde_json::to_vec(&serde_json::json!({
+                "encrypted_output": "opaque",
+                "output": "search output",
+                "results": [{
+                    "type": "text_result",
+                    "ref_id": "turn0search0",
+                    "url": "https://example.com",
+                    "title": "Example"
+                }]
+            }))
+            .unwrap();
+            let response_headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(response_headers.as_bytes()).await.unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+
         let client = authenticated_http_test_client(format!("http://{addr}/responses"));
         let request = super::super::search::SearchRequest {
             id: "session".to_string(),
@@ -5011,22 +5051,13 @@ mod tests {
             },
             max_output_tokens: 2_500,
         };
-
-        let error = client
+        let response = client
             .post_search(&request, &http_test_context())
             .await
-            .unwrap_err();
-        assert_eq!(error.status, 501);
-        assert_eq!(
-            error.detail.as_deref(),
-            Some("route_safe_recovery_required")
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), listener.accept())
-                .await
-                .is_err(),
-            "fail-closed standalone search must not dispatch"
-        );
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(response.output, "search output");
+        assert_eq!(response.results.unwrap().len(), 1);
     }
 
     #[tokio::test]
