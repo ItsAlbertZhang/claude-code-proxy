@@ -1,6 +1,6 @@
 use crate::anthropic::schema::MessagesRequest;
 use crate::monitor::MonitorHandle;
-use crate::request_identity::ConversationIdentity;
+use crate::request_identity::{ConversationIdentity, RequestPurpose, RequestScope};
 use crate::traffic::TrafficCapture;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -34,7 +34,8 @@ pub trait Provider: Send + Sync {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        let _ = conversation_identity;
+        let identity = compatible_explicit_identity(&ctx, conversation_identity);
+        let _ = identity;
         self.handle_messages(body, ctx).await
     }
 
@@ -53,6 +54,17 @@ pub trait Provider: Send + Sync {
                 self.name()
             ),
         ))
+    }
+
+    async fn generate_anthropic_stream_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Result<Generation, ProviderError> {
+        let identity = compatible_explicit_identity(&ctx, conversation_identity);
+        let _ = identity;
+        self.generate_anthropic_stream(body, ctx).await
     }
 }
 
@@ -123,4 +135,36 @@ pub struct RequestContext {
     pub provider: String,
     pub traffic: Option<Arc<TrafficCapture>>,
     pub monitor: Option<MonitorHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScopedRequestContext {
+    legacy: RequestContext,
+    scope: RequestScope,
+}
+
+impl ScopedRequestContext {
+    pub(crate) fn new(legacy: RequestContext, scope: RequestScope) -> Self {
+        Self { legacy, scope }
+    }
+
+    pub(crate) fn into_parts(self) -> (RequestContext, RequestScope) {
+        (self.legacy, self.scope)
+    }
+}
+
+pub(crate) fn compatible_explicit_identity(
+    ctx: &RequestContext,
+    identity: Option<ConversationIdentity>,
+) -> Option<ConversationIdentity> {
+    let identity = identity.and_then(|identity| identity.validated())?;
+    let legacy = ctx
+        .session_id
+        .as_deref()
+        .and_then(ConversationIdentity::from_legacy_main)?;
+    (identity.session_component() == legacy.session_component()).then_some(identity)
+}
+
+pub(crate) fn legacy_scope(ctx: &RequestContext, purpose: RequestPurpose) -> RequestScope {
+    RequestScope::legacy(ctx.session_id.as_deref(), purpose)
 }

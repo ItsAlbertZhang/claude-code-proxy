@@ -134,6 +134,31 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     })
 }
 
+pub(crate) fn failure_with_status(
+    payload: &Value,
+    expected_status: u16,
+) -> Option<CodexEventFailure> {
+    classify_event_failure(payload).filter(|failure| failure.status == expected_status)
+}
+
+pub(crate) fn first_failure_with_status(
+    body: &[u8],
+    expected_status: u16,
+) -> Option<CodexEventFailure> {
+    for event in crate::anthropic::sse::parse_sse_events(body) {
+        if event.data == "[DONE]" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
+            continue;
+        };
+        if let Some(failure) = failure_with_status(&payload, expected_status) {
+            return Some(failure);
+        }
+    }
+    None
+}
+
 pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> {
     for event in crate::anthropic::sse::parse_sse_events(body) {
         if event.data == "[DONE]" {
@@ -290,5 +315,49 @@ mod tests {
         }))
         .unwrap();
         assert!(!failure.retryable());
+    }
+
+    #[test]
+    fn extracts_explicit_unauthorized_failures_from_payload_and_sse() {
+        let payload = serde_json::json!({
+            "type": "response.failed",
+            "status_code": 401,
+            "response": {
+                "error": {
+                    "status": 401,
+                    "message": "route credential rejected",
+                    "retry_after": 2
+                }
+            }
+        });
+        let failure = failure_with_status(&payload, 401).unwrap();
+        assert_eq!(failure.explicit_status, Some(401));
+        assert_eq!(failure.status, 401);
+        assert_eq!(failure.message, "route credential rejected");
+        assert_eq!(failure.retry_after.as_deref(), Some("2"));
+        assert!(!failure.retryable());
+
+        let body = format!(
+            "data: {{\"type\":\"response.created\"}}\n\ndata: {payload}\n\ndata: [DONE]\n\n"
+        );
+        assert_eq!(
+            first_failure_with_status(body.as_bytes(), 401),
+            Some(failure)
+        );
+        assert!(first_failure_with_status(body.as_bytes(), 403).is_none());
+    }
+
+    #[test]
+    fn unauthorized_requires_an_explicit_401_status() {
+        assert!(
+            failure_with_status(
+                &serde_json::json!({
+                    "type": "response.failed",
+                    "response": {"error": {"message": "unauthorized"}}
+                }),
+                401
+            )
+            .is_none()
+        );
     }
 }

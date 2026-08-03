@@ -84,7 +84,8 @@ impl Provider for CursorProvider {
             );
         }
 
-        if let Some(ref session_id) = ctx.session_id
+        if can_bridge_cursor_native_tools(&body, ctx.session_id.as_deref())
+            && let Some(ref session_id) = ctx.session_id
             && let Some(pending) = BridgeRegistry::pending_tool(session_id)
             && let Some(result) = find_tool_result(&body, pending.tool_use_id())
         {
@@ -256,7 +257,8 @@ impl Provider for CursorProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model_id);
         }
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        if let Some(session_id) = ctx.session_id.as_deref()
+        if can_bridge_cursor_native_tools(&body, ctx.session_id.as_deref())
+            && let Some(session_id) = ctx.session_id.as_deref()
             && let Some(pending) = BridgeRegistry::pending_tool(session_id)
             && let Some(result) = find_tool_result(&body, pending.tool_use_id())
         {

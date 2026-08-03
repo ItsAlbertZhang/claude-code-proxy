@@ -128,7 +128,7 @@ const DEFAULT_MAX_TOKENS: u32 = 32000;
 
 pub fn translate_request(
     req: &MessagesRequest,
-    opts: TranslateOptions,
+    _opts: TranslateOptions,
 ) -> Result<KimiChatRequest, anyhow::Error> {
     let model = req.model.as_deref().unwrap_or(KIMI_DEFAULT_MODEL);
     let resolved = resolve_model(model);
@@ -153,7 +153,8 @@ pub fn translate_request(
         }),
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
-        prompt_cache_key: opts.session_id,
+        // Kimi prompt-cache ownership is disabled until a stable provider lane exists.
+        prompt_cache_key: None,
     };
 
     // Collapse auto tool_choice to None (default behavior)
@@ -648,7 +649,7 @@ mod tests {
         .unwrap();
         assert_eq!(translated.model, "kimi-for-coding");
         assert_eq!(translated.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(translated.prompt_cache_key.as_deref(), Some("sid"));
+        assert!(translated.prompt_cache_key.is_none());
         assert_eq!(translated.max_tokens, 10);
     }
 
