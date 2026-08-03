@@ -679,6 +679,23 @@ mod tests {
     }
 
     #[test]
+    fn tool_free_parallel_policy_is_preserved_for_kimi() {
+        for parallel in [false, true] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"kimi-k2.6",
+                "messages":[{"role":"user","content":"hello"}],
+                "parallel_tool_calls":parallel
+            }))
+            .unwrap();
+            let translated =
+                translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+            assert_eq!(translated.parallel_tool_calls, Some(parallel));
+            assert!(translated.tool_choice.is_none());
+            assert!(translated.tools.is_none());
+        }
+    }
+
+    #[test]
     fn scoped_prompt_cache_keys_isolate_main_and_sibling_agents() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "kimi-k2",

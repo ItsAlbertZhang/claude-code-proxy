@@ -462,7 +462,7 @@ pub fn responses_response(
         "status":if incomplete { "incomplete" } else { "completed" },
         "model":model,
         "output":output,
-        "parallel_tool_calls":false,
+        "parallel_tool_calls":response_metadata.parallel_tool_calls,
         "tool_choice":response_metadata.tool_choice,
         "tools":response_metadata.tools,
         "error":null,
@@ -694,19 +694,24 @@ mod tests {
     }
 
     #[test]
-    fn renders_responses_function_items() {
+    fn buffered_responses_preserves_effective_parallel_policy() {
+        let metadata = OpenAiResponseMetadata {
+            parallel_tool_calls: true,
+            ..OpenAiResponseMetadata::default()
+        };
         let response = buffered_response(
             OpenAiSurface::Responses,
             &events(),
             "resp_test",
             "kimi-k2.6",
             1,
-            &OpenAiResponseMetadata::default(),
+            &metadata,
         )
         .unwrap();
         assert_eq!(response["object"], "response");
         assert_eq!(response["output"][0]["type"], "message");
         assert_eq!(response["output"][1]["type"], "function_call");
+        assert_eq!(response["parallel_tool_calls"], true);
         assert_eq!(response["usage"]["total_tokens"], 10);
     }
 }

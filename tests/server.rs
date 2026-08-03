@@ -156,6 +156,16 @@ impl Provider for TranslatingProvider {
                 .unwrap(),
             )
             .unwrap(),
+            "opencode" => serde_json::to_value(
+                claude_code_proxy::providers::opencode::chat::prepare_request(&body, self.model)
+                    .unwrap(),
+            )
+            .unwrap(),
+            "cursor" => serde_json::json!({
+                "parallel_tool_calls": body.extra.get("parallel_tool_calls"),
+                "tool_choice": body.extra.get("tool_choice"),
+                "rendered": claude_code_proxy::providers::cursor::request::render_cursor_prompt(&body),
+            }),
             _ => unreachable!(),
         };
         *self.captured.lock().unwrap() = Some(translated);
@@ -1226,6 +1236,44 @@ async fn openai_routes_preserve_serial_tool_calls_upstream() {
         let translated = captured.lock().unwrap().clone().unwrap();
         assert_eq!(translated["parallel_tool_calls"], false);
         assert_eq!(translated["tool_choice"], expected_choice);
+    }
+}
+
+#[tokio::test]
+async fn tool_free_parallel_policy_reaches_all_openai_backends_without_synthetic_choice() {
+    for (provider, model) in [
+        ("kimi", "kimi-k2.6"),
+        ("grok", "grok-4.5"),
+        ("cursor", "cursor:gpt-5.5"),
+        ("opencode", "glm-5.2"),
+    ] {
+        for parallel in [false, true] {
+            let captured = Arc::new(Mutex::new(None));
+            let body = json!({
+                "model":model,
+                "input":"hello",
+                "parallel_tool_calls":parallel
+            });
+            let response = app_with_options(
+                translating_registry(provider, model, captured.clone()),
+                None,
+                true,
+            )
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(body_string(&body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{provider}");
+            let translated = captured.lock().unwrap().clone().unwrap();
+            assert_eq!(translated["parallel_tool_calls"], parallel, "{provider}");
+            assert!(translated["tool_choice"].is_null(), "{provider}");
+        }
     }
 }
 
