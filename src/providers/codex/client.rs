@@ -62,6 +62,61 @@ impl AuthRejectionBudget {
     }
 }
 
+pub(crate) struct InBandAuthRefreshDetector {
+    client: Arc<CodexHttpClient>,
+    route: CodexBoundRoute,
+    budget: Arc<AuthRejectionBudget>,
+    detector: super::events::BoundedAuthFailureDetector,
+}
+
+impl InBandAuthRefreshDetector {
+    pub(crate) fn json(
+        client: Arc<CodexHttpClient>,
+        route: CodexBoundRoute,
+        budget: Arc<AuthRejectionBudget>,
+    ) -> Self {
+        Self {
+            client,
+            route,
+            budget,
+            detector: super::events::BoundedAuthFailureDetector::json(),
+        }
+    }
+
+    pub(crate) fn sse(
+        client: Arc<CodexHttpClient>,
+        route: CodexBoundRoute,
+        budget: Arc<AuthRejectionBudget>,
+    ) -> Self {
+        Self {
+            client,
+            route,
+            budget,
+            detector: super::events::BoundedAuthFailureDetector::sse(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, chunk: &[u8]) {
+        if self.detector.observe(chunk) {
+            self.schedule_refresh();
+        }
+    }
+
+    pub(crate) fn finish(&mut self) {
+        if self.detector.finish() {
+            self.schedule_refresh();
+        }
+    }
+
+    fn schedule_refresh(&self) {
+        self.client
+            .refresh_conversation_auth_after_rejection_in_background(
+                &self.route,
+                self.budget.clone(),
+            );
+    }
+}
+
 pub(crate) enum RouteRebindResult {
     Rebound(Box<CodexBoundRoute>),
     CurrentRequestRejected,

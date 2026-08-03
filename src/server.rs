@@ -1062,7 +1062,11 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         }
     } else {
         match state.native_responses.as_ref() {
-            Some(backend) => backend.handle(body, context).await,
+            Some(backend) => {
+                backend
+                    .handle_scoped(body, ScopedRequestContext::new(context, request_scope))
+                    .await
+            }
             None => openai_error(
                 StatusCode::NOT_FOUND,
                 "not_found_error",
@@ -1278,7 +1282,14 @@ async fn handler_chat_completions(
     };
     let response = if let Some(translated) = translated {
         match state.chat_completions.as_ref() {
-            Some(backend) => backend.handle(translated, context).await,
+            Some(backend) => {
+                backend
+                    .handle_scoped(
+                        translated,
+                        ScopedRequestContext::new(context, request_scope),
+                    )
+                    .await
+            }
             None => openai_error(
                 StatusCode::NOT_FOUND,
                 "not_found_error",
