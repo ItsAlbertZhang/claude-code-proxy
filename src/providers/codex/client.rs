@@ -5,7 +5,9 @@ use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::provider::{RequestContext, legacy_scope};
-use crate::request_identity::{ConversationIdentity, LaneDomain, OpaqueLane, RequestPurpose};
+#[cfg(test)]
+use crate::request_identity::ConversationIdentity;
+use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose};
 use crate::retry::{compute_backoff_delay, should_retry_status, sleep};
 use crate::traffic::TrafficCapture;
 
@@ -1372,6 +1374,7 @@ impl CodexHttpClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn post_search_bound(
         &self,
         route: &CodexBoundRoute,
@@ -2157,6 +2160,7 @@ impl CodexHttpClient {
         }
     }
 
+    #[cfg(test)]
     async fn attempt_post_http(
         &self,
         auth: &StoredAuth,
@@ -2843,6 +2847,7 @@ pub(super) fn is_continuation_retry_error(err: &CodexError) -> bool {
     )
 }
 
+#[cfg(test)]
 fn websocket_pool_owner(
     continuation: Option<&super::continuation::ContinuationReservation>,
 ) -> Option<&ConversationIdentity> {

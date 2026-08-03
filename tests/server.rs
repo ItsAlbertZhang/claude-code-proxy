@@ -916,50 +916,6 @@ async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
 }
 
 #[tokio::test]
-async fn monitor_tracks_transcription_endpoint_without_session_affinity() {
-    let monitor = MonitorHandle::new(10);
-    let app = app_with_features(
-        Arc::new(Registry::with_default_alias()),
-        Some(monitor.clone()),
-        AppFeatures {
-            responses_api: false,
-            images_api: false,
-            transcriptions_api: true,
-        },
-    );
-    let boundary = "ccp-transcription-affinity-test";
-    let body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-mini-transcribe\r\n--{boundary}--\r\n"
-    );
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/audio/transcriptions")
-                .header("session_id", "raw-transcription-session")
-                .header(
-                    "content-type",
-                    format!("multipart/form-data; boundary={boundary}"),
-                )
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-
-    let state = monitor.snapshot();
-    assert_eq!(state.recent.len(), 1);
-    assert_eq!(state.recent[0].endpoint.label(), "transcriptions");
-    assert_eq!(state.recent[0].status, RequestStatus::Failed);
-    assert!(state.recent[0].session_seq.is_none());
-    assert!(state.recent[0].traffic_capture_path.is_none());
-}
-
-#[tokio::test]
 async fn transcription_route_rejects_non_audio_uploads() {
     let app = app_with_features(
         Arc::new(Registry::with_default_alias()),

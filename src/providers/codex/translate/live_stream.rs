@@ -145,11 +145,10 @@ impl LiveStreamTranslator {
         let mut out = Vec::new();
 
         match kind {
-            "codex.rate_limits" => {
-                if is_terminal_rate_limit_event(payload) {
-                    return Err("rate limit reached".to_string());
-                }
+            "codex.rate_limits" if is_terminal_rate_limit_event(payload) => {
+                return Err("rate limit reached".to_string());
             }
+            "codex.rate_limits" => {}
             "keepalive" => {}
             "response.failed" | "response.error" | "error" => {
                 return Err(error_message(payload));
