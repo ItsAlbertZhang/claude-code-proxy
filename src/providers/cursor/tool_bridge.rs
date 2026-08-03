@@ -251,23 +251,9 @@ pub fn advertised_tool_names(body: &MessagesRequest) -> Option<BTreeSet<String>>
     if names.is_empty() { None } else { Some(names) }
 }
 
-/// Whether the request can use the Cursor native tool bridge.
-///
-/// Returns `true` when the request is streaming, has a session id, and
-/// advertises at least one of Read, Write, or Bash.
-pub fn can_bridge_cursor_native_tools(body: &MessagesRequest, session_id: Option<&str>) -> bool {
-    let _sid = match session_id {
-        Some(id) if !id.is_empty() => id,
-        _ => return false,
-    };
-    if !body.stream {
-        return false;
-    }
-    let names = match advertised_tool_names(body) {
-        Some(n) => n,
-        None => return false,
-    };
-    names.contains("Read") || names.contains("Write") || names.contains("Bash")
+/// Cursor native bridge ownership is disabled until a stable provider lane exists.
+pub fn can_bridge_cursor_native_tools(_body: &MessagesRequest, _session_id: Option<&str>) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn can_bridge_returns_true_for_stream_with_read_tool() {
+    fn native_bridge_is_disabled_without_a_stable_lane() {
         let body: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "cursor:gpt-5.5",
             "stream": true,
@@ -1172,7 +1158,7 @@ mod tests {
             "tools": [{"name": "Read", "description": "read", "input_schema": {}}]
         }))
         .unwrap();
-        assert!(can_bridge_cursor_native_tools(&body, Some("session-1")));
+        assert!(!can_bridge_cursor_native_tools(&body, Some("session-1")));
     }
 
     #[test]

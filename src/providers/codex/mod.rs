@@ -9,6 +9,7 @@ pub mod images;
 pub mod native;
 pub mod request_summary;
 pub mod search;
+pub(crate) mod state;
 pub mod transcription;
 pub mod translate;
 pub mod websocket;
@@ -20,7 +21,6 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::StatusCode;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
@@ -28,25 +28,30 @@ use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
-use crate::provider::{CliHandlers, Provider, RequestContext};
+use crate::provider::{
+    CliHandlers, Provider, RequestContext, ScopedRequestContext, compatible_explicit_identity,
+    legacy_scope,
+};
 use crate::registry;
-use crate::request_identity::ConversationIdentity;
+use crate::request_identity::{ConversationIdentity, LaneDomain, RequestPurpose, RequestScope};
 use crate::retry::{compute_backoff_delay, sleep};
 
 use self::auth::browser_login::run_browser_login;
 use self::auth::device::DeviceAuthClient;
 use self::auth::manager::CodexAuthManager;
 use self::auth::token_store::file_store;
-use self::client::CodexHttpClient;
+use self::client::{AuthRejectionBudget, BufferedRetryState, CodexHttpClient};
 use self::compaction::{
-    abort_compaction_attempt, activate_compaction_for_request, apply_compaction_replay,
-    request_compaction, store_compaction_for_request,
+    CompactionLease, CompactionStartPermit, abort_compaction_for_route,
+    activate_compaction_for_route, apply_compaction_replay_for_route, begin_compaction_for_route,
+    request_compaction_bound, reserve_compaction_start, store_compaction_for_route,
 };
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
     record_continuation_for_owner,
 };
 use self::count_tokens::count_translated_tokens;
+use self::state::{CodexBoundRoute, ProtocolLane};
 use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
@@ -67,12 +72,23 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 // Provider
 // ---------------------------------------------------------------------------
 
-pub(crate) fn clear_session_compaction(session_id: &str) {
-    compaction::clear_compaction(session_id);
+pub(crate) fn clear_conversation_state(identity: &ConversationIdentity) {
+    continuation::clear_continuation_for_owner(Some(identity));
+    websocket::invalidate_codex_websocket_pool_owner(identity);
+    let lane = RequestScope::from_conversation_identity(
+        Some(identity.clone()),
+        RequestPurpose::Conversation,
+    )
+    .provider_lane(LaneDomain::CodexConversation);
+    if let Some(lane) = lane {
+        compaction::clear_compactions_for_lane(lane);
+    }
 }
 
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
+    #[cfg(test)]
+    server_compaction_override: Option<bool>,
 }
 
 impl Default for CodexProvider {
@@ -85,7 +101,31 @@ impl CodexProvider {
     pub fn new() -> Self {
         Self {
             client: Arc::new(CodexHttpClient::new()),
+            #[cfg(test)]
+            server_compaction_override: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_client(client: CodexHttpClient) -> Self {
+        Self {
+            client: Arc::new(client),
+            server_compaction_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_server_compaction_for_test(mut self) -> Self {
+        self.server_compaction_override = Some(true);
+        self
+    }
+
+    fn server_compaction_enabled(&self) -> bool {
+        #[cfg(test)]
+        if let Some(enabled) = self.server_compaction_override {
+            return enabled;
+        }
+        config::codex_server_compaction()
     }
 }
 
@@ -93,9 +133,11 @@ impl CodexProvider {
     async fn handle_messages_inner(
         &self,
         body: MessagesRequest,
-        ctx: RequestContext,
-        conversation_identity: Option<ConversationIdentity>,
+        scoped: ScopedRequestContext,
     ) -> Response {
+        let (ctx, scope) = scoped.into_parts();
+        let conversation_identity = scope.conversational_lane().cloned();
+        let codex_lane = scope.provider_lane(LaneDomain::CodexConversation);
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
@@ -113,82 +155,10 @@ impl CodexProvider {
             );
         }
         if search::is_standalone_search_request(&body) {
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.model_resolved(&ctx.req_id, &resolved.model);
-            }
-            let (search_request, query) = match search::build_search_request(
-                &body,
-                &resolved.model,
-                ctx.session_id.as_deref(),
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    return json_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        error.to_string(),
-                    );
-                }
-            };
-            let log = create_logger("codex");
-            let started_at = Instant::now();
-            log.info(
-                "codex_standalone_search_started",
-                Some(serde_json::Map::from_iter([
-                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
-                    ("model".to_string(), serde_json::json!(&resolved.model)),
-                    ("stream".to_string(), serde_json::json!(want_stream)),
-                ])),
-            );
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.upstream_started(&ctx.req_id);
-            }
-            let search_response = match self.client.post_search(&search_request, &ctx).await {
-                Ok(response) => response,
-                Err(error) => {
-                    log.warn(
-                        "codex_standalone_search_failed",
-                        Some(serde_json::Map::from_iter([
-                            ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
-                            ("model".to_string(), serde_json::json!(&resolved.model)),
-                            ("status".to_string(), serde_json::json!(error.status)),
-                            (
-                                "ms".to_string(),
-                                serde_json::json!(started_at.elapsed().as_millis()),
-                            ),
-                        ])),
-                    );
-                    return map_codex_error_to_response(&error);
-                }
-            };
-            log.info(
-                "codex_standalone_search_completed",
-                Some(serde_json::Map::from_iter([
-                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
-                    ("model".to_string(), serde_json::json!(&resolved.model)),
-                    (
-                        "resultCount".to_string(),
-                        serde_json::json!(search_response.results.as_ref().map(Vec::len)),
-                    ),
-                    (
-                        "ms".to_string(),
-                        serde_json::json!(started_at.elapsed().as_millis()),
-                    ),
-                ])),
-            );
-            let input_tokens = search::search_request_input_tokens(&search_request);
-            let output_tokens = search::search_response_output_tokens(&search_response);
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.usage_updated(&ctx.req_id, Some(input_tokens), Some(output_tokens));
-            }
-            return search::anthropic_search_response(
-                &search_response,
-                &query,
-                &message_id,
-                model,
-                want_stream,
-                input_tokens,
-                ctx.traffic.as_deref(),
+            return json_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "invalid_request_error",
+                "Standalone Codex search is disabled until route-safe recovery is available",
             );
         }
         let full_lane = config::codex_full_lane();
@@ -198,232 +168,356 @@ impl CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let mut translated = match translate_request(
+        let original_translated = match translate_request(
             &body,
             TranslateOptions {
-                session_id: ctx.session_id.clone(),
+                // Route binding owns all upstream conversation identity. Never
+                // translate a raw session or Agent identifier into a cache key.
+                session_id: None,
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
         ) {
-            Ok(t) => t,
-            Err(e) => {
+            Ok(translated) => translated,
+            Err(error) => {
                 return json_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
-                    e.to_string(),
+                    error.to_string(),
                 );
             }
         };
 
         let compact_boundary = is_compact_messages_request(&body);
-        let server_compaction_enabled = config::codex_server_compaction();
-        if !server_compaction_enabled && let Some(session_id) = ctx.session_id.as_deref() {
-            compaction::clear_compaction(session_id);
-        }
-        if server_compaction_enabled
-            && compact_boundary
-            && let Some(session_id) = ctx.session_id.as_deref()
-        {
-            compaction::clear_compaction(session_id);
-            log_compaction_event(
-                "server_compaction_triggered",
-                &ctx,
-                translated.input.len(),
-                None,
-            );
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.compaction_started(&ctx.req_id);
-            }
-            let mut compaction_ctx = ctx.clone();
-            compaction_ctx.monitor = None;
-            match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
-                Ok(native_history) => {
-                    if store_compaction_for_request(session_id, &translated, native_history) {
-                        log_compaction_event(
-                            "server_compaction_completed",
-                            &ctx,
-                            translated.input.len(),
-                            None,
-                        );
-                    } else {
-                        log_compaction_event(
-                            "server_compaction_failed",
-                            &ctx,
-                            translated.input.len(),
-                            Some("compaction state exceeded the in-memory limit"),
-                        );
-                    }
-                }
-                Err(error) => {
-                    compaction::clear_compaction(session_id);
-                    log_compaction_event(
-                        "server_compaction_failed",
-                        &ctx,
-                        translated.input.len(),
-                        Some(&error.to_string()),
-                    );
-                }
-            }
-        } else if server_compaction_enabled
-            && !compact_boundary
-            && let Some(replay) = apply_compaction_replay(ctx.session_id.as_deref(), &translated)
-        {
-            translated = replay;
+        let server_compaction_enabled = self.server_compaction_enabled();
+        if !server_compaction_enabled && let Some(lane) = codex_lane {
+            compaction::clear_compactions_for_lane(lane);
         }
 
-        // Check continuation
+        // Reserve logical generations synchronously before route/auth resolution can await.
         let previous_response_id_enabled = config::codex_previous_response_id();
-        let continuation = continuation_candidate_for_owner(
+        let logical_continuation = continuation_candidate_for_owner(
             conversation_identity.as_ref(),
-            &translated,
+            &original_translated,
             previous_response_id_enabled,
         );
+        let compaction_start_permit = (server_compaction_enabled && compact_boundary)
+            .then(|| reserve_compaction_start(codex_lane))
+            .flatten();
+        let mut cleanup = LiveRequestStateCleanup::new(
+            logical_continuation.clone(),
+            None,
+            compaction_start_permit,
+        );
 
-        // Post to upstream with continuation
         let client = self.client.clone();
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.upstream_started(&ctx.req_id);
-        }
-        if want_stream && matches!(config::codex_transport(), config::CodexTransport::WebSocket) {
-            let stream_request = translated.clone();
-            return live_stream_response(
-                client,
-                message_id,
-                model,
-                ctx,
-                stream_request,
-                continuation,
-                compact_boundary,
+        let mut route = match client
+            .bind_conversation_route(
+                codex_lane,
+                ProtocolLane::from_uses_responses_lite(use_responses_lite),
             )
-            .await;
-        }
-
-        let request_continuation = continuation.clone();
-        let mut continuation = Some(continuation);
-        let mut attempt = 0_u32;
-        let upstream = loop {
-            let response = match client
-                .post_codex_for_owner(&translated, &ctx, continuation.as_ref())
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    abort_compaction_attempt(
-                        ctx.session_id.as_deref(),
-                        compact_boundary,
-                        &translated,
-                    );
-                    abort_continuation_for_owner(&request_continuation);
-                    return map_codex_error_to_response(&e);
-                }
-            };
-            if !is_empty_codex_success_completion(&response.body) {
-                break response;
-            }
-            // A successful terminal event with no output would translate into
-            // an empty end_turn; retry with full context instead.
-            let error = empty_buffered_completion_error();
-            drop_live_continuation_for_retry(&mut continuation);
-            if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
-                abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
-                abort_continuation_for_owner(&request_continuation);
+            .await
+        {
+            Ok(route) => route,
+            Err(error) => {
+                cleanup.abort();
                 return map_codex_error_to_response(&error);
             }
-            let delay = compute_backoff_delay(attempt, None);
-            if delay.exceeds_budget {
-                abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
-                abort_continuation_for_owner(&request_continuation);
-                return map_codex_error_to_response(&error);
-            }
-            attempt += 1;
-            sleep(delay.wait_ms).await;
         };
+        let auth_rejection_budget = Arc::new(AuthRejectionBudget::default());
+        let mut buffered_retry_state = BufferedRetryState::default();
+        let mut route_rebuilt = false;
+        let mut live_start_attempt = 0_u32;
+        let mut empty_completion_attempt = 0_u32;
+        let mut upstream_started = false;
 
-        if want_stream {
-            let estimated_input_tokens = count_translated_tokens(&translated);
-            let sse_bytes = match translate_stream_bytes_with_traffic(
-                &upstream.body,
-                &message_id,
-                model,
-                estimated_input_tokens,
-                ctx.traffic.as_deref(),
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    abort_compaction_attempt(
-                        ctx.session_id.as_deref(),
-                        compact_boundary,
+        'routes: loop {
+            let mut translated = bind_messages_request_to_route(&original_translated, &route);
+            let mut request_continuation = if route_rebuilt {
+                logical_continuation.full_context_retry().bind_route(&route)
+            } else {
+                logical_continuation.bind_route(&route)
+            };
+            cleanup.replace_continuation(request_continuation.clone());
+
+            if let Some(permit) = cleanup.compaction_start_permit() {
+                log_compaction_event(
+                    "server_compaction_triggered",
+                    &ctx,
+                    translated.input.len(),
+                    None,
+                );
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.compaction_started(&ctx.req_id);
+                }
+                if let Some(build_lease) =
+                    begin_compaction_for_route(permit, &route, &translated.model)
+                {
+                    cleanup.replace_compaction_lease(Some(build_lease.clone()));
+                    let mut compaction_ctx = ctx.clone();
+                    compaction_ctx.monitor = None;
+                    match request_compaction_bound(
+                        client.as_ref(),
+                        &route,
                         &translated,
+                        &compaction_ctx,
+                        &mut buffered_retry_state,
+                    )
+                    .await
+                    {
+                        Ok(native_history) => {
+                            if store_compaction_for_route(&build_lease, native_history) {
+                                log_compaction_event(
+                                    "server_compaction_completed",
+                                    &ctx,
+                                    translated.input.len(),
+                                    None,
+                                );
+                            } else {
+                                cleanup.abort_compaction();
+                                log_compaction_event(
+                                    "server_compaction_failed",
+                                    &ctx,
+                                    translated.input.len(),
+                                    Some("compaction state exceeded the in-memory limit"),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            cleanup.abort_compaction();
+                            log_compaction_event(
+                                "server_compaction_failed",
+                                &ctx,
+                                translated.input.len(),
+                                Some(&error.to_string()),
+                            );
+                            if let compaction::CompactionError::Upstream(upstream) = error {
+                                if upstream.is_in_band_auth_rejection() {
+                                    client.refresh_conversation_auth_after_rejection_in_background(
+                                        &route,
+                                        auth_rejection_budget.clone(),
+                                    );
+                                    cleanup.abort();
+                                    return map_codex_error_to_response(&upstream);
+                                }
+                                if upstream.is_replayable_auth_rejection() {
+                                    let Some(next_route) = rebuild_route_after_unauthorized(
+                                        client.as_ref(),
+                                        &route,
+                                        auth_rejection_budget.as_ref(),
+                                    )
+                                    .await
+                                    else {
+                                        cleanup.abort();
+                                        return map_codex_error_to_response(&upstream);
+                                    };
+                                    route = next_route;
+                                    route_rebuilt = true;
+                                    continue 'routes;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if server_compaction_enabled
+                && !compact_boundary
+                && let Some(replay) = apply_compaction_replay_for_route(&route, &translated)
+            {
+                translated = replay.request;
+                cleanup.replace_compaction_lease(Some(replay.lease));
+                request_continuation = request_continuation.full_context_retry();
+                cleanup.replace_continuation(request_continuation.clone());
+            }
+
+            if !upstream_started {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.upstream_started(&ctx.req_id);
+                }
+                upstream_started = true;
+            }
+            if want_stream
+                && matches!(
+                    client.configured_transport(),
+                    config::CodexTransport::WebSocket
+                )
+            {
+                match live_stream_route_attempt(
+                    client.clone(),
+                    &route,
+                    message_id.clone(),
+                    model,
+                    ctx.clone(),
+                    translated.clone(),
+                    request_continuation.clone(),
+                    cleanup.compaction_lease().cloned(),
+                    auth_rejection_budget.clone(),
+                    &mut live_start_attempt,
+                )
+                .await
+                {
+                    LiveRouteOutcome::Response(response) => {
+                        cleanup.disarm();
+                        return response;
+                    }
+                    LiveRouteOutcome::Unauthorized(error) => {
+                        cleanup.abort_compaction();
+                        let Some(next_route) = rebuild_route_after_unauthorized(
+                            client.as_ref(),
+                            &route,
+                            auth_rejection_budget.as_ref(),
+                        )
+                        .await
+                        else {
+                            cleanup.abort();
+                            return map_codex_error_to_response(&error);
+                        };
+                        route = next_route;
+                        route_rebuilt = true;
+                        continue 'routes;
+                    }
+                }
+            }
+
+            let mut active_continuation = Some(request_continuation.clone());
+            let upstream = loop {
+                let response = match client
+                    .post_codex_bound_with_retry_state(
+                        &route,
+                        &translated,
+                        &ctx,
+                        active_continuation.as_ref(),
+                        &mut buffered_retry_state,
+                    )
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if error.is_in_band_auth_rejection() {
+                            client.refresh_conversation_auth_after_rejection_in_background(
+                                &route,
+                                auth_rejection_budget.clone(),
+                            );
+                            cleanup.abort();
+                            return map_codex_error_to_response(&error);
+                        }
+                        if error.is_replayable_auth_rejection() {
+                            cleanup.abort_compaction();
+                            websocket::invalidate_codex_websocket_pool_for_reservation(
+                                &request_continuation,
+                            );
+                            let Some(next_route) = rebuild_route_after_unauthorized(
+                                client.as_ref(),
+                                &route,
+                                auth_rejection_budget.as_ref(),
+                            )
+                            .await
+                            else {
+                                cleanup.abort();
+                                return map_codex_error_to_response(&error);
+                            };
+                            route = next_route;
+                            route_rebuilt = true;
+                            continue 'routes;
+                        }
+                        cleanup.abort();
+                        return map_codex_error_to_response(&error);
+                    }
+                };
+                if !is_empty_codex_success_completion(&response.body) {
+                    break response;
+                }
+                // A successful terminal event with no output would translate into
+                // an empty end_turn; retry with full context instead.
+                let error = empty_buffered_completion_error();
+                drop_live_continuation_for_retry(&mut active_continuation);
+                if empty_completion_attempt >= MAX_EMPTY_COMPLETION_RETRIES {
+                    cleanup.abort();
+                    return map_codex_error_to_response(&error);
+                }
+                let delay = compute_backoff_delay(empty_completion_attempt, None);
+                if delay.exceeds_budget {
+                    cleanup.abort();
+                    return map_codex_error_to_response(&error);
+                }
+                empty_completion_attempt += 1;
+                sleep(delay.wait_ms).await;
+            };
+
+            return if want_stream {
+                let estimated_input_tokens = count_translated_tokens(&translated);
+                let sse_bytes = match translate_stream_bytes_with_traffic(
+                    &upstream.body,
+                    &message_id,
+                    model,
+                    estimated_input_tokens,
+                    ctx.traffic.as_deref(),
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        cleanup.abort();
+                        return map_codex_failure_to_response(&format!(
+                            "Stream translation error: {error}"
+                        ));
+                    }
+                };
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+                    monitor.stream_progress(
+                        &ctx.req_id,
+                        sse_bytes.len() as u64,
+                        count_sse_events(&sse_bytes),
+                        input_tokens,
+                        output_tokens,
                     );
-                    abort_continuation_for_owner(&request_continuation);
-                    return map_codex_failure_to_response(&format!(
-                        "Stream translation error: {e}"
-                    ));
+                }
+                update_continuation_from_upstream(
+                    &request_continuation,
+                    &translated,
+                    &upstream.body,
+                    upstream.socket_id,
+                    cleanup.compaction_lease(),
+                );
+                cleanup.disarm();
+
+                let headers = [
+                    (http::header::CONTENT_TYPE, "text/event-stream"),
+                    (http::header::CACHE_CONTROL, "no-cache"),
+                    (http::header::CONNECTION, "keep-alive"),
+                ];
+                (headers, sse_bytes).into_response()
+            } else {
+                match accumulate_response_with_traffic(
+                    &upstream.body,
+                    &message_id,
+                    model,
+                    ctx.traffic.as_deref(),
+                ) {
+                    Ok(json) => {
+                        if let Some(monitor) = ctx.monitor.as_ref() {
+                            monitor.usage_updated(
+                                &ctx.req_id,
+                                json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+                                json.pointer("/usage/output_tokens")
+                                    .and_then(|v| v.as_u64()),
+                            );
+                        }
+                        update_continuation_from_upstream(
+                            &request_continuation,
+                            &translated,
+                            &upstream.body,
+                            upstream.socket_id,
+                            cleanup.compaction_lease(),
+                        );
+                        cleanup.disarm();
+                        (StatusCode::OK, Json(json)).into_response()
+                    }
+                    Err(error) => {
+                        cleanup.abort();
+                        map_codex_failure_to_response(&format!("Accumulation error: {error}"))
+                    }
                 }
             };
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                monitor.stream_progress(
-                    &ctx.req_id,
-                    sse_bytes.len() as u64,
-                    count_sse_events(&sse_bytes),
-                    input_tokens,
-                    output_tokens,
-                );
-            }
-            update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
-                &request_continuation,
-                &translated,
-                &upstream.body,
-                upstream.socket_id,
-                compact_boundary,
-            );
-
-            let headers = [
-                (http::header::CONTENT_TYPE, "text/event-stream"),
-                (http::header::CACHE_CONTROL, "no-cache"),
-                (http::header::CONNECTION, "keep-alive"),
-            ];
-            (headers, sse_bytes).into_response()
-        } else {
-            match accumulate_response_with_traffic(
-                &upstream.body,
-                &message_id,
-                model,
-                ctx.traffic.as_deref(),
-            ) {
-                Ok(json) => {
-                    if let Some(monitor) = ctx.monitor.as_ref() {
-                        monitor.usage_updated(
-                            &ctx.req_id,
-                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
-                            json.pointer("/usage/output_tokens")
-                                .and_then(|v| v.as_u64()),
-                        );
-                    }
-                    update_continuation_from_upstream(
-                        ctx.session_id.as_deref(),
-                        &request_continuation,
-                        &translated,
-                        &upstream.body,
-                        upstream.socket_id,
-                        compact_boundary,
-                    );
-                    (StatusCode::OK, Json(json)).into_response()
-                }
-                Err(e) => {
-                    abort_compaction_attempt(
-                        ctx.session_id.as_deref(),
-                        compact_boundary,
-                        &translated,
-                    );
-                    abort_continuation_for_owner(&request_continuation);
-                    map_codex_failure_to_response(&format!("Accumulation error: {e}"))
-                }
-            }
         }
     }
 }
@@ -452,7 +546,9 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        self.handle_messages_inner(body, ctx, None).await
+        let scope = legacy_scope(&ctx, RequestPurpose::Conversation);
+        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope))
+            .await
     }
 
     async fn handle_messages_with_conversation_identity(
@@ -461,7 +557,10 @@ impl Provider for CodexProvider {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        self.handle_messages_inner(body, ctx, conversation_identity)
+        let identity = compatible_explicit_identity(&ctx, conversation_identity);
+        let scope =
+            RequestScope::from_conversation_identity(identity, RequestPurpose::Conversation);
+        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope))
             .await
     }
 
@@ -535,6 +634,29 @@ fn apply_model_lane_for_request(
     uses_responses_lite_with_full_lane(model, full_lane)
 }
 
+fn bind_messages_request_to_route(
+    original: &translate::request::ResponsesRequest,
+    route: &CodexBoundRoute,
+) -> translate::request::ResponsesRequest {
+    let mut request = original.clone();
+    request.prompt_cache_key = route.namespace_prompt_cache_key("messages");
+    request
+}
+
+async fn rebuild_route_after_unauthorized(
+    client: &CodexHttpClient,
+    rejected: &CodexBoundRoute,
+    budget: &AuthRejectionBudget,
+) -> Option<CodexBoundRoute> {
+    if !budget.try_claim() {
+        return None;
+    }
+    client
+        .refresh_conversation_route_after_rejection(rejected)
+        .await
+        .into_route()
+}
+
 fn count_sse_events(bytes: &[u8]) -> u64 {
     String::from_utf8_lossy(bytes).matches("event:").count() as u64
 }
@@ -557,47 +679,61 @@ fn log_compaction_event(
 }
 
 fn abort_request_state(
-    session_id: Option<&str>,
     continuation: &ContinuationReservation,
-    compact_boundary: bool,
-    request: &translate::request::ResponsesRequest,
+    compaction_lease: Option<&CompactionLease>,
 ) {
-    abort_compaction_attempt(session_id, compact_boundary, request);
+    if let Some(lease) = compaction_lease {
+        abort_compaction_for_route(lease);
+    }
     abort_continuation_for_owner(continuation);
 }
 
 struct LiveRequestStateCleanup {
     continuation: ContinuationReservation,
-    session_id: Option<String>,
-    compact_boundary: bool,
-    request: translate::request::ResponsesRequest,
+    compaction_lease: Option<CompactionLease>,
+    compaction_start_permit: Option<CompactionStartPermit>,
     armed: bool,
 }
 
 impl LiveRequestStateCleanup {
     fn new(
         continuation: ContinuationReservation,
-        session_id: Option<String>,
-        compact_boundary: bool,
-        request: translate::request::ResponsesRequest,
+        compaction_lease: Option<CompactionLease>,
+        compaction_start_permit: Option<CompactionStartPermit>,
     ) -> Self {
         Self {
             continuation,
-            session_id,
-            compact_boundary,
-            request,
+            compaction_lease,
+            compaction_start_permit,
             armed: true,
+        }
+    }
+
+    fn replace_continuation(&mut self, continuation: ContinuationReservation) {
+        self.continuation = continuation;
+    }
+
+    fn compaction_start_permit(&self) -> Option<&CompactionStartPermit> {
+        self.compaction_start_permit.as_ref()
+    }
+
+    fn compaction_lease(&self) -> Option<&CompactionLease> {
+        self.compaction_lease.as_ref()
+    }
+
+    fn replace_compaction_lease(&mut self, lease: Option<CompactionLease>) {
+        self.compaction_lease = lease;
+    }
+
+    fn abort_compaction(&mut self) {
+        if let Some(lease) = self.compaction_lease.take() {
+            abort_compaction_for_route(&lease);
         }
     }
 
     fn abort(&mut self) {
         if self.armed {
-            abort_request_state(
-                self.session_id.as_deref(),
-                &self.continuation,
-                self.compact_boundary,
-                &self.request,
-            );
+            abort_request_state(&self.continuation, self.compaction_lease.as_ref());
             self.armed = false;
         }
     }
@@ -610,7 +746,7 @@ impl LiveRequestStateCleanup {
 impl Drop for LiveRequestStateCleanup {
     fn drop(&mut self) {
         if self.armed {
-            abort_continuation_for_owner(&self.continuation);
+            abort_request_state(&self.continuation, self.compaction_lease.as_ref());
         }
     }
 }
@@ -621,73 +757,127 @@ enum LiveStreamStart {
         error: client::CodexError,
         full_context_retry_attempted: bool,
     },
+    Unauthorized(client::CodexError),
 }
 
+enum LiveRouteOutcome {
+    Response(Response),
+    Unauthorized(client::CodexError),
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn live_stream_response(
     client: Arc<CodexHttpClient>,
+    route: CodexBoundRoute,
     message_id: String,
     model: &str,
     ctx: RequestContext,
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationReservation,
-    compact_boundary: bool,
+    compaction_lease: Option<CompactionLease>,
+    compaction_start_permit: Option<CompactionStartPermit>,
 ) -> Response {
-    let model = model.to_string();
-    let request_continuation = continuation.clone();
     let mut cleanup = LiveRequestStateCleanup::new(
-        request_continuation.clone(),
-        ctx.session_id.clone(),
-        compact_boundary,
-        request_body.clone(),
+        continuation.clone(),
+        compaction_lease.clone(),
+        compaction_start_permit,
     );
-    let mut attempt = 0_u32;
-    let mut continuation = Some(continuation);
+    let mut attempt = 0;
+    let outcome = live_stream_route_attempt(
+        client,
+        &route,
+        message_id,
+        model,
+        ctx,
+        request_body,
+        continuation,
+        compaction_lease,
+        Arc::new(AuthRejectionBudget::default()),
+        &mut attempt,
+    )
+    .await;
+    match outcome {
+        LiveRouteOutcome::Response(response) => {
+            cleanup.disarm();
+            response
+        }
+        LiveRouteOutcome::Unauthorized(error) => {
+            cleanup.abort();
+            map_codex_error_to_response(&error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn live_stream_route_attempt(
+    client: Arc<CodexHttpClient>,
+    route: &CodexBoundRoute,
+    message_id: String,
+    model: &str,
+    ctx: RequestContext,
+    request_body: translate::request::ResponsesRequest,
+    request_continuation: ContinuationReservation,
+    compaction_lease: Option<CompactionLease>,
+    auth_rejection_budget: Arc<AuthRejectionBudget>,
+    attempt: &mut u32,
+) -> LiveRouteOutcome {
+    let model = model.to_string();
+    let mut continuation = Some(request_continuation.clone());
 
     loop {
         let upstream_events = match client
-            .stream_codex_websocket_events_for_owner(&request_body, &ctx, continuation.as_ref())
+            .stream_codex_websocket_events_bound(route, &request_body, &ctx, continuation.as_ref())
             .await
         {
             Ok(events) => events,
-            Err(err) if retryable_live_start_codex_error(&err) => {
+            Err(error) if error.status == 401 => {
+                return LiveRouteOutcome::Unauthorized(error);
+            }
+            Err(error) if retryable_live_start_codex_error(&error) => {
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
-                if dropped && is_missing_previous_response_error(&err) {
-                    attempt += 1;
+                if dropped && is_missing_previous_response_error(&error) {
+                    *attempt += 1;
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&err);
+                if *attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                    abort_request_state(&request_continuation, compaction_lease.as_ref());
+                    return LiveRouteOutcome::Response(map_codex_error_to_response(&error));
                 }
-                let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
+                let delay = compute_backoff_delay(*attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&err);
+                    abort_request_state(&request_continuation, compaction_lease.as_ref());
+                    return LiveRouteOutcome::Response(map_codex_error_to_response(&error));
                 }
-                attempt += 1;
+                *attempt += 1;
                 sleep(delay.wait_ms).await;
                 continue;
             }
-            Err(err) => {
-                cleanup.abort();
-                return map_codex_error_to_response(&err);
+            Err(error) => {
+                abort_request_state(&request_continuation, compaction_lease.as_ref());
+                return LiveRouteOutcome::Response(map_codex_error_to_response(&error));
             }
         };
 
         match live_stream_response_once(
             upstream_events,
+            client.clone(),
+            route.clone(),
+            auth_rejection_budget.clone(),
             message_id.clone(),
             &model,
             ctx.clone(),
             request_continuation.clone(),
             request_body.clone(),
-            compact_boundary,
+            compaction_lease.clone(),
         )
         .await
         {
             LiveStreamStart::Response(response) => {
-                cleanup.disarm();
-                return response;
+                return LiveRouteOutcome::Response(response);
+            }
+            LiveStreamStart::Unauthorized(error) => {
+                return LiveRouteOutcome::Unauthorized(error);
             }
             LiveStreamStart::Retry {
                 error,
@@ -695,23 +885,23 @@ async fn live_stream_response(
             } => {
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
+                    abort_request_state(&request_continuation, compaction_lease.as_ref());
+                    return LiveRouteOutcome::Response(map_codex_error_to_response(&error));
                 }
                 if dropped && is_missing_previous_response_error(&error) {
-                    attempt += 1;
+                    *attempt += 1;
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
+                if *attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                    abort_request_state(&request_continuation, compaction_lease.as_ref());
+                    return LiveRouteOutcome::Response(map_codex_error_to_response(&error));
                 }
-                let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
+                let delay = compute_backoff_delay(*attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
+                    abort_request_state(&request_continuation, compaction_lease.as_ref());
+                    return LiveRouteOutcome::Response(map_codex_error_to_response(&error));
                 }
-                attempt += 1;
+                *attempt += 1;
                 sleep(delay.wait_ms).await;
             }
         }
@@ -733,12 +923,15 @@ fn provider_retry(
 #[allow(clippy::too_many_arguments)]
 async fn live_stream_response_once(
     mut upstream_events: websocket::CodexWebSocketEventStream,
+    client: Arc<CodexHttpClient>,
+    route: CodexBoundRoute,
+    auth_rejection_budget: Arc<AuthRejectionBudget>,
     message_id: String,
     model: &str,
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
-    compact_boundary: bool,
+    compaction_lease: Option<CompactionLease>,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -755,19 +948,49 @@ async fn live_stream_response_once(
     while let Some(item) = upstream_events.recv().await {
         let payload = match item {
             Ok(payload) => payload,
-            Err(err) => {
-                if retryable_live_start_codex_error(&err) {
-                    return provider_retry(&upstream_events, err);
-                }
-                abort_request_state(
-                    ctx.session_id.as_deref(),
-                    &request_continuation,
-                    compact_boundary,
-                    &request_body,
+            Err(error) if error.status == 401 => {
+                return handle_live_auth_rejection(
+                    &upstream_events,
+                    &mut translator,
+                    pending_chunk,
+                    &ctx,
+                    &client,
+                    &route,
+                    auth_rejection_budget,
+                    request_continuation,
+                    compaction_lease,
+                    error,
                 );
-                return LiveStreamStart::Response(map_codex_error_to_response(&err));
+            }
+            Err(error) => {
+                if retryable_live_start_codex_error(&error) {
+                    return provider_retry(&upstream_events, error);
+                }
+                abort_request_state(&request_continuation, compaction_lease.as_ref());
+                return LiveStreamStart::Response(map_codex_error_to_response(&error));
             }
         };
+        if let Some(failure) = events::failure_with_status(&payload, 401) {
+            let error = client::CodexError {
+                status: 401,
+                message: failure.message.clone(),
+                detail: Some(failure.message),
+                retry_after: failure.retry_after,
+                origin: client::CodexErrorOrigin::WebSocket,
+            };
+            return handle_live_auth_rejection(
+                &upstream_events,
+                &mut translator,
+                pending_chunk,
+                &ctx,
+                &client,
+                &route,
+                auth_rejection_budget,
+                request_continuation,
+                compaction_lease,
+                error,
+            );
+        }
         if !generation_started && codex_generation_event(&payload) {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.generation_started(&ctx.req_id);
@@ -813,12 +1036,7 @@ async fn live_stream_response_once(
                         },
                     );
                 }
-                abort_request_state(
-                    ctx.session_id.as_deref(),
-                    &request_continuation,
-                    compact_boundary,
-                    &request_body,
-                );
+                abort_request_state(&request_continuation, compaction_lease.as_ref());
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
@@ -834,12 +1052,11 @@ async fn live_stream_response_once(
             record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
                 update_continuation_from_upstream(
-                    ctx.session_id.as_deref(),
                     &request_continuation,
                     &request_body,
                     &upstream_sse_body,
                     upstream_events.socket_id(),
-                    compact_boundary,
+                    compaction_lease.as_ref(),
                 );
                 return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
             }
@@ -851,17 +1068,19 @@ async fn live_stream_response_once(
                 request_continuation,
                 request_body,
                 upstream_sse_body,
-                compact_boundary,
+                compaction_lease,
+                client,
+                route,
+                auth_rejection_budget,
             ));
         }
         if terminal {
             update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
                 &request_continuation,
                 &request_body,
                 &upstream_sse_body,
                 upstream_events.socket_id(),
-                compact_boundary,
+                compaction_lease.as_ref(),
             );
             if pending_chunk.is_empty() {
                 return LiveStreamStart::Response(empty_live_stream_response());
@@ -882,6 +1101,48 @@ async fn live_stream_response_once(
             origin: client::CodexErrorOrigin::WebSocket,
         },
     )
+}
+
+fn invalidate_live_route_socket(continuation: &ContinuationReservation, socket_id: Option<u64>) {
+    if socket_id.is_some() {
+        websocket::invalidate_codex_websocket_pool_socket(continuation, socket_id);
+    } else {
+        websocket::invalidate_codex_websocket_pool_for_reservation(continuation);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_live_auth_rejection(
+    upstream_events: &websocket::CodexWebSocketEventStream,
+    translator: &mut LiveStreamTranslator,
+    mut pending_chunk: Vec<u8>,
+    ctx: &RequestContext,
+    client: &Arc<CodexHttpClient>,
+    route: &CodexBoundRoute,
+    auth_rejection_budget: Arc<AuthRejectionBudget>,
+    request_continuation: ContinuationReservation,
+    compaction_lease: Option<CompactionLease>,
+    error: client::CodexError,
+) -> LiveStreamStart {
+    invalidate_live_route_socket(&request_continuation, upstream_events.socket_id());
+    if !translator.has_semantic_output() {
+        upstream_events.mark_provider_retry_handoff();
+        return LiveStreamStart::Unauthorized(error);
+    }
+
+    abort_request_state(&request_continuation, compaction_lease.as_ref());
+    client.refresh_conversation_auth_after_rejection_in_background(route, auth_rejection_budget);
+    let chunk = translator.error_chunk(
+        "Authentication failed",
+        "authentication_error",
+        ctx.traffic.as_deref(),
+    );
+    pending_chunk.extend_from_slice(&chunk);
+    if !pending_chunk.is_empty() {
+        record_live_stream_downstream_capture(ctx, &pending_chunk);
+        record_live_stream_progress(ctx, &pending_chunk);
+    }
+    LiveStreamStart::Response(single_live_stream_response(pending_chunk))
 }
 
 fn empty_live_completion_error() -> client::CodexError {
@@ -961,29 +1222,22 @@ fn remaining_live_stream_response(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
-    compact_boundary: bool,
+    compaction_lease: Option<CompactionLease>,
+    client: Arc<CodexHttpClient>,
+    route: CodexBoundRoute,
+    auth_rejection_budget: Arc<AuthRejectionBudget>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
-            abort_request_state(
-                ctx.session_id.as_deref(),
-                &request_continuation,
-                compact_boundary,
-                &request_body,
-            );
+            abort_request_state(&request_continuation, compaction_lease.as_ref());
             return;
         }
         loop {
             let item = tokio::select! {
                 biased;
                 _ = tx.closed() => {
-                    abort_request_state(
-                        ctx.session_id.as_deref(),
-                        &request_continuation,
-                        compact_boundary,
-                        &request_body,
-                    );
+                    abort_request_state(&request_continuation, compaction_lease.as_ref());
                     return;
                 }
                 item = upstream_events.recv() => item,
@@ -993,6 +1247,27 @@ fn remaining_live_stream_response(
             };
             match item {
                 Ok(payload) => {
+                    if events::failure_with_status(&payload, 401).is_some() {
+                        invalidate_live_route_socket(
+                            &request_continuation,
+                            upstream_events.socket_id(),
+                        );
+                        abort_request_state(&request_continuation, compaction_lease.as_ref());
+                        client.refresh_conversation_auth_after_rejection_in_background(
+                            &route,
+                            auth_rejection_budget.clone(),
+                        );
+                        let chunk = translator.error_chunk(
+                            "Authentication failed",
+                            "authentication_error",
+                            ctx.traffic.as_deref(),
+                        );
+                        if !chunk.is_empty() {
+                            record_live_stream_progress(&ctx, &chunk);
+                            let _ = tx.send(Ok(Bytes::from(chunk))).await;
+                        }
+                        return;
+                    }
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
                         &mut translator,
@@ -1001,12 +1276,7 @@ fn remaining_live_stream_response(
                     ) {
                         Ok(result) => result,
                         Err(message) => {
-                            abort_request_state(
-                                ctx.session_id.as_deref(),
-                                &request_continuation,
-                                compact_boundary,
-                                &request_body,
-                            );
+                            abort_request_state(&request_continuation, compaction_lease.as_ref());
                             let chunk = translator.error_chunk(
                                 &message,
                                 "api_error",
@@ -1022,34 +1292,44 @@ fn remaining_live_stream_response(
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                            abort_request_state(
-                                ctx.session_id.as_deref(),
-                                &request_continuation,
-                                compact_boundary,
-                                &request_body,
-                            );
+                            abort_request_state(&request_continuation, compaction_lease.as_ref());
                             return;
                         }
                     }
                     if terminal {
                         update_continuation_from_upstream(
-                            ctx.session_id.as_deref(),
                             &request_continuation,
                             &request_body,
                             &upstream_sse_body,
                             upstream_events.socket_id(),
-                            compact_boundary,
+                            compaction_lease.as_ref(),
                         );
                         return;
                     }
                 }
                 Err(err) => {
-                    abort_request_state(
-                        ctx.session_id.as_deref(),
-                        &request_continuation,
-                        compact_boundary,
-                        &request_body,
-                    );
+                    if err.status == 401 {
+                        invalidate_live_route_socket(
+                            &request_continuation,
+                            upstream_events.socket_id(),
+                        );
+                        abort_request_state(&request_continuation, compaction_lease.as_ref());
+                        client.refresh_conversation_auth_after_rejection_in_background(
+                            &route,
+                            auth_rejection_budget.clone(),
+                        );
+                        let chunk = translator.error_chunk(
+                            "Authentication failed",
+                            "authentication_error",
+                            ctx.traffic.as_deref(),
+                        );
+                        if !chunk.is_empty() {
+                            record_live_stream_progress(&ctx, &chunk);
+                            let _ = tx.send(Ok(Bytes::from(chunk))).await;
+                        }
+                        return;
+                    }
+                    abort_request_state(&request_continuation, compaction_lease.as_ref());
                     let chunk =
                         translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
                     if !chunk.is_empty() {
@@ -1072,12 +1352,7 @@ fn remaining_live_stream_response(
             }
         }
 
-        abort_request_state(
-            ctx.session_id.as_deref(),
-            &request_continuation,
-            compact_boundary,
-            &request_body,
-        );
+        abort_request_state(&request_continuation, compaction_lease.as_ref());
         let chunk = translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
@@ -1254,17 +1529,16 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
 
 #[allow(clippy::too_many_arguments)]
 fn update_continuation_from_upstream(
-    session_id: Option<&str>,
     continuation: &ContinuationReservation,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
     socket_id: Option<u64>,
-    compact_boundary: bool,
+    compaction_lease: Option<&CompactionLease>,
 ) {
     match finish_metadata_from_upstream(upstream_body) {
         Ok(Some(finish)) if finish.continuation_eligible => {
-            if compact_boundary {
-                activate_compaction_for_request(session_id, request_body, &finish.output_items);
+            if let Some(lease) = compaction_lease {
+                activate_compaction_for_route(lease, &finish.output_items);
             }
             record_continuation_for_owner(
                 continuation,
@@ -1274,10 +1548,7 @@ fn update_continuation_from_upstream(
                 &finish.output_items,
             );
         }
-        _ => {
-            abort_compaction_attempt(session_id, compact_boundary, request_body);
-            abort_continuation_for_owner(continuation);
-        }
+        _ => abort_request_state(continuation, compaction_lease),
     }
 }
 
@@ -1465,6 +1736,7 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
 mod tests {
     use futures_util::{SinkExt, StreamExt};
     use http_body_util::BodyExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::tungstenite::Message;
 
@@ -1527,6 +1799,24 @@ mod tests {
         Arc::new(client)
     }
 
+    async fn bind_live_test_route(
+        client: &CodexHttpClient,
+        owner: &ConversationIdentity,
+        continuation: &ContinuationReservation,
+    ) -> (CodexBoundRoute, ContinuationReservation) {
+        let lane = RequestScope::from_conversation_identity(
+            Some(owner.clone()),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexConversation);
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let continuation = continuation.bind_route(&route);
+        (route, continuation)
+    }
+
     async fn next_live_websocket_request(
         websocket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
     ) -> serde_json::Value {
@@ -1551,12 +1841,115 @@ mod tests {
             .unwrap();
     }
 
+    async fn read_http_request(socket: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "request ended before its body was complete");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return request;
+            }
+        }
+    }
+
+    fn http_request_parts(request: &[u8]) -> (String, serde_json::Value) {
+        let header_end = request
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        (
+            String::from_utf8_lossy(&request[..header_end]).into_owned(),
+            serde_json::from_slice(&request[header_end + 4..]).unwrap(),
+        )
+    }
+
+    fn captured_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+        headers.lines().find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
+    }
+
+    fn messages_test_context(req_id: &str, session_id: Option<&str>) -> RequestContext {
+        RequestContext {
+            req_id: req_id.to_string(),
+            session_id: session_id.map(str::to_string),
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    fn standalone_search_request() -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.4",
+            "max_tokens": 1024,
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": "Perform a web search for the query: route binding"
+            }],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search"
+            }],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        }))
+        .unwrap()
+    }
+
     fn upstream_sse(events: &[serde_json::Value]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for event in events {
             bytes.extend_from_slice(format!("data: {event}\n\n").as_bytes());
         }
         bytes
+    }
+
+    const COMPACTION_SUMMARY: &str =
+        "portable provider summary with enough detail to anchor replay safely";
+
+    fn compaction_output() -> Vec<translate::request::ResponsesInputItem> {
+        serde_json::from_value(serde_json::json!([{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": COMPACTION_SUMMARY}]
+        }]))
+        .unwrap()
+    }
+
+    fn compaction_replay_request() -> translate::request::ResponsesRequest {
+        let mut request = live_test_request("unused");
+        request.input = serde_json::from_value(serde_json::json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":COMPACTION_SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]))
+        .unwrap();
+        request
+    }
+
+    fn native_compaction(tag: &str) -> Vec<translate::request::ResponsesInputItem> {
+        vec![translate::request::ResponsesInputItem::Compaction {
+            encrypted_content: tag.to_string(),
+        }]
     }
 
     #[test]
@@ -1711,6 +2104,507 @@ mod tests {
                 "model={resolved}, full_lane={full_lane}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn standalone_search_is_rejected_before_auth_or_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "search-disabled".into(),
+                refresh: "refresh-disabled".into(),
+                expires: u64::MAX,
+                account_id: Some("search-account".into()),
+            });
+        let provider = CodexProvider::with_client(client);
+
+        let response = provider
+            .handle_messages(
+                standalone_search_request(),
+                messages_test_context("search-disabled", Some("raw-search-lane")),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("route-safe recovery"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "fail-closed standalone search must not dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_messages_401_rebuilds_full_route_bound_request_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_transport(config::CodexTransport::Http);
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "messages-a".into(),
+                refresh: "refresh-a".into(),
+                expires: u64::MAX,
+                account_id: Some("messages-account".into()),
+            });
+        let provider = CodexProvider::with_client(client);
+        let server_client = provider.client.clone();
+        let success = upstream_sse(&[
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_b"}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "route-b-only"
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message"}
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_b",
+                    "status": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 1}
+                }
+            }),
+        ]);
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(http_request_parts(&read_http_request(&mut socket).await));
+                if attempt == 0 {
+                    server_client
+                        .auth_manager()
+                        .set_test_auth(auth::token_store::StoredAuth {
+                            access: "messages-b".into(),
+                            refresh: "refresh-b".into(),
+                            expires: u64::MAX,
+                            account_id: Some("messages-account".into()),
+                        });
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 7\r\nconnection: close\r\n\r\nroute-a",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        success.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(&success).await.unwrap();
+                }
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "Messages sent a third route attempt"
+            );
+            captured
+        });
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.4",
+            "max_tokens": 256,
+            "stream": false,
+            "messages": [{"role": "user", "content": "original full context"}]
+        }))
+        .unwrap();
+        let response = provider
+            .handle_messages(
+                request,
+                messages_test_context("messages-rebind", Some("messages-raw-lane")),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let downstream: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(downstream["content"][0]["text"], "route-b-only");
+
+        let captured = server.await.unwrap();
+        assert!(captured[0].0.contains("authorization: Bearer messages-a"));
+        assert!(captured[1].0.contains("authorization: Bearer messages-b"));
+        let key_a = captured[0].1["prompt_cache_key"].as_str().unwrap();
+        let key_b = captured[1].1["prompt_cache_key"].as_str().unwrap();
+        assert_ne!(key_a, key_b);
+        let mut route_keys = Vec::new();
+        for ((headers, _), prompt_key) in captured.iter().zip([key_a, key_b]) {
+            let route_key = captured_header(headers, "session_id").unwrap();
+            assert_eq!(
+                captured_header(headers, "x-client-request-id"),
+                Some(route_key)
+            );
+            assert_eq!(
+                captured_header(headers, "x-codex-window-id"),
+                Some(route_key)
+            );
+            assert_ne!(route_key, prompt_key);
+            assert!(!headers.contains("messages-raw-lane"));
+            route_keys.push(route_key.to_string());
+        }
+        assert_ne!(route_keys[0], route_keys[1]);
+        assert_eq!(captured[0].1["input"], captured[1].1["input"]);
+        assert!(captured[1].1.get("previous_response_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_messages_second_401_returns_route_b_without_route_c() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_transport(config::CodexTransport::Http);
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "bounded-a".into(),
+                refresh: "refresh-a".into(),
+                expires: u64::MAX,
+                account_id: Some("bounded-account".into()),
+            });
+        let provider = CodexProvider::with_client(client);
+        let server_client = provider.client.clone();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(http_request_parts(&read_http_request(&mut socket).await));
+                server_client
+                    .auth_manager()
+                    .set_test_auth(auth::token_store::StoredAuth {
+                        access: if attempt == 0 {
+                            "bounded-b"
+                        } else {
+                            "bounded-c"
+                        }
+                        .into(),
+                        refresh: format!("refresh-{}", attempt + 2),
+                        expires: u64::MAX,
+                        account_id: Some("bounded-account".into()),
+                    });
+                let body = if attempt == 0 {
+                    b"route-a-rejected".as_slice()
+                } else {
+                    b"route-b-rejected".as_slice()
+                };
+                let head = format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+            let third =
+                tokio::time::timeout(std::time::Duration::from_millis(125), listener.accept())
+                    .await;
+            (third, captured)
+        });
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.4",
+            "max_tokens": 256,
+            "stream": false,
+            "messages": [{"role": "user", "content": "bounded retry"}]
+        }))
+        .unwrap();
+        let response = provider
+            .handle_messages(
+                request,
+                messages_test_context("bounded-retry", Some("bounded-raw-lane")),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("route-b-rejected"));
+
+        let (third, captured) = server.await.unwrap();
+        assert!(third.is_err(), "Messages sent route C");
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].0.contains("authorization: Bearer bounded-a"));
+        assert!(captured[1].0.contains("authorization: Bearer bounded-b"));
+        assert_ne!(
+            captured[0].1["prompt_cache_key"],
+            captured[1].1["prompt_cache_key"]
+        );
+        assert_eq!(captured[0].1["input"], captured[1].1["input"]);
+    }
+
+    #[tokio::test]
+    async fn compaction_401_rebinds_permit_and_primary_send_to_route_b() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
+        compaction::clear_all_compactions_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_transport(config::CodexTransport::Http);
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "compact-a".into(),
+                refresh: "refresh-a".into(),
+                expires: u64::MAX,
+                account_id: Some("compact-account".into()),
+            });
+        let provider = CodexProvider::with_client(client).with_server_compaction_for_test();
+        let server_client = provider.client.clone();
+        let compacted = upstream_sse(&[
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{"type":"compaction","encrypted_content":"encrypted-route-b"}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"compact-b","status":"completed"}
+            }),
+        ]);
+        let success = upstream_sse(&[
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"main-b"}
+            }),
+            serde_json::json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "delta":"route-b-compacted"
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"message","id":"main-b"}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"main-b","status":"completed","usage":{}}
+            }),
+        ]);
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for attempt in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(http_request_parts(&read_http_request(&mut socket).await));
+                match attempt {
+                    0 => {
+                        server_client
+                            .auth_manager()
+                            .set_test_auth(auth::token_store::StoredAuth {
+                                access: "compact-b".into(),
+                                refresh: "refresh-b".into(),
+                                expires: u64::MAX,
+                                account_id: Some("compact-account".into()),
+                            });
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 15\r\nconnection: close\r\n\r\ncompact-route-a",
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    1 => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            compacted.len()
+                        );
+                        socket.write_all(head.as_bytes()).await.unwrap();
+                        socket.write_all(&compacted).await.unwrap();
+                    }
+                    2 => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            success.len()
+                        );
+                        socket.write_all(head.as_bytes()).await.unwrap();
+                        socket.write_all(&success).await.unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "compaction request sent route C"
+            );
+            captured
+        });
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-5.4",
+            "max_tokens":256,
+            "stream":false,
+            "system":"You are a helpful AI assistant tasked with summarizing conversations",
+            "messages":[{"role":"user","content":"summarize this boundary"}]
+        }))
+        .unwrap();
+        let response = provider
+            .handle_messages(
+                request,
+                messages_test_context("compact-rebind", Some("compact-raw-lane")),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("route-b-compacted"));
+
+        let captured = server.await.unwrap();
+        assert_eq!(captured.len(), 3);
+        assert!(captured[0].0.contains("authorization: Bearer compact-a"));
+        assert!(captured[1].0.contains("authorization: Bearer compact-b"));
+        assert!(captured[2].0.contains("authorization: Bearer compact-b"));
+        let has_trigger = |body: &serde_json::Value| {
+            body["input"].as_array().is_some_and(|input| {
+                input
+                    .iter()
+                    .any(|item| item["type"] == "compaction_trigger")
+            })
+        };
+        assert!(has_trigger(&captured[0].1));
+        assert!(has_trigger(&captured[1].1));
+        assert!(!has_trigger(&captured[2].1));
+        assert_ne!(
+            captured[0].1["prompt_cache_key"],
+            captured[1].1["prompt_cache_key"]
+        );
+        assert_eq!(
+            captured[1].1["prompt_cache_key"],
+            captured[2].1["prompt_cache_key"]
+        );
+        compaction::clear_all_compactions_for_tests();
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_auth_refresh_aborts_reserved_request_state() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let session_id = "cancel-during-auth-refresh";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let oauth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oauth_address = oauth_listener.local_addr().unwrap();
+        let auth_manager = CodexAuthManager::new_for_test(
+            file_store(),
+            format!("http://{oauth_address}/oauth/token"),
+        );
+        auth_manager.set_test_auth(auth::token_store::StoredAuth {
+            access: "cancel-a".into(),
+            refresh: "cancel-refresh".into(),
+            expires: u64::MAX,
+            account_id: Some("cancel-account".into()),
+        });
+        let client = CodexHttpClient::new_for_test_with_auth_manager(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            auth_manager,
+            format!("http://{upstream_address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_transport(config::CodexTransport::Http);
+        let provider = CodexProvider::with_client(client);
+
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let _ = read_http_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 5\r\nconnection: close\r\n\r\nstale",
+                )
+                .await
+                .unwrap();
+        });
+        let (refresh_started_tx, refresh_started_rx) = tokio::sync::oneshot::channel();
+        let (release_refresh_tx, release_refresh_rx) = tokio::sync::oneshot::channel();
+        let oauth = tokio::spawn(async move {
+            let (mut socket, _) = oauth_listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            assert!(String::from_utf8_lossy(&request).contains("refresh_token=cancel-refresh"));
+            refresh_started_tx.send(()).unwrap();
+            let _ = release_refresh_rx.await;
+            let body = br#"{"access_token":"cancel-b","refresh_token":"cancel-refresh-b","expires_in":3600}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body).await;
+        });
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-5.4",
+            "max_tokens":256,
+            "stream":false,
+            "messages":[{"role":"user","content":"cancel while refreshing"}]
+        }))
+        .unwrap();
+        let response_task = tokio::spawn(async move {
+            provider
+                .handle_messages(
+                    request,
+                    messages_test_context("cancel-refresh", Some(session_id)),
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), refresh_started_rx)
+            .await
+            .expect("auth refresh did not start")
+            .expect("auth refresh acknowledgement dropped");
+        assert!(!response_task.is_finished());
+        response_task.abort();
+        assert!(response_task.await.unwrap_err().is_cancelled());
+        let _ = release_refresh_tx.send(());
+        upstream.await.unwrap();
+        oauth.await.unwrap();
+
+        assert!(
+            !continuation::has_continuation_owner_state_for_tests(&owner),
+            "canceled request left stale continuation owner state"
+        );
     }
 
     #[test]
@@ -1925,16 +2819,28 @@ mod tests {
             }
         });
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let lane = RequestScope::from_conversation_identity(
+            Some(owner.clone()),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexConversation);
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let continuation = continuation.bind_route(&route);
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             live_stream_response(
                 client,
+                route,
                 "message".to_string(),
                 &request.model,
                 live_test_context(session_id),
                 request.clone(),
                 continuation.clone(),
-                false,
+                None,
+                None,
             ),
         )
         .await
@@ -1947,6 +2853,269 @@ mod tests {
         assert!(!continuation::is_current_turn_for_owner(&continuation));
         websocket::invalidate_codex_websocket_pool_owner(&owner);
         response.status()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn live_response_created_then_401_rebuilds_before_downstream_publication() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let session_id = "live-presemantic-auth-rebuild";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_transport(config::CodexTransport::WebSocket);
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "live-a".into(),
+                refresh: "refresh-a".into(),
+                expires: u64::MAX,
+                account_id: Some("live-account".into()),
+            });
+        let provider = CodexProvider::with_client(client);
+        let server_client = provider.client.clone();
+        let server = tokio::spawn(async move {
+            let (route_a_socket, _) = listener.accept().await.unwrap();
+            let mut route_a = tokio_tungstenite::accept_hdr_async(
+                route_a_socket,
+                |request: &http::Request<()>, response| {
+                    assert_eq!(
+                        request.headers()[http::header::AUTHORIZATION],
+                        "Bearer live-a"
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let request_a = next_live_websocket_request(&mut route_a).await;
+            emit_live_event(
+                &mut route_a,
+                &serde_json::json!({
+                    "type": "response.created",
+                    "response": {"id": "private-route-a"}
+                }),
+            )
+            .await;
+            server_client
+                .auth_manager()
+                .set_test_auth(auth::token_store::StoredAuth {
+                    access: "live-b".into(),
+                    refresh: "refresh-b".into(),
+                    expires: u64::MAX,
+                    account_id: Some("live-account".into()),
+                });
+            emit_live_event(
+                &mut route_a,
+                &serde_json::json!({
+                    "type": "response.failed",
+                    "status_code": 401,
+                    "response": {
+                        "error": {"status": 401, "message": "private route A rejection"}
+                    }
+                }),
+            )
+            .await;
+            drop(route_a);
+
+            let (route_b_socket, _) = listener.accept().await.unwrap();
+            let mut route_b = tokio_tungstenite::accept_hdr_async(
+                route_b_socket,
+                |request: &http::Request<()>, response| {
+                    assert_eq!(
+                        request.headers()[http::header::AUTHORIZATION],
+                        "Bearer live-b"
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let request_b = next_live_websocket_request(&mut route_b).await;
+            assert_ne!(request_a["prompt_cache_key"], request_b["prompt_cache_key"]);
+            assert_eq!(request_a["input"], request_b["input"]);
+            assert!(request_b.get("previous_response_id").is_none());
+            for event in [
+                serde_json::json!({"type":"response.created","response":{"id":"resp_b"}}),
+                serde_json::json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_b"}
+                }),
+                serde_json::json!({
+                    "type":"response.output_text.delta",
+                    "output_index":0,
+                    "delta":"public-route-b-only"
+                }),
+                serde_json::json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_b"}
+                }),
+                serde_json::json!({
+                    "type":"response.completed",
+                    "response":{"id":"resp_b","status":"completed","usage":{}}
+                }),
+            ] {
+                emit_live_event(&mut route_b, &event).await;
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(125), listener.accept())
+                    .await
+                    .is_err(),
+                "live request sent route C"
+            );
+        });
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-5.4",
+            "max_tokens":256,
+            "stream":true,
+            "messages":[{"role":"user","content":"route rebuild"}]
+        }))
+        .unwrap();
+        let response = provider
+            .handle_messages(
+                request,
+                messages_test_context("live-presemantic", Some(session_id)),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("public-route-b-only"));
+        assert!(!body.contains("private route A rejection"));
+        assert!(!body.contains("authentication_error"));
+        server.await.unwrap();
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        continuation::clear_continuation_for_owner(Some(&owner));
+    }
+
+    #[tokio::test]
+    async fn live_completed_tool_then_401_emits_sanitized_auth_error_without_replay() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let session_id = "live-postsemantic-auth-error";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_transport(config::CodexTransport::WebSocket);
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "semantic-a".into(),
+                refresh: "refresh-a".into(),
+                expires: u64::MAX,
+                account_id: Some("semantic-account".into()),
+            });
+        let provider = CodexProvider::with_client(client);
+        let server_client = provider.client.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_live_websocket_request(&mut websocket).await;
+            for event in [
+                serde_json::json!({"type":"response.created","response":{"id":"semantic-a"}}),
+                serde_json::json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"tool-item",
+                        "call_id":"call-1",
+                        "name":"Bash",
+                        "arguments":""
+                    }
+                }),
+                serde_json::json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"tool-item",
+                        "call_id":"call-1",
+                        "name":"Bash",
+                        "arguments":"{\"command\":\"pwd\"}"
+                    }
+                }),
+            ] {
+                emit_live_event(&mut websocket, &event).await;
+            }
+            server_client
+                .auth_manager()
+                .set_test_auth(auth::token_store::StoredAuth {
+                    access: "semantic-b".into(),
+                    refresh: "refresh-b".into(),
+                    expires: u64::MAX,
+                    account_id: Some("semantic-account".into()),
+                });
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type":"response.failed",
+                    "status_code":401,
+                    "response":{"error":{"status":401,"message":"private semantic rejection"}}
+                }),
+            )
+            .await;
+            drop(websocket);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err(),
+                "post-semantic 401 replayed the request"
+            );
+        });
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-5.4",
+            "max_tokens":256,
+            "stream":true,
+            "messages":[{"role":"user","content":"run a tool"}],
+            "tools":[{"name":"Bash","input_schema":{"type":"object"}}]
+        }))
+        .unwrap();
+        let response = provider
+            .handle_messages(
+                request,
+                messages_test_context("live-postsemantic", Some(session_id)),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("tool_use"));
+        assert!(body.contains("authentication_error"));
+        assert!(body.contains("Authentication failed"));
+        assert!(!body.contains("private semantic rejection"));
+        assert!(!body.contains("event: message_stop"));
+        server.await.unwrap();
+        assert!(!continuation::has_continuation_for_owner_for_tests(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        continuation::clear_continuation_for_owner(Some(&owner));
     }
 
     #[tokio::test]
@@ -1981,18 +3150,22 @@ mod tests {
             socket_closed_tx.send(()).unwrap();
         });
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let (route, continuation) =
+            bind_live_test_route(client.as_ref(), &owner, &continuation).await;
         let task_request = request.clone();
         let task_continuation = continuation.clone();
         let response_task = tokio::spawn(async move {
             let model = task_request.model.clone();
             live_stream_response(
                 client,
+                route,
                 "message".to_string(),
                 &model,
                 live_test_context(session_id),
                 task_request,
                 task_continuation,
-                false,
+                None,
+                None,
             )
             .await
         });
@@ -2019,6 +3192,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_live_response_body_after_first_chunk_aborts_request_state() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
         let session_id = "live-response-body-drop-cleanup";
@@ -2057,17 +3231,36 @@ mod tests {
             socket_closed_tx.send(()).unwrap();
         });
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let (route, continuation) =
+            bind_live_test_route(client.as_ref(), &owner, &continuation).await;
+        let compaction_permit = reserve_compaction_start(route.lane()).unwrap();
+        let compaction_build =
+            begin_compaction_for_route(&compaction_permit, &route, "gpt-5.6-sol").unwrap();
+        assert!(store_compaction_for_route(
+            &compaction_build,
+            native_compaction("drop-body-native")
+        ));
+        assert!(activate_compaction_for_route(
+            &compaction_build,
+            &compaction_output()
+        ));
+        let dropped_replay =
+            apply_compaction_replay_for_route(&route, &compaction_replay_request()).unwrap();
+        let peer_replay =
+            apply_compaction_replay_for_route(&route, &compaction_replay_request()).unwrap();
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             live_stream_response(
                 client,
+                route.clone(),
                 "message".to_string(),
                 &request.model,
                 live_test_context(session_id),
                 request.clone(),
                 continuation.clone(),
-                false,
+                Some(dropped_replay.lease),
+                None,
             ),
         )
         .await
@@ -2085,30 +3278,267 @@ mod tests {
             .expect("dropping the downstream body did not close the upstream socket")
             .expect("socket-close acknowledgement sender dropped");
         assert!(!continuation::is_current_turn_for_owner(&continuation));
+        assert!(compaction::has_bound_compaction_for_tests(&route));
+        assert!(activate_compaction_for_route(&peer_replay.lease, &[]));
+        assert!(compaction::has_bound_compaction_for_tests(&route));
         server.await.unwrap();
         websocket::invalidate_codex_websocket_pool_owner(&owner);
+        compaction::clear_compactions_for_lane(route.lane().unwrap());
+        drop(compaction_permit);
+    }
+
+    #[tokio::test]
+    async fn blocked_older_compaction_cannot_publish_after_newer_completion() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
+        let session_id = "blocked-older-compaction";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        let lane = RequestScope::from_conversation_identity(
+            Some(owner.clone()),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexConversation);
+        let client = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let older_permit = reserve_compaction_start(lane).unwrap();
+        let older = begin_compaction_for_route(&older_permit, &route, "gpt-5.6-sol").unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let older_task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let stored = store_compaction_for_route(&older, native_compaction("older"));
+            let activated = activate_compaction_for_route(&older, &compaction_output());
+            drop(older_permit);
+            (stored, activated)
+        });
+        started_rx.await.unwrap();
+
+        let newer_permit = reserve_compaction_start(lane).unwrap();
+        let newer = begin_compaction_for_route(&newer_permit, &route, "gpt-5.6-sol").unwrap();
+        assert!(store_compaction_for_route(
+            &newer,
+            native_compaction("newer")
+        ));
+        assert!(activate_compaction_for_route(&newer, &compaction_output()));
+        release_tx.send(()).unwrap();
+        assert_eq!(older_task.await.unwrap(), (false, false));
+
+        let replay =
+            apply_compaction_replay_for_route(&route, &compaction_replay_request()).unwrap();
+        assert!(replay.request.input.iter().any(|item| {
+            matches!(item, translate::request::ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "newer")
+        }));
+        assert!(activate_compaction_for_route(&replay.lease, &[]));
+        compaction::clear_compactions_for_lane(lane.unwrap());
+        drop(newer_permit);
+    }
+
+    #[tokio::test]
+    async fn canceling_blocked_compaction_drops_its_permit_and_build() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
+        let session_id = "cancel-blocked-compaction";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        let lane =
+            RequestScope::from_conversation_identity(Some(owner), RequestPurpose::Conversation)
+                .provider_lane(LaneDomain::CodexConversation);
+        let client = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let permit = reserve_compaction_start(lane).unwrap();
+        let build = begin_compaction_for_route(&permit, &route, "gpt-5.6-sol").unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.await;
+            drop((build, permit));
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(!compaction::has_bound_compaction_for_tests(&route));
+        assert!(!compaction::has_bound_lane_metadata_for_tests(
+            lane.unwrap()
+        ));
+        let fresh = reserve_compaction_start(lane).unwrap();
+        let fresh_build = begin_compaction_for_route(&fresh, &route, "gpt-5.6-sol").unwrap();
+        drop((fresh_build, fresh));
+    }
+
+    #[tokio::test]
+    async fn replay_forces_full_context_without_allocating_another_continuation_generation() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let session_id = "replay-full-context-generation";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        let lane = RequestScope::from_conversation_identity(
+            Some(owner.clone()),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexConversation);
+        let client = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+
+        let mut first_request = compaction_replay_request();
+        first_request.input.pop();
+        let first =
+            continuation_candidate_for_owner(Some(&owner), &first_request, true).bind_route(&route);
+        record_continuation_for_owner(
+            &first,
+            &first_request,
+            Some("resp-before-replay"),
+            Some(41),
+            &[],
+        );
+        let next_request = compaction_replay_request();
+        let reserved =
+            continuation_candidate_for_owner(Some(&owner), &next_request, true).bind_route(&route);
+        assert_eq!(
+            reserved.candidate().previous_response_id.as_deref(),
+            Some("resp-before-replay")
+        );
+        let generation = reserved.turn_id();
+
+        let permit = reserve_compaction_start(lane).unwrap();
+        let build = begin_compaction_for_route(&permit, &route, "gpt-5.6-sol").unwrap();
+        assert!(store_compaction_for_route(
+            &build,
+            native_compaction("native")
+        ));
+        assert!(activate_compaction_for_route(&build, &compaction_output()));
+        let replay = apply_compaction_replay_for_route(&route, &next_request).unwrap();
+        let full_context = reserved.full_context_retry();
+
+        assert_eq!(full_context.turn_id(), generation);
+        assert!(full_context.candidate().previous_response_id.is_none());
+        assert!(full_context.candidate().input_delta.is_none());
+        assert!(activate_compaction_for_route(&replay.lease, &[]));
+        abort_continuation_for_owner(&full_context);
+        compaction::clear_compactions_for_lane(lane.unwrap());
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn route_rebound_with_same_permit_requires_no_newer_generation() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
+        let lane = RequestScope::from_conversation_identity(
+            Some(ConversationIdentity::Main(
+                "route-rebound-permit".to_string(),
+            )),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexConversation);
+        let client_a = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let client_b = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            "http://127.0.0.1:1/responses".to_string(),
+            1_000,
+            1_000,
+            0,
+        );
+        client_b
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "rotated".to_string(),
+                refresh: String::new(),
+                expires: u64::MAX,
+                account_id: Some("acct".to_string()),
+            });
+        let route_a = client_a
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let route_b = client_b
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+
+        let permit = reserve_compaction_start(lane).unwrap();
+        let first = begin_compaction_for_route(&permit, &route_a, "gpt-5.6-sol").unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let rebound_route = route_b.clone();
+        let rebound = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            begin_compaction_for_route(&permit, &rebound_route, "gpt-5.6-sol")
+                .map(|lease| (lease, permit))
+        });
+        started_rx.await.unwrap();
+        release_tx.send(()).unwrap();
+        let (rebound_build, permit) = rebound.await.unwrap().unwrap();
+        assert!(compaction::has_bound_compaction_for_tests(&route_b));
+        drop(first);
+        assert!(compaction::has_bound_compaction_for_tests(&route_b));
+        drop((rebound_build, permit));
+
+        let older = reserve_compaction_start(lane).unwrap();
+        let older_build = begin_compaction_for_route(&older, &route_a, "gpt-5.6-sol").unwrap();
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let stale_route = route_b.clone();
+        let stale_rebound = tokio::spawn(async move {
+            blocked_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            begin_compaction_for_route(&older, &stale_route, "gpt-5.6-sol")
+        });
+        blocked_rx.await.unwrap();
+        let newer = reserve_compaction_start(lane).unwrap();
+        let newer_build = begin_compaction_for_route(&newer, &route_b, "gpt-5.6-sol").unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(stale_rebound.await.unwrap().is_none());
+        assert!(compaction::has_bound_compaction_for_tests(&route_b));
+        drop((older_build, newer_build, newer));
     }
 
     #[tokio::test]
     async fn stale_request_cleanup_preserves_newer_continuation_turn() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let session_id = "stale-live-request-cleanup";
         let owner = ConversationIdentity::Main(session_id.to_string());
         continuation::clear_continuation_for_owner(Some(&owner));
-        compaction::clear_compaction(session_id);
         let request = live_test_request("one");
+        let lane = RequestScope::from_conversation_identity(
+            Some(owner.clone()),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexConversation);
+        let client = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+
         let stale_continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
-        let stale_cleanup = LiveRequestStateCleanup::new(
-            stale_continuation,
-            Some(session_id.to_string()),
-            true,
-            request.clone(),
-        );
+        let stale_permit = reserve_compaction_start(lane).unwrap();
+        let stale_lease =
+            begin_compaction_for_route(&stale_permit, &route, &request.model).unwrap();
+        assert!(store_compaction_for_route(
+            &stale_lease,
+            vec![translate::request::ResponsesInputItem::Compaction {
+                encrypted_content: "stale-native-history".to_string(),
+            }],
+        ));
+        let stale_cleanup =
+            LiveRequestStateCleanup::new(stale_continuation, Some(stale_lease), Some(stale_permit));
 
         let newer_continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
-        assert!(store_compaction_for_request(
-            session_id,
-            &request,
+        let newer_permit = reserve_compaction_start(lane).unwrap();
+        let newer_lease =
+            begin_compaction_for_route(&newer_permit, &route, &request.model).unwrap();
+        assert!(store_compaction_for_route(
+            &newer_lease,
             vec![translate::request::ResponsesInputItem::Compaction {
                 encrypted_content: "newer-native-history".to_string(),
             }],
@@ -2126,12 +3556,9 @@ mod tests {
                 }]
             }]))
             .unwrap();
-        assert!(activate_compaction_for_request(
-            Some(session_id),
-            &request,
-            &summary,
-        ));
-        abort_request_state(Some(session_id), &newer_continuation, true, &request);
+        assert!(activate_compaction_for_route(&newer_lease, &summary));
+        abort_request_state(&newer_continuation, Some(&newer_lease));
+        compaction::clear_compactions_for_lane(lane.unwrap());
     }
 
     #[tokio::test]
@@ -2231,18 +3658,22 @@ mod tests {
             let _ = release_replacement_rx.await;
         });
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let (route, continuation) =
+            bind_live_test_route(client.as_ref(), &owner, &continuation).await;
         let task_request = request.clone();
         let task_continuation = continuation.clone();
         let response_task = tokio::spawn(async move {
             let model = task_request.model.clone();
             live_stream_response(
                 client,
+                route,
                 "message".to_string(),
                 &model,
                 live_test_context(session_id),
                 task_request,
                 task_continuation,
-                false,
+                None,
+                None,
             )
             .await
         });

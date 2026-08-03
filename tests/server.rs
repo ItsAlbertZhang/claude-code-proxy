@@ -146,6 +146,68 @@ impl Provider for IdentityCaptureProvider {
     }
 }
 
+struct OpenAiIdentityCaptureProvider {
+    captured: Arc<Mutex<Vec<CapturedIdentity>>>,
+}
+
+#[async_trait]
+impl Provider for OpenAiIdentityCaptureProvider {
+    fn name(&self) -> &'static str {
+        "kimi"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["kimi-k2.6".to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn generate_anthropic_stream(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> Result<Generation, ProviderError> {
+        let model = body.model.unwrap_or_else(|| "kimi-k2.6".to_string());
+        let sse = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_identity\",\"model\":{model:?},\"usage\":{{\"input_tokens\":1}}}}}}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"ok\"}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        Ok(Generation {
+            body: GenerationBody::BufferedSse(sse.into()),
+            resolved_model: model,
+        })
+    }
+    async fn generate_anthropic_stream_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        identity: Option<ConversationIdentity>,
+    ) -> Result<Generation, ProviderError> {
+        self.captured
+            .lock()
+            .unwrap()
+            .push((identity, ctx.session_id.clone()));
+        self.generate_anthropic_stream(body, ctx).await
+    }
+}
+
 fn routed_registry() -> Arc<Registry> {
     Arc::new(Registry::from_providers(
         AliasProvider::Kimi,
@@ -187,7 +249,7 @@ async fn call_identity_ingress(
 }
 
 #[tokio::test]
-async fn messages_ingress_forwards_only_strict_conversation_identity() {
+async fn messages_ingress_preserves_agent_identity_and_auxiliary_purpose() {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(IdentityCaptureProvider {
         captured: captured.clone(),
@@ -291,13 +353,91 @@ async fn messages_ingress_forwards_only_strict_conversation_identity() {
                 )),
                 Some("session-nested".to_string()),
             ),
-            (None, Some("session-malformed-agent".to_string())),
+            (None, None),
             (None, None),
             (
                 Some(ConversationIdentity::Main("session-trimmed".to_string())),
-                Some(" \tsession-trimmed\t ".to_string()),
+                Some("session-trimmed".to_string()),
             ),
             (None, Some("session-auto-review".to_string())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn openai_ingress_restores_legacy_identity_without_bypassing_claude_validation() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(OpenAiIdentityCaptureProvider {
+        captured: captured.clone(),
+    }) as Arc<dyn Provider>;
+    let app = app_with_options(
+        Arc::new(Registry::from_providers(AliasProvider::Kimi, [provider])),
+        None,
+        true,
+    );
+    let body = || json!({"model": "kimi-k2.6", "input": "hello"});
+    let cases = [
+        vec![("session_id", "legacy-session")],
+        vec![("x-client-request-id", "legacy-request")],
+        vec![
+            ("x-claude-code-session-id", "claude-session"),
+            ("session_id", "ignored-legacy"),
+        ],
+        vec![
+            ("x-claude-code-session-id", "shared-session"),
+            ("x-claude-code-agent-id", "agent-a"),
+        ],
+        vec![
+            ("x-claude-code-session-id", "shared-session"),
+            ("x-claude-code-agent-id", "agent-b"),
+        ],
+        vec![
+            ("x-claude-code-session-id", "claude-session"),
+            ("x-claude-code-agent-id", "malformed agent"),
+            ("session_id", "suppressed-legacy"),
+        ],
+        vec![
+            ("x-claude-code-agent-id", "orphan-agent"),
+            ("x-client-request-id", "suppressed-request"),
+        ],
+    ];
+    for headers in cases {
+        assert_eq!(
+            call_identity_ingress(&app, "/v1/responses", &headers, body()).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec![
+            (
+                Some(ConversationIdentity::Main("legacy-session".to_string())),
+                Some("legacy-session".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Main("legacy-request".to_string())),
+                Some("legacy-request".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Main("claude-session".to_string())),
+                Some("claude-session".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Agent(
+                    "shared-session".to_string(),
+                    "agent-a".to_string(),
+                )),
+                Some("shared-session".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Agent(
+                    "shared-session".to_string(),
+                    "agent-b".to_string(),
+                )),
+                Some("shared-session".to_string()),
+            ),
+            (None, None),
+            (None, None),
         ]
     );
 }
@@ -776,6 +916,50 @@ async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
 }
 
 #[tokio::test]
+async fn monitor_tracks_transcription_endpoint_without_session_affinity() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+        AppFeatures {
+            responses_api: false,
+            images_api: false,
+            transcriptions_api: true,
+        },
+    );
+    let boundary = "ccp-transcription-affinity-test";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-mini-transcribe\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/audio/transcriptions")
+                .header("session_id", "raw-transcription-session")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 1);
+    assert_eq!(state.recent[0].endpoint.label(), "transcriptions");
+    assert_eq!(state.recent[0].status, RequestStatus::Failed);
+    assert!(state.recent[0].session_seq.is_none());
+    assert!(state.recent[0].traffic_capture_path.is_none());
+}
+
+#[tokio::test]
 async fn transcription_route_rejects_non_audio_uploads() {
     let app = app_with_features(
         Arc::new(Registry::with_default_alias()),
@@ -1116,7 +1300,7 @@ async fn monitor_records_successful_request_events() {
         state.recent[0].session_id.as_deref(),
         Some("project-session")
     );
-    assert!(state.recent[0].session_seq.is_some());
+    assert!(state.recent[0].session_seq.is_none());
     assert_eq!(state.recent[0].project.as_deref(), Some("example"));
     assert_eq!(state.sessions[0].project.as_deref(), Some("example"));
     assert_eq!(state.recent[0].provider.as_deref(), Some("codex"));

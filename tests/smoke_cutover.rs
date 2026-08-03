@@ -7,7 +7,7 @@ use axum::response::Response;
 use claude_code_proxy::providers::codex::compaction::clear_all_compactions_for_tests;
 use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
-use claude_code_proxy::{config::AliasProvider, registry::Registry, server::app};
+use claude_code_proxy::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -855,11 +855,10 @@ async fn smoke_auto_review_effort_follows_kimi_routes() {
     let _ = axum::body::to_bytes(effort_only.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(
+    assert!(
         claude_code_proxy::session::existing_session_now(Some("smoke-effort-only-affinity"))
-            .and_then(|state| state.affinity_provider),
-        Some(AliasProvider::Kimi),
-        "an effort-only auto-review request must retain normal affinity bookkeeping"
+            .is_none(),
+        "an auto-review request must not create conversational affinity state"
     );
 
     {

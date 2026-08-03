@@ -14,7 +14,26 @@ where
     fn load(&self) -> Result<Option<T>>;
     fn save(&self, value: T) -> Result<()>;
     fn clear(&self) -> Result<()>;
+    fn compare_and_swap(&self, expected: Option<&T>, replacement: Option<T>) -> Result<bool> {
+        let current = self.load()?;
+        if !serialized_values_equal(current.as_ref(), expected)? {
+            return Ok(false);
+        }
+        match replacement {
+            Some(value) => self.save(value)?,
+            None => self.clear()?,
+        }
+        Ok(true)
+    }
     fn path(&self) -> String;
+}
+
+fn serialized_values_equal<T: Serialize>(left: Option<&T>, right: Option<&T>) -> Result<bool> {
+    Ok(match (left, right) {
+        (Some(left), Some(right)) => serde_json::to_value(left)? == serde_json::to_value(right)?,
+        (None, None) => true,
+        _ => false,
+    })
 }
 
 pub trait Keychain: Send + Sync {
@@ -134,6 +153,29 @@ impl Keychain for SystemKeychain {
     }
 }
 
+fn with_auth_file_lock<R>(path: &str, action: impl FnOnce() -> Result<R>) -> Result<R> {
+    let lock_path = format!("{path}.lock");
+    let lock_path = std::path::Path::new(&lock_path);
+    if let Some(directory) = lock_path.parent() {
+        fs::create_dir_all(directory)?;
+        set_mode(directory, 0o700);
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let result = action();
+    let unlock_result = fs2::FileExt::unlock(&lock);
+    match (result, unlock_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+    }
+}
+
 pub struct FileAuthStore<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
@@ -154,33 +196,28 @@ where
             _marker: Default::default(),
         }
     }
-}
 
-impl<T> AuthStorage<T> for FileAuthStore<T>
-where
-    T: Serialize + DeserializeOwned + Send + Sync + Clone,
-{
-    fn load(&self) -> Result<Option<T>> {
+    fn load_unlocked(&self) -> Option<T> {
         let parsed = load_auth_file::<T>(&self.file);
         if parsed.is_some() {
-            return Ok(parsed);
+            return parsed;
         }
         if self.file == self.legacy_file {
-            return Ok(None);
+            return None;
         }
-        Ok(load_auth_file::<T>(&self.legacy_file))
+        load_auth_file::<T>(&self.legacy_file)
     }
 
-    fn save(&self, value: T) -> Result<()> {
+    fn save_unlocked(&self, value: &T) -> Result<()> {
         let path = std::path::Path::new(&self.file);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
             set_mode(dir, 0o700);
         }
-        write_atomically(&self.file, &value)
+        write_atomically(&self.file, value)
     }
 
-    fn clear(&self) -> Result<()> {
+    fn clear_unlocked(&self) -> Result<()> {
         for path in [&self.file, &self.legacy_file] {
             if let Err(err) = fs::remove_file(path)
                 && err.kind() != io::ErrorKind::NotFound
@@ -189,6 +226,37 @@ where
             }
         }
         Ok(())
+    }
+}
+
+impl<T> AuthStorage<T> for FileAuthStore<T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + Clone,
+{
+    fn load(&self) -> Result<Option<T>> {
+        with_auth_file_lock(&self.file, || Ok(self.load_unlocked()))
+    }
+
+    fn save(&self, value: T) -> Result<()> {
+        with_auth_file_lock(&self.file, || self.save_unlocked(&value))
+    }
+
+    fn clear(&self) -> Result<()> {
+        with_auth_file_lock(&self.file, || self.clear_unlocked())
+    }
+
+    fn compare_and_swap(&self, expected: Option<&T>, replacement: Option<T>) -> Result<bool> {
+        with_auth_file_lock(&self.file, || {
+            let current = self.load_unlocked();
+            if !serialized_values_equal(current.as_ref(), expected)? {
+                return Ok(false);
+            }
+            match replacement.as_ref() {
+                Some(value) => self.save_unlocked(value)?,
+                None => self.clear_unlocked()?,
+            }
+            Ok(true)
+        })
     }
 
     fn path(&self) -> String {
@@ -233,15 +301,9 @@ where
             _marker: PhantomData,
         }
     }
-}
 
-impl<T, K> AuthStorage<T> for KeychainFileAuthStore<T, K>
-where
-    T: Serialize + DeserializeOwned + Send + Sync + Clone,
-    K: Keychain,
-{
-    fn load(&self) -> Result<Option<T>> {
-        if let Some(parsed) = self.file_store.load()? {
+    fn load_unlocked(&self) -> Result<Option<T>> {
+        if let Some(parsed) = self.file_store.load_unlocked() {
             return Ok(Some(parsed));
         }
         if self.use_keychain
@@ -254,9 +316,9 @@ where
         Ok(None)
     }
 
-    fn save(&self, value: T) -> Result<()> {
+    fn save_unlocked(&self, value: &T) -> Result<()> {
         if self.use_keychain {
-            let raw = serde_json::to_string(&value)?;
+            let raw = serde_json::to_string(value)?;
             if self
                 .keychain
                 .write(&self.service, &self.account, &raw)
@@ -264,16 +326,47 @@ where
             {
                 return Ok(());
             }
-            return self.file_store.save(value);
         }
-        self.file_store.save(value)
+        self.file_store.save_unlocked(value)
     }
 
-    fn clear(&self) -> Result<()> {
+    fn clear_unlocked(&self) -> Result<()> {
         if self.use_keychain {
             self.keychain.delete(&self.service, &self.account)?;
         }
-        self.file_store.clear()
+        self.file_store.clear_unlocked()
+    }
+}
+
+impl<T, K> AuthStorage<T> for KeychainFileAuthStore<T, K>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + Clone,
+    K: Keychain,
+{
+    fn load(&self) -> Result<Option<T>> {
+        with_auth_file_lock(&self.file_store.file, || self.load_unlocked())
+    }
+
+    fn save(&self, value: T) -> Result<()> {
+        with_auth_file_lock(&self.file_store.file, || self.save_unlocked(&value))
+    }
+
+    fn clear(&self) -> Result<()> {
+        with_auth_file_lock(&self.file_store.file, || self.clear_unlocked())
+    }
+
+    fn compare_and_swap(&self, expected: Option<&T>, replacement: Option<T>) -> Result<bool> {
+        with_auth_file_lock(&self.file_store.file, || {
+            let current = self.load_unlocked()?;
+            if !serialized_values_equal(current.as_ref(), expected)? {
+                return Ok(false);
+            }
+            match replacement.as_ref() {
+                Some(value) => self.save_unlocked(value)?,
+                None => self.clear_unlocked()?,
+            }
+            Ok(true)
+        })
     }
 
     fn path(&self) -> String {
@@ -360,13 +453,13 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
     Ok(())
 }
 
-fn set_mode(path: &std::path::Path, mode: u32) {
+fn set_mode(_path: &std::path::Path, _mode: u32) {
     #[cfg(unix)]
     {
-        if let Ok(meta) = fs::metadata(path) {
+        if let Ok(meta) = fs::metadata(_path) {
             let mut permissions = meta.permissions();
-            permissions.set_mode(mode);
-            let _ = fs::set_permissions(path, permissions);
+            permissions.set_mode(_mode);
+            let _ = fs::set_permissions(_path, permissions);
         }
     }
 }
@@ -439,6 +532,18 @@ where
         Ok(())
     }
 
+    fn compare_and_swap(&self, expected: Option<&T>, replacement: Option<T>) -> Result<bool> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        if !serialized_values_equal(inner.as_ref(), expected)? {
+            return Ok(false);
+        }
+        *inner = replacement;
+        Ok(true)
+    }
+
     fn path(&self) -> String {
         "memory".to_string()
     }
@@ -458,6 +563,32 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn file_store_compare_and_swap_rejects_stale_writer() {
+        let path = std::env::temp_dir()
+            .join(format!("ccp-auth-cas-{}.json", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let first = FileAuthStore::<serde_json::Value>::new(path.clone(), path.clone());
+        let second = FileAuthStore::<serde_json::Value>::new(path.clone(), path.clone());
+        let original = json!({"account":"a","access":"old"});
+        let switched = json!({"account":"b","access":"new"});
+        first.save(original.clone()).unwrap();
+        second.save(switched.clone()).unwrap();
+
+        assert!(
+            !first
+                .compare_and_swap(
+                    Some(&original),
+                    Some(json!({"account":"a","access":"stale"})),
+                )
+                .unwrap()
+        );
+        assert_eq!(first.load().unwrap(), Some(switched));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.lock"));
+    }
 
     #[derive(Clone, Default)]
     struct MockKeychain {

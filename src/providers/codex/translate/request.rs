@@ -1939,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_rewritten_read_result_adds_proxy_note() {
+    fn translate_read_result_adds_no_proxy_note_without_stable_lane() {
         crate::providers::codex::translate::read_rewrite::sanitize_read_args(
             "Read",
             r#"{"file_path":"/tmp/a","offset":1300000,"limit":20}"#,
@@ -1966,10 +1966,8 @@ mod tests {
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
             let output = output.as_text().expect("text tool output");
-            assert!(output.contains("1\tcontent"));
-            assert!(output.contains("Proxy Read offset note:"));
-            assert!(output.contains("1300000"));
-            assert!(output.contains("/tmp/a"));
+            assert_eq!(output, "1\tcontent");
+            assert!(!output.contains("Proxy Read offset note:"));
         } else {
             panic!("expected FunctionCallOutput");
         }
