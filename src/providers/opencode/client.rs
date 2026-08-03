@@ -60,11 +60,28 @@ impl OpenCodeResponse {
 
 impl OpenCodeClient {
     pub fn new(base_url: String, api_key: Option<String>) -> anyhow::Result<Self> {
+        Self::build(base_url, api_key, false)
+    }
+
+    /// Build a client that ignores ambient proxy variables for loopback mocks.
+    #[doc(hidden)]
+    pub fn new_for_test(base_url: String, api_key: Option<String>) -> anyhow::Result<Self> {
+        Self::build(base_url, api_key, true)
+    }
+
+    fn build(
+        base_url: String,
+        api_key: Option<String>,
+        disable_proxies: bool,
+    ) -> anyhow::Result<Self> {
         let base_url = reqwest::Url::parse(base_url.trim_end_matches('/'))?;
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .build()?;
+            .connect_timeout(Duration::from_secs(10));
+        if disable_proxies {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build()?;
         Ok(Self {
             client: Arc::new(client),
             base_url,
@@ -231,7 +248,40 @@ mod tests {
         http::HeaderMap,
         routing::post,
     };
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
+
+    static PROXY_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct ProxyEnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl ProxyEnvGuard {
+        fn invalid() -> Self {
+            let names = ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"];
+            let saved = names
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            unsafe {
+                std::env::set_var("HTTP_PROXY", "http://127.0.0.1:9");
+                std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:9");
+                std::env::set_var("NO_PROXY", "");
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for ProxyEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct SeenRequest {
@@ -293,6 +343,42 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn loopback_mock_ignores_ambient_proxy_configuration() {
+        let _lock = PROXY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _proxy_env = ProxyEnvGuard::invalid();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_request))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = OpenCodeClient::new_for_test(
+            format!("http://{address}/v1"),
+            Some("test-key".to_string()),
+        )
+        .unwrap();
+        client
+            .post(
+                EndpointKind::ChatCompletions,
+                &serde_json::json!({"model":"glm-5.2","messages":[]}),
+                false,
+                None,
+            )
+            .await
+            .unwrap()
+            .into_bytes()
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn endpoints_use_protocol_native_auth_and_wire_model_ids() {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
@@ -305,9 +391,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let client =
-            OpenCodeClient::new(format!("http://{address}/v1"), Some("test-key".to_string()))
-                .unwrap();
+        let client = OpenCodeClient::new_for_test(
+            format!("http://{address}/v1"),
+            Some("test-key".to_string()),
+        )
+        .unwrap();
         for (endpoint, model) in [
             (EndpointKind::ChatCompletions, "glm-5.2"),
             (EndpointKind::Messages, "minimax-m3"),

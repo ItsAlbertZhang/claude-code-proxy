@@ -22,3 +22,15 @@ jobs:
         run: cargo install checkle just --locked
       - name: Run full checks
         run: just check-ci
+
+  windows-loopback-proxy:
+    name: Windows loopback proxy isolation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test OpenCode loopback proxy isolation
+        run: cargo test --locked providers::opencode::client::tests::loopback_mock_ignores_ambient_proxy_configuration
+      - name: Test Cursor loopback proxy isolation
+        run: cargo test --locked --test cursor_native cursor_loopback_mock_ignores_ambient_proxy_and_sends_connect_request
