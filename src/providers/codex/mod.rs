@@ -53,6 +53,7 @@ use self::continuation::{
     record_continuation_for_owner,
 };
 use self::count_tokens::count_translated_tokens;
+use self::state::{CodexBoundRoute, ProtocolLane};
 use self::translate::accumulate::accumulate_response_scoped;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
@@ -108,6 +109,7 @@ impl CodexProvider {
     ) -> Response {
         let (ctx, scope) = scoped.into_parts();
         let conversation_identity = scope.conversational_lane().cloned();
+        let codex_lane = scope.provider_lane(LaneDomain::CodexConversation);
         let read_lane = scope.provider_lane(LaneDomain::CodexReadRewrite);
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
@@ -287,16 +289,35 @@ impl CodexProvider {
             translated = replay;
         }
 
-        // Check continuation
+        // Reserve the logical generation synchronously before route/auth resolution can await.
         let previous_response_id_enabled = config::codex_previous_response_id();
         let continuation = continuation_candidate_for_owner(
             conversation_identity.as_ref(),
             &translated,
             previous_response_id_enabled,
         );
-
-        // Post to upstream with continuation
         let client = self.client.clone();
+        let route = match client
+            .bind_conversation_route(
+                codex_lane,
+                ProtocolLane::from_uses_responses_lite(use_responses_lite),
+            )
+            .await
+        {
+            Ok(route) => route,
+            Err(error) => {
+                abort_request_state(
+                    ctx.session_id.as_deref(),
+                    &continuation,
+                    compact_boundary,
+                    &translated,
+                );
+                return map_codex_error_to_response(&error);
+            }
+        };
+        let continuation = continuation.bind_route(&route);
+
+        // Post to upstream with one immutable route snapshot.
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
@@ -304,6 +325,7 @@ impl CodexProvider {
             let stream_request = translated.clone();
             return live_stream_response(
                 client,
+                route,
                 message_id,
                 model,
                 ctx,
@@ -320,7 +342,7 @@ impl CodexProvider {
         let mut attempt = 0_u32;
         let upstream = loop {
             let response = match client
-                .post_codex_for_owner(&translated, &ctx, continuation.as_ref())
+                .post_codex_bound(&route, &translated, &ctx, continuation.as_ref())
                 .await
             {
                 Ok(r) => r,
@@ -658,6 +680,7 @@ enum LiveStreamStart {
 
 async fn live_stream_response(
     client: Arc<CodexHttpClient>,
+    route: CodexBoundRoute,
     message_id: String,
     model: &str,
     ctx: RequestContext,
@@ -679,7 +702,7 @@ async fn live_stream_response(
 
     loop {
         let upstream_events = match client
-            .stream_codex_websocket_events_for_owner(&request_body, &ctx, continuation.as_ref())
+            .stream_codex_websocket_events_bound(&route, &request_body, &ctx, continuation.as_ref())
             .await
         {
             Ok(events) => events,
@@ -1570,6 +1593,24 @@ mod tests {
         Arc::new(client)
     }
 
+    async fn bind_live_test_route(
+        client: &CodexHttpClient,
+        owner: &ConversationIdentity,
+        continuation: &ContinuationReservation,
+    ) -> (CodexBoundRoute, ContinuationReservation) {
+        let lane = RequestScope::from_conversation_identity(
+            Some(owner.clone()),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexConversation);
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let continuation = continuation.bind_route(&route);
+        (route, continuation)
+    }
+
     async fn next_live_websocket_request(
         websocket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
     ) -> serde_json::Value {
@@ -1968,10 +2009,21 @@ mod tests {
             }
         });
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let lane = RequestScope::from_conversation_identity(
+            Some(owner.clone()),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexConversation);
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let continuation = continuation.bind_route(&route);
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             live_stream_response(
                 client,
+                route,
                 "message".to_string(),
                 &request.model,
                 live_test_context(session_id),
@@ -2025,12 +2077,15 @@ mod tests {
             socket_closed_tx.send(()).unwrap();
         });
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let (route, continuation) =
+            bind_live_test_route(client.as_ref(), &owner, &continuation).await;
         let task_request = request.clone();
         let task_continuation = continuation.clone();
         let response_task = tokio::spawn(async move {
             let model = task_request.model.clone();
             live_stream_response(
                 client,
+                route,
                 "message".to_string(),
                 &model,
                 live_test_context(session_id),
@@ -2102,11 +2157,14 @@ mod tests {
             socket_closed_tx.send(()).unwrap();
         });
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let (route, continuation) =
+            bind_live_test_route(client.as_ref(), &owner, &continuation).await;
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             live_stream_response(
                 client,
+                route,
                 "message".to_string(),
                 &request.model,
                 live_test_context(session_id),
@@ -2277,12 +2335,15 @@ mod tests {
             let _ = release_replacement_rx.await;
         });
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let (route, continuation) =
+            bind_live_test_route(client.as_ref(), &owner, &continuation).await;
         let task_request = request.clone();
         let task_continuation = continuation.clone();
         let response_task = tokio::spawn(async move {
             let model = task_request.model.clone();
             live_stream_response(
                 client,
+                route,
                 "message".to_string(),
                 &model,
                 live_test_context(session_id),
