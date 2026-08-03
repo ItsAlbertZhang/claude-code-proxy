@@ -923,20 +923,40 @@ async fn smoke_auto_review_effort_follows_kimi_routes() {
         })
     };
 
-    let effort_only = call_messages_body_for_session(
-        classifier_body("kimi-for-coding", "high"),
-        "smoke-effort-only-affinity",
+    let session_id = "smoke-effort-only-affinity";
+    let seed = call_messages_body_for_session(
+        json!({
+            "model": "kimi-for-coding",
+            "max_tokens": 64,
+            "messages": [{"role":"user","content":"seed Kimi affinity"}],
+            "output_config": {"effort": "high"}
+        }),
+        session_id,
     )
     .await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let seeded_session =
+        claude_code_proxy::session::existing_session_now(Some(session_id)).unwrap();
+    assert_eq!(
+        seeded_session.affinity_provider,
+        Some(claude_code_proxy::config::AliasProvider::Kimi)
+    );
+
+    let effort_only =
+        call_messages_body_for_session(classifier_body("sonnet", "high"), session_id).await;
     assert_eq!(effort_only.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(effort_only.into_body(), usize::MAX)
         .await
         .unwrap();
+    let after_classifier =
+        claude_code_proxy::session::existing_session_now(Some(session_id)).unwrap();
+    assert_eq!(after_classifier.seq, seeded_session.seq);
     assert_eq!(
-        claude_code_proxy::session::existing_session_now(Some("smoke-effort-only-affinity"))
-            .and_then(|state| state.affinity_provider),
-        None,
-        "an effort-only auto-review request must not publish affinity"
+        after_classifier.affinity_provider, seeded_session.affinity_provider,
+        "an effort-only auto-review request must route by existing affinity without publishing it"
     );
 
     {
@@ -962,14 +982,17 @@ async fn smoke_auto_review_effort_follows_kimi_routes() {
         .unwrap();
 
     let sent = captured.lock().unwrap();
-    assert_eq!(sent.len(), 3);
+    assert_eq!(sent.len(), 4);
     assert_eq!(sent[0]["model"], "kimi-for-coding");
-    assert_eq!(sent[0]["reasoning_effort"], "low");
-    assert!(sent[0].get("prompt_cache_key").is_none());
+    assert_eq!(sent[0]["reasoning_effort"], "high");
+    assert!(sent[0].get("prompt_cache_key").is_some());
     assert_eq!(sent[1]["model"], "kimi-for-coding");
-    assert_eq!(sent[1]["reasoning_effort"], "high");
+    assert_eq!(sent[1]["reasoning_effort"], "low");
+    assert!(sent[1].get("prompt_cache_key").is_none());
     assert_eq!(sent[2]["model"], "kimi-for-coding");
     assert_eq!(sent[2]["reasoning_effort"], "high");
+    assert_eq!(sent[3]["model"], "kimi-for-coding");
+    assert_eq!(sent[3]["reasoning_effort"], "high");
 }
 
 // ---------------------------------------------------------------------------

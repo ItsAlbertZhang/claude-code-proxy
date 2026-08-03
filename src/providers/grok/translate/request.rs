@@ -17,12 +17,26 @@ pub struct GrokResponsesRequest {
     pub tools: Option<Vec<GrokTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<GrokToolChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallel_tool_calls: Option<bool>,
     pub store: bool,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct GrokResponsesWireRequest {
+    #[serde(flatten)]
+    request: GrokResponsesRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+}
+
+impl std::ops::Deref for GrokResponsesWireRequest {
+    type Target = GrokResponsesRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +145,16 @@ pub fn translate_request(
     translate_request_with_mode(req, model, crate::config::grok_tool_image_mode())
 }
 
+pub(crate) fn translate_wire_request(
+    req: &MessagesRequest,
+    model: String,
+) -> anyhow::Result<GrokResponsesWireRequest> {
+    Ok(GrokResponsesWireRequest {
+        request: translate_request_with_mode(req, model, crate::config::grok_tool_image_mode())?,
+        parallel_tool_calls: parallel_tool_calls(req),
+    })
+}
+
 pub fn translate_request_with_mode(
     req: &MessagesRequest,
     model: String,
@@ -185,7 +209,6 @@ pub fn translate_request_with_mode(
         input,
         tools,
         tool_choice,
-        parallel_tool_calls: parallel_tool_calls(req),
         store: false,
         stream: true,
         max_output_tokens: req.max_tokens,
@@ -1155,8 +1178,9 @@ mod tests {
                 "parallel_tool_calls":parallel
             }))
             .unwrap();
-            let translated = translate_request(&request, "grok-4.5".into()).unwrap();
-            assert_eq!(translated.parallel_tool_calls, Some(parallel));
+            let translated = translate_wire_request(&request, "grok-4.5".into()).unwrap();
+            let wire = serde_json::to_value(&translated).unwrap();
+            assert_eq!(wire["parallel_tool_calls"], parallel);
             assert!(translated.tool_choice.is_none());
         }
     }

@@ -94,7 +94,7 @@ async fn handle_messages_with_lane(
     }
     let upstream = match tokio::task::spawn_blocking(move || {
         let client = client::KimiHttpClient::new();
-        let result = client.post_kimi(&translated);
+        let result = client.post_kimi_wire(&translated);
         drop(client);
         result
     })
@@ -205,7 +205,7 @@ async fn generate_anthropic_stream_with_lane(
     }
     let upstream = tokio::task::spawn_blocking(move || {
         let client = client::KimiHttpClient::new();
-        let result = client.post_kimi(&translated);
+        let result = client.post_kimi_wire(&translated);
         drop(client);
         result
     })
