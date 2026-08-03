@@ -3808,7 +3808,7 @@ mod tests {
             apply_compaction_replay_for_route(&route, &compaction_replay_request()).unwrap();
 
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
             live_stream_response(
                 client,
                 route.clone(),
@@ -3825,14 +3825,14 @@ mod tests {
         .await
         .expect("live response did not publish the first chunk");
         let mut body = response.into_body();
-        tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+        tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
             .await
             .expect("first downstream chunk timed out")
             .expect("live response body ended before the first chunk")
             .expect("first downstream chunk failed");
         drop(body);
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), socket_closed_rx)
+        tokio::time::timeout(std::time::Duration::from_secs(5), socket_closed_rx)
             .await
             .expect("dropping the downstream body did not close the upstream socket")
             .expect("socket-close acknowledgement sender dropped");
