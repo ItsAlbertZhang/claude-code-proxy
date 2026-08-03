@@ -12,12 +12,17 @@ use futures_util::StreamExt;
 use http::StatusCode;
 use serde_json::{Value, json};
 
+use crate::openai_compat::{MAX_PROVIDER_STREAM_BYTES, MAX_SSE_EVENT_BYTES};
 use crate::provider::{RequestContext, ScopedRequestContext, legacy_scope};
 use crate::request_identity::{LaneDomain, RequestPurpose};
 
 use super::client::{AuthRejectionBudget, CodexError, CodexHttpClient, InBandAuthRefreshDetector};
 use super::state::{CodexBoundRoute, ProtocolLane};
 use request::TranslatedRequest;
+
+pub(super) const MAX_CHAT_UPSTREAM_BYTES: usize = MAX_PROVIDER_STREAM_BYTES;
+pub(super) const MAX_CHAT_SSE_FRAME_BYTES: usize = MAX_SSE_EVENT_BYTES;
+pub(super) const MAX_CHAT_OUTPUT_BYTES: usize = MAX_PROVIDER_STREAM_BYTES;
 
 pub struct ChatCompletionsBackend {
     client: Arc<CodexHttpClient>,
@@ -84,16 +89,16 @@ impl ChatCompletionsBackend {
                 Ok(upstream) => upstream,
                 Err(error) => return codex_error_response(error),
             };
-            if upstream.status() == StatusCode::UNAUTHORIZED && rejection_budget.try_claim() {
-                if let Some(next_route) = self
+            if upstream.status() == StatusCode::UNAUTHORIZED
+                && rejection_budget.try_claim()
+                && let Some(next_route) = self
                     .client
                     .refresh_conversation_route_after_rejection(&route)
                     .await
                     .into_route()
-                {
-                    route = next_route;
-                    continue;
-                }
+            {
+                route = next_route;
+                continue;
             }
             break upstream;
         };
@@ -115,21 +120,15 @@ impl ChatCompletionsBackend {
         }
 
         let headers = stream::response_headers(upstream.headers());
-        let bytes = match collect_body(
+        let completion = match aggregate_completion_body(
             upstream,
             self.client.body_idle_timeout_ms(),
-            Some(&ctx),
-            Some(auth_refresh),
+            &ctx,
+            auth_refresh,
+            &request.model,
         )
         .await
         {
-            Ok(bytes) => bytes,
-            Err(error) => return error.response(),
-        };
-        if let Some(traffic) = ctx.traffic.as_deref() {
-            traffic.write_bytes("032-upstream-response-body.sse", &bytes);
-        }
-        let completion = match response::aggregate_sse(&bytes, &request.model) {
             Ok(completion) => completion,
             Err(error) => return error.response(),
         };
@@ -169,6 +168,94 @@ fn bind_chat_request_to_route(body: &Value, route: &CodexBoundRoute) -> Value {
     bound
 }
 
+async fn aggregate_completion_body(
+    upstream: reqwest::Response,
+    idle_timeout_ms: u64,
+    ctx: &RequestContext,
+    mut auth_refresh: InBandAuthRefreshDetector,
+    model: &str,
+) -> Result<Value, ChatError> {
+    let mut upstream = upstream.bytes_stream();
+    let mut decoder = stream::ChatSseDecoder::default();
+    let mut completion = response::CompletionState::new(model);
+    let mut raw = Vec::new();
+    let mut started = false;
+
+    loop {
+        match tokio::time::timeout(Duration::from_millis(idle_timeout_ms), upstream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                auth_refresh.observe(&chunk);
+                if !started {
+                    if let Some(monitor) = ctx.monitor.as_ref() {
+                        monitor.generation_started(&ctx.req_id);
+                    }
+                    started = true;
+                }
+                let remaining = crate::traffic::MAX_SSE_CAPTURE_BYTES.saturating_sub(raw.len());
+                raw.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+                let events = decoder.observe(&chunk)?;
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.stream_progress(
+                        &ctx.req_id,
+                        chunk.len() as u64,
+                        events.len() as u64,
+                        Some(completion.usage.prompt_tokens),
+                        Some(completion.usage.completion_tokens),
+                    );
+                }
+                for data in events {
+                    if data == "[DONE]" {
+                        continue;
+                    }
+                    let event: Value = serde_json::from_str(&data).map_err(|_| {
+                        ChatError::upstream("Codex returned malformed JSON in its event stream")
+                    })?;
+                    if let Some(traffic) = ctx.traffic.as_deref() {
+                        traffic.write_json_event("040-upstream-event", &event);
+                    }
+                    completion.observe(&event)?;
+                }
+            }
+            Ok(Some(Err(error))) => {
+                return Err(ChatError::upstream(format!(
+                    "Codex response body read failed: {error}"
+                )));
+            }
+            Ok(None) => {
+                auth_refresh.finish();
+                decoder.finish()?;
+                break;
+            }
+            Err(_) => {
+                return Err(ChatError::timeout(format!(
+                    "Timed out waiting {idle_timeout_ms}ms for the next Codex response body chunk"
+                )));
+            }
+        }
+    }
+
+    if let Some(traffic) = ctx.traffic.as_deref()
+        && !raw.is_empty()
+    {
+        traffic.write_bytes("032-upstream-response-body.sse", &raw);
+    }
+    if !completion.completed {
+        return Err(ChatError::upstream(
+            "Codex event stream ended before completion",
+        ));
+    }
+    if !completion.has_output_text() {
+        return Err(ChatError::upstream("Codex completed without output text"));
+    }
+    let value = response::completion_value(&completion);
+    if serde_json::to_vec(&value).map_or(true, |body| body.len() > MAX_CHAT_OUTPUT_BYTES) {
+        return Err(ChatError::upstream(
+            "Codex translated output exceeded the configured limit",
+        ));
+    }
+    Ok(value)
+}
+
 async fn collect_body(
     upstream: reqwest::Response,
     idle_timeout_ms: u64,
@@ -191,6 +278,11 @@ async fn collect_body(
                         monitor.generation_started(&ctx.req_id);
                     }
                     started = true;
+                }
+                if bytes.len().saturating_add(chunk.len()) > MAX_CHAT_UPSTREAM_BYTES {
+                    return Err(ChatError::upstream(
+                        "Codex response body exceeded the configured limit",
+                    ));
                 }
                 bytes.extend_from_slice(&chunk);
                 if let Some(ctx) = ctx
