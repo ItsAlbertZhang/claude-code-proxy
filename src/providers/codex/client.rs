@@ -1189,14 +1189,10 @@ impl CodexHttpClient {
             .validate_responses_request(body)
             .map_err(protocol_error)?;
 
-        let initial_pool_owner = websocket_pool_owner(continuation).cloned();
         if should_reset_websocket_pool(continuation)
-            && let Some(owner) = initial_pool_owner.as_ref()
+            && let Some(reservation) = continuation
         {
-            super::websocket::invalidate_codex_websocket_pool_turn_for_owner(
-                owner,
-                continuation.and_then(super::continuation::ContinuationReservation::turn_id),
-            );
+            super::websocket::invalidate_codex_websocket_pool_for_reservation(reservation);
         }
 
         let mut active_continuation = continuation.cloned();
@@ -1571,11 +1567,10 @@ impl CodexHttpClient {
         continuation: Option<&super::continuation::ContinuationReservation>,
         allow_auth_refresh: bool,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let turn_id = continuation.and_then(super::continuation::ContinuationReservation::turn_id);
         if should_reset_websocket_pool(continuation)
-            && let Some(owner) = websocket_pool_owner(continuation)
+            && let Some(reservation) = continuation
         {
-            super::websocket::invalidate_codex_websocket_pool_turn_for_owner(owner, turn_id);
+            super::websocket::invalidate_codex_websocket_pool_for_reservation(reservation);
         }
 
         let client = self.clone();
@@ -2473,13 +2468,9 @@ fn abort_abandoned_live_continuation(
 fn invalidate_live_continuation_pool(
     continuation: Option<&super::continuation::ContinuationReservation>,
 ) {
-    let Some(continuation) = continuation else {
-        return;
-    };
-    let Some(owner) = websocket_pool_owner(Some(continuation)) else {
-        return;
-    };
-    super::websocket::invalidate_codex_websocket_pool_turn_for_owner(owner, continuation.turn_id());
+    if let Some(continuation) = continuation {
+        super::websocket::invalidate_codex_websocket_pool_for_reservation(continuation);
+    }
 }
 
 fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
