@@ -1029,6 +1029,13 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
     let upstream_url = format!("http://{}", upstream_addr);
+    let _env_guard = EnvGuard::set(&[
+        ("CCP_CURSOR_BASE_URL", &upstream_url),
+        ("CCP_CURSOR_AUTH_TOKEN", "proxy-token"),
+        ("CCP_CURSOR_CLIENT_VERSION", "proxy-test-version"),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ]);
     let _upstream_handle = tokio::spawn(async move {
         axum::serve(upstream_listener, upstream_app).await.unwrap();
     });
@@ -1044,15 +1051,9 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
         .unwrap();
     });
 
-    unsafe {
-        std::env::set_var("CCP_CURSOR_BASE_URL", &upstream_url);
-        std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "proxy-token");
-        std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "proxy-test-version");
-    }
-
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let resp = client
         .post(format!("http://{proxy_addr}/v1/messages"))
         .header("authorization", "Bearer ignored")
@@ -1092,11 +1093,6 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
     );
 
     let _ = shutdown_tx.send(());
-    unsafe {
-        std::env::remove_var("CCP_CURSOR_BASE_URL");
-        std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
-        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
-    }
 }
 
 // ---------------------------------------------------------------------------
