@@ -11,13 +11,15 @@ use http::{HeaderMap, HeaderName, StatusCode};
 use serde_json::{Map, Value, json};
 
 use crate::anthropic::sse::parse_sse_events;
-use crate::provider::RequestContext;
+use crate::provider::{RequestContext, ScopedRequestContext, legacy_scope};
+use crate::request_identity::{LaneDomain, RequestPurpose};
 use crate::traffic::{
     MAX_SSE_CAPTURE_BYTES, MAX_STREAM_CAPTURE_EVENT_BYTES, MAX_STREAM_CAPTURE_EVENTS,
     MAX_STREAM_CAPTURE_FRAME_BYTES,
 };
 
-use super::client::{CodexError, CodexHttpClient};
+use super::client::{AuthRejectionBudget, CodexError, CodexHttpClient, InBandAuthRefreshDetector};
+use super::state::{CodexBoundRoute, ProtocolLane};
 use super::translate::model_allowlist::{
     ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
     uses_responses_lite,
@@ -40,26 +42,82 @@ impl CodexNativeBackend {
         }
     }
 
-    pub async fn handle(&self, mut body: Value, ctx: RequestContext) -> Response {
+    #[cfg(test)]
+    fn with_client(client: CodexHttpClient) -> Self {
+        Self {
+            client: Arc::new(client),
+        }
+    }
+
+    pub async fn handle(&self, body: Value, ctx: RequestContext) -> Response {
+        let scope = legacy_scope(&ctx, RequestPurpose::Conversation);
+        self.handle_scoped(body, ScopedRequestContext::new(ctx, scope))
+            .await
+    }
+
+    pub(crate) async fn handle_scoped(
+        &self,
+        mut body: Value,
+        scoped: ScopedRequestContext,
+    ) -> Response {
+        let (ctx, scope) = scoped.into_parts();
         let resolved = match shape_native_request(&mut body) {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
-            monitor.upstream_started(&ctx.req_id);
         }
-
-        let upstream = match self
-            .client
-            .post_native_responses(&body, &ctx, resolved.use_responses_lite, resolved.stream)
-            .await
-        {
-            Ok(response) => response,
+        let lane = scope.provider_lane(LaneDomain::CodexConversation);
+        let protocol = ProtocolLane::from_uses_responses_lite(resolved.use_responses_lite);
+        let mut route = match self.client.bind_conversation_route(lane, protocol).await {
+            Ok(route) => route,
             Err(error) => return local_codex_error(error),
         };
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.upstream_started(&ctx.req_id);
+        }
+        let rejection_budget = Arc::new(AuthRejectionBudget::default());
+        let can_replay_after_rebind = body.get("previous_response_id").is_none_or(Value::is_null);
 
-        passthrough_response(upstream, ctx, self.client.body_idle_timeout_ms())
+        loop {
+            let bound_body = bind_native_request_to_route(&body, &route);
+            let upstream = match self
+                .client
+                .post_native_responses_bound(
+                    &route,
+                    &bound_body,
+                    &ctx,
+                    resolved.use_responses_lite,
+                    resolved.stream,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => return local_codex_error(error),
+            };
+
+            if upstream.status() == StatusCode::UNAUTHORIZED && rejection_budget.try_claim() {
+                let next_route = self
+                    .client
+                    .refresh_conversation_route_after_rejection(&route)
+                    .await
+                    .into_route();
+                if can_replay_after_rebind && let Some(next_route) = next_route {
+                    route = next_route;
+                    continue;
+                }
+            }
+
+            return passthrough_response(
+                upstream,
+                ctx,
+                self.client.body_idle_timeout_ms(),
+                self.client.clone(),
+                route,
+                rejection_budget,
+            );
+        }
     }
 }
 
@@ -124,19 +182,39 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     if hosted_web_search {
         model = full_lane_web_search_model(&model).to_string();
     }
+    let use_responses_lite = uses_responses_lite(&model) && !hosted_web_search;
     object.insert("model".to_string(), Value::String(model.clone()));
+    if use_responses_lite {
+        object.insert("client_metadata".to_string(), json!({"lite":"true"}));
+    } else {
+        object.remove("client_metadata");
+    }
     if priority && !object.contains_key("service_tier") {
         object.insert("service_tier".to_string(), json!("priority"));
     }
 
     Ok(NativeResolved {
-        use_responses_lite: uses_responses_lite(&model) && !hosted_web_search,
+        use_responses_lite,
         model,
         stream: object
             .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
+}
+
+fn bind_native_request_to_route(body: &Value, route: &CodexBoundRoute) -> Value {
+    let mut bound = body.clone();
+    let Some(caller_key) = body.get("prompt_cache_key").and_then(Value::as_str) else {
+        return bound;
+    };
+    let Some(namespaced) = route.namespace_prompt_cache_key(caller_key) else {
+        return bound;
+    };
+    if let Some(object) = bound.as_object_mut() {
+        object.insert("prompt_cache_key".to_string(), Value::String(namespaced));
+    }
+    bound
 }
 
 fn resolve_native_model(requested: &str) -> (String, bool) {
@@ -236,6 +314,9 @@ fn passthrough_response(
     upstream: reqwest::Response,
     ctx: RequestContext,
     body_idle_timeout_ms: u64,
+    client: Arc<CodexHttpClient>,
+    route: CodexBoundRoute,
+    rejection_budget: Arc<AuthRejectionBudget>,
 ) -> Response {
     let status = upstream.status();
     let headers = passthrough_headers(upstream.headers());
@@ -245,7 +326,12 @@ fn passthrough_response(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream"));
     let outcome = NativeResponseOutcome::default();
-    let observer = NativeResponseObserver::new(ctx, is_sse, outcome.clone());
+    let auth_refresh = if is_sse {
+        InBandAuthRefreshDetector::sse(client, route, rejection_budget)
+    } else {
+        InBandAuthRefreshDetector::json(client, route, rejection_budget)
+    };
+    let observer = NativeResponseObserver::new(ctx, is_sse, outcome.clone(), Some(auth_refresh));
     let state = Some(NativeBodyState {
         stream: Box::pin(upstream.bytes_stream()),
         observer,
@@ -337,11 +423,17 @@ struct NativeResponseObserver {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     outcome: NativeResponseOutcome,
+    auth_refresh: Option<InBandAuthRefreshDetector>,
     finished: bool,
 }
 
 impl NativeResponseObserver {
-    fn new(ctx: RequestContext, is_sse: bool, outcome: NativeResponseOutcome) -> Self {
+    fn new(
+        ctx: RequestContext,
+        is_sse: bool,
+        outcome: NativeResponseOutcome,
+        auth_refresh: Option<InBandAuthRefreshDetector>,
+    ) -> Self {
         Self {
             ctx,
             is_sse,
@@ -358,11 +450,15 @@ impl NativeResponseObserver {
             input_tokens: None,
             output_tokens: None,
             outcome,
+            auth_refresh,
             finished: false,
         }
     }
 
     fn observe(&mut self, chunk: &[u8]) {
+        if let Some(auth_refresh) = self.auth_refresh.as_mut() {
+            auth_refresh.observe(chunk);
+        }
         if !chunk.is_empty() && !self.generation_started {
             if let Some(monitor) = self.ctx.monitor.as_ref() {
                 monitor.generation_started(&self.ctx.req_id);
@@ -522,6 +618,9 @@ impl NativeResponseObserver {
             return;
         }
         self.finished = true;
+        if let Some(auth_refresh) = self.auth_refresh.as_mut() {
+            auth_refresh.finish();
+        }
         if !self.is_sse
             && let Ok(value) = serde_json::from_slice::<Value>(&self.raw)
         {
@@ -603,6 +702,15 @@ fn retain_boundary_prefix(bytes: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::codex::auth::{
+        manager::CodexAuthManager,
+        token_store::{StoredAuth, file_store},
+    };
+    use crate::request_identity::{ConversationIdentity, RequestScope};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn request(body: Value) -> Value {
         body
@@ -619,10 +727,470 @@ mod tests {
         }
     }
 
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, Value) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return (
+                    headers.into_owned(),
+                    serde_json::from_slice(
+                        &request[header_end + 4..header_end + 4 + content_length],
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+    }
+
+    fn test_backend(address: std::net::SocketAddr, auth: StoredAuth) -> CodexNativeBackend {
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        client.auth_manager().set_test_auth(auth);
+        CodexNativeBackend::with_client(client)
+    }
+
+    fn scoped_context(identity: ConversationIdentity, req_id: &str) -> ScopedRequestContext {
+        let mut ctx = observer_context();
+        ctx.req_id = req_id.to_string();
+        ctx.session_id = Some(identity.session_component().to_string());
+        let scope =
+            RequestScope::from_conversation_identity(Some(identity), RequestPurpose::Conversation);
+        ScopedRequestContext::new(ctx, scope)
+    }
+
+    #[tokio::test]
+    async fn native_scoped_routes_keep_sibling_agents_opaque_and_distinct() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(read_http_request(&mut socket).await);
+                let body = br#"{"id":"resp_native","object":"response","status":"completed"}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+            captured
+        });
+        let backend = test_backend(
+            address,
+            StoredAuth {
+                access: "native-token".into(),
+                refresh: String::new(),
+                account_id: Some("native-account".into()),
+                expires: u64::MAX,
+            },
+        );
+
+        for agent in ["agent-a", "agent-b"] {
+            let response = backend
+                .handle_scoped(
+                    json!({"model":"gpt-5.4","input":"hello","stream":false}),
+                    scoped_context(
+                        ConversationIdentity::Agent("shared-session".into(), agent.into()),
+                        agent,
+                    ),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+
+        let captured = server.await.unwrap();
+        let bound_session = |headers: &str| {
+            headers
+                .lines()
+                .find_map(|line| line.strip_prefix("session_id: "))
+                .unwrap()
+                .to_string()
+        };
+        let session_a = bound_session(&captured[0].0);
+        let session_b = bound_session(&captured[1].0);
+        assert_ne!(session_a, session_b);
+        for (headers, _) in captured {
+            for raw in ["shared-session", "agent-a", "agent-b"] {
+                assert!(!headers.contains(raw));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_header_401_rebuilds_once_and_namespaces_original_cache_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let backend = test_backend(
+            address,
+            StoredAuth {
+                access: "native-a".into(),
+                refresh: "refresh-a".into(),
+                account_id: Some("native-account".into()),
+                expires: u64::MAX,
+            },
+        );
+        let server_client = backend.client.clone();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(read_http_request(&mut socket).await);
+                if attempt == 0 {
+                    server_client.auth_manager().set_test_auth(StoredAuth {
+                        access: "native-b".into(),
+                        refresh: "refresh-b".into(),
+                        account_id: Some("native-account".into()),
+                        expires: u64::MAX,
+                    });
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 7\r\nconnection: close\r\n\r\nroute-a",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let body = br#"{"id":"resp_b","object":"response","status":"completed"}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                }
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                    .await
+                    .is_err()
+            );
+            captured
+        });
+        let identity = ConversationIdentity::Main("native-session".into());
+        let response = backend
+            .handle_scoped(
+                json!({
+                    "model":"gpt-5.4",
+                    "input":"unchanged",
+                    "stream":false,
+                    "prompt_cache_key":"caller-cache"
+                }),
+                scoped_context(identity.clone(), "native-rebind"),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let captured = server.await.unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].1["input"], captured[1].1["input"]);
+        assert_ne!(
+            captured[0].1["prompt_cache_key"],
+            captured[1].1["prompt_cache_key"]
+        );
+        assert_ne!(captured[1].1["prompt_cache_key"], "caller-cache");
+        let scope =
+            RequestScope::from_conversation_identity(Some(identity), RequestPurpose::Conversation);
+        let route_b = backend
+            .client
+            .bind_conversation_route(
+                scope.provider_lane(LaneDomain::CodexConversation),
+                ProtocolLane::ResponsesFull,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            captured[1].1["prompt_cache_key"],
+            route_b.namespace_prompt_cache_key("caller-cache").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_continuation_header_401_refreshes_without_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let backend = test_backend(
+            address,
+            StoredAuth {
+                access: "continuation-a".into(),
+                refresh: "refresh-a".into(),
+                account_id: Some("continuation-account".into()),
+                expires: u64::MAX,
+            },
+        );
+        let server_client = backend.client.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let captured = read_http_request(&mut socket).await;
+            server_client.auth_manager().set_test_auth(StoredAuth {
+                access: "continuation-b".into(),
+                refresh: "refresh-b".into(),
+                account_id: Some("continuation-account".into()),
+                expires: u64::MAX,
+            });
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 14\r\nconnection: close\r\n\r\nstale response",
+                )
+                .await
+                .unwrap();
+            (
+                captured,
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await,
+            )
+        });
+
+        let response = backend
+            .handle(
+                json!({
+                    "model":"gpt-5.4",
+                    "previous_response_id":"resp_route_a",
+                    "input":"delta only",
+                    "stream":false
+                }),
+                observer_context(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(response_body.as_ref(), b"stale response");
+        let ((_, captured), second) = server.await.unwrap();
+        assert!(second.is_err());
+        assert_eq!(captured["previous_response_id"], "resp_route_a");
+        assert_eq!(
+            backend
+                .client
+                .auth_manager()
+                .get_auth()
+                .await
+                .unwrap()
+                .access,
+            "continuation-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_route_b_401_cannot_refresh_or_send_route_c() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let backend = test_backend(
+            address,
+            StoredAuth {
+                access: "native-a".into(),
+                refresh: "refresh-a".into(),
+                account_id: Some("native-account".into()),
+                expires: u64::MAX,
+            },
+        );
+        let server_client = backend.client.clone();
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(read_http_request(&mut socket).await);
+                server_client.auth_manager().set_test_auth(StoredAuth {
+                    access: if attempt == 0 { "native-b" } else { "native-c" }.into(),
+                    refresh: format!("refresh-{}", attempt + 2),
+                    account_id: Some("native-account".into()),
+                    expires: u64::MAX,
+                });
+                let body = if attempt == 0 { b"route-a" } else { b"route-b" };
+                let head = format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+            (
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await,
+                captured,
+            )
+        });
+
+        let response = backend
+            .handle(
+                json!({"model":"gpt-5.4","input":"hello","stream":false}),
+                observer_context(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"route-b");
+        let (third, captured) = server.await.unwrap();
+        assert!(third.is_err());
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].0.contains("authorization: Bearer native-a"));
+        assert!(captured[1].0.contains("authorization: Bearer native-b"));
+    }
+
+    #[tokio::test]
+    async fn native_split_json_in_band_401_preserves_response_and_refreshes_once_later() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let oauth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oauth_address = oauth_listener.local_addr().unwrap();
+        let auth_manager = CodexAuthManager::new_for_test(
+            file_store(),
+            format!("http://{oauth_address}/oauth/token"),
+        );
+        auth_manager.set_test_auth(StoredAuth {
+            access: "in-band-a".into(),
+            refresh: "in-band-refresh".into(),
+            account_id: Some("in-band-account".into()),
+            expires: u64::MAX,
+        });
+        let client = CodexHttpClient::new_for_test_with_auth_manager(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            auth_manager,
+            format!("http://{upstream_address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        let backend = CodexNativeBackend::with_client(client);
+        let observable = br#"{"type":"response.failed","status_code":401,"response":{"error":{"status":401,"message":"expired in band"}}}"#;
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let _ = read_http_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in observable.chunks(17) {
+                socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        let oauth = tokio::spawn(async move {
+            let (mut socket, _) = oauth_listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).contains("in-band-refresh"));
+            let body = br#"{"access_token":"in-band-b","refresh_token":"in-band-refresh-b","expires_in":3600}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(100), oauth_listener.accept()).await
+        });
+
+        let response = backend
+            .handle(
+                json!({"model":"gpt-5.4","input":"hello","stream":false}),
+                observer_context(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), observable);
+        upstream.await.unwrap();
+        assert!(oauth.await.unwrap().is_err());
+        assert_eq!(
+            backend
+                .client
+                .auth_manager()
+                .get_auth()
+                .await
+                .unwrap()
+                .access,
+            "in-band-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_sse_in_band_401_preserves_status_body_and_framing_without_replay() {
+        const AUTH_SSE: &[u8] = b"event: response.failed\r\ndata: {\"type\":\"response.failed\",\"status_code\":401,\"response\":{\"error\":{\"status\":401,\"message\":\"stream expired\"}}}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = test_backend(
+            listener.local_addr().unwrap(),
+            StoredAuth {
+                access: "native-sse".into(),
+                refresh: String::new(),
+                account_id: Some("native-sse-account".into()),
+                expires: u64::MAX,
+            },
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut socket).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                AUTH_SSE.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            for chunk in AUTH_SSE.chunks(19) {
+                socket.write_all(chunk).await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_millis(75), listener.accept()).await
+        });
+
+        let response = backend
+            .handle(
+                json!({"model":"gpt-5.4","input":"hello","stream":true}),
+                observer_context(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), AUTH_SSE);
+        assert!(server.await.unwrap().is_err());
+    }
+
     #[test]
     fn failed_sse_event_records_native_outcome() {
         let outcome = NativeResponseOutcome::default();
-        let mut observer = NativeResponseObserver::new(observer_context(), true, outcome.clone());
+        let mut observer =
+            NativeResponseObserver::new(observer_context(), true, outcome.clone(), None);
         observer.observe(
             b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"generation failed\"}}}\n\n",
         );
@@ -633,7 +1201,8 @@ mod tests {
     #[test]
     fn completed_json_with_null_error_stays_successful() {
         let outcome = NativeResponseOutcome::default();
-        let mut observer = NativeResponseObserver::new(observer_context(), false, outcome.clone());
+        let mut observer =
+            NativeResponseObserver::new(observer_context(), false, outcome.clone(), None);
         observer
             .observe(br#"{"id":"resp_ok","object":"response","status":"completed","error":null}"#);
         observer.finish("complete");
@@ -644,7 +1213,8 @@ mod tests {
     #[test]
     fn failed_json_records_error_message() {
         let outcome = NativeResponseOutcome::default();
-        let mut observer = NativeResponseObserver::new(observer_context(), false, outcome.clone());
+        let mut observer =
+            NativeResponseObserver::new(observer_context(), false, outcome.clone(), None);
         observer.observe(
             br#"{"id":"resp_failed","object":"response","status":"failed","error":{"message":"request failed"}}"#,
         );
@@ -656,7 +1226,8 @@ mod tests {
     #[test]
     fn response_error_event_records_failure() {
         let outcome = NativeResponseOutcome::default();
-        let mut observer = NativeResponseObserver::new(observer_context(), true, outcome.clone());
+        let mut observer =
+            NativeResponseObserver::new(observer_context(), true, outcome.clone(), None);
         observer.observe(
             b"event: response.error\ndata: {\"type\":\"response.error\",\"response\":{\"error\":{\"message\":\"stream error\"}}}\n\n",
         );
@@ -672,7 +1243,7 @@ mod tests {
         context.traffic = Some(Arc::new(crate::traffic::test_capture(
             temp.path().to_path_buf(),
         )));
-        let mut observer = NativeResponseObserver::new(context, true, outcome);
+        let mut observer = NativeResponseObserver::new(context, true, outcome, None);
         for index in 0..MAX_STREAM_CAPTURE_EVENTS + 10 {
             observer.capture_event(json!({"index": index}));
         }
@@ -696,11 +1267,17 @@ mod tests {
         assert_eq!(resolved.model, "gpt-5.6-sol");
         assert_eq!(body["model"], "gpt-5.6-sol");
         assert!(resolved.use_responses_lite);
+        assert_eq!(body["client_metadata"]["lite"], "true");
 
-        let mut fast = request(json!({"model":"gpt-5.4-fast","input":[]}));
+        let mut fast = request(json!({
+            "model":"gpt-5.4-fast",
+            "input":[],
+            "client_metadata":{"lite":"true"}
+        }));
         let resolved = shape_native_request(&mut fast).unwrap();
         assert_eq!(resolved.model, "gpt-5.4");
         assert_eq!(fast["service_tier"], "priority");
+        assert!(fast.get("client_metadata").is_none());
     }
 
     #[test]
@@ -720,11 +1297,13 @@ mod tests {
             let mut body = request(json!({
                 "model":"gpt-5.6-luna",
                 "tools":[{"type":tool_type}],
-                "input":[]
+                "input":[],
+                "client_metadata":{"lite":"true"}
             }));
             let resolved = shape_native_request(&mut body).unwrap();
             assert_eq!(resolved.model, "gpt-5.6-sol");
             assert!(!resolved.use_responses_lite);
+            assert!(body.get("client_metadata").is_none());
         }
     }
 

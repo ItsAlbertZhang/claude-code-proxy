@@ -5,9 +5,7 @@ use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::provider::{RequestContext, legacy_scope};
-#[cfg(test)]
-use crate::request_identity::ConversationIdentity;
-use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose};
+use crate::request_identity::{ConversationIdentity, LaneDomain, OpaqueLane, RequestPurpose};
 use crate::retry::{compute_backoff_delay, should_retry_status, sleep};
 use crate::traffic::TrafficCapture;
 
@@ -61,6 +59,61 @@ impl AuthRejectionBudget {
                 std::sync::atomic::Ordering::Acquire,
             )
             .is_ok()
+    }
+}
+
+pub(crate) struct InBandAuthRefreshDetector {
+    client: Arc<CodexHttpClient>,
+    route: CodexBoundRoute,
+    budget: Arc<AuthRejectionBudget>,
+    detector: super::events::BoundedAuthFailureDetector,
+}
+
+impl InBandAuthRefreshDetector {
+    pub(crate) fn json(
+        client: Arc<CodexHttpClient>,
+        route: CodexBoundRoute,
+        budget: Arc<AuthRejectionBudget>,
+    ) -> Self {
+        Self {
+            client,
+            route,
+            budget,
+            detector: super::events::BoundedAuthFailureDetector::json(),
+        }
+    }
+
+    pub(crate) fn sse(
+        client: Arc<CodexHttpClient>,
+        route: CodexBoundRoute,
+        budget: Arc<AuthRejectionBudget>,
+    ) -> Self {
+        Self {
+            client,
+            route,
+            budget,
+            detector: super::events::BoundedAuthFailureDetector::sse(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, chunk: &[u8]) {
+        if self.detector.observe(chunk) {
+            self.schedule_refresh();
+        }
+    }
+
+    pub(crate) fn finish(&mut self) {
+        if self.detector.finish() {
+            self.schedule_refresh();
+        }
+    }
+
+    fn schedule_refresh(&self) {
+        self.client
+            .refresh_conversation_auth_after_rejection_in_background(
+                &self.route,
+                self.budget.clone(),
+            );
     }
 }
 
@@ -317,9 +370,32 @@ fn build_bound_native_codex_headers(
     Ok(headers)
 }
 
+fn build_bound_codex_search_headers(
+    route: &CodexBoundRoute,
+) -> Result<http::HeaderMap, CodexError> {
+    route
+        .validate_protocol(ProtocolLane::ResponsesFull)
+        .map_err(protocol_error)?;
+    let mut headers = build_bound_codex_headers(route)?;
+    headers.insert(
+        http::header::ACCEPT,
+        header_value("accept", "application/json")?,
+    );
+    let originator = config::codex_originator(RESPONSES_LITE_ORIGINATOR);
+    headers.insert("originator", header_value("originator", &originator)?);
+    let user_agent = config::codex_user_agent(RESPONSES_LITE_ORIGINATOR);
+    if !user_agent.is_empty() {
+        headers.insert(
+            http::header::USER_AGENT,
+            header_value("user-agent", &user_agent)?,
+        );
+    }
+    Ok(headers)
+}
+
 pub fn build_codex_image_headers(
     auth: &StoredAuth,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
 ) -> Result<http::HeaderMap, CodexError> {
     let mut headers = http::HeaderMap::new();
     headers.insert(
@@ -344,6 +420,12 @@ pub fn build_codex_image_headers(
             header_value("ChatGPT-Account-Id", account_id)?,
         );
     }
+    if let Some(session_id) = ctx.session_id.as_deref() {
+        headers.insert(
+            "x-client-request-id",
+            header_value("x-client-request-id", session_id)?,
+        );
+    }
     let user_agent = config::codex_user_agent(&default_user_agent(false));
     if !user_agent.is_empty() {
         headers.insert(
@@ -356,7 +438,7 @@ pub fn build_codex_image_headers(
 
 pub fn build_codex_transcription_headers(
     auth: &StoredAuth,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
 ) -> Result<http::HeaderMap, CodexError> {
     let mut headers = http::HeaderMap::new();
     headers.insert(
@@ -372,6 +454,12 @@ pub fn build_codex_transcription_headers(
         headers.insert(
             "ChatGPT-Account-Id",
             header_value("ChatGPT-Account-Id", account_id)?,
+        );
+    }
+    if let Some(session_id) = ctx.session_id.as_deref() {
+        headers.insert(
+            "x-client-request-id",
+            header_value("x-client-request-id", session_id)?,
         );
     }
     let user_agent = config::codex_user_agent(&default_user_agent(false));
@@ -392,6 +480,14 @@ fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError
         retry_after: None,
         origin: CodexErrorOrigin::Http,
     })
+}
+
+fn search_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    match base_url.strip_suffix("/responses") {
+        Some(api_root) => format!("{api_root}/alpha/search"),
+        None => format!("{base_url}/alpha/search"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,17 +1344,93 @@ impl CodexHttpClient {
 
     pub async fn post_search(
         &self,
-        _body: &SearchRequest,
-        _ctx: &RequestContext,
+        body: &SearchRequest,
+        ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
-        Err(CodexError {
-            status: 501,
-            message: "Standalone Codex search is disabled until route-safe recovery is available"
-                .to_string(),
-            detail: Some("route_safe_recovery_required".to_string()),
+        let mut route = self
+            .bind_conversation_route(None, ProtocolLane::ResponsesFull)
+            .await?;
+        let auth_rejection_budget = AuthRejectionBudget::default();
+        let mut retry_state = BufferedRetryState::default();
+        loop {
+            match self
+                .post_search_bound_with_retry_state(&route, body, ctx, &mut retry_state)
+                .await
+            {
+                Err(error) if error.status == 401 && auth_rejection_budget.try_claim() => {
+                    let Some(next_route) = self
+                        .refresh_conversation_route_after_rejection(&route)
+                        .await
+                        .into_route()
+                    else {
+                        return Err(error);
+                    };
+                    route = next_route;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    pub(crate) async fn post_search_bound(
+        &self,
+        route: &CodexBoundRoute,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+    ) -> Result<SearchResponse, CodexError> {
+        let mut retry_state = BufferedRetryState::default();
+        self.post_search_bound_with_retry_state(route, body, ctx, &mut retry_state)
+            .await
+    }
+
+    pub(crate) async fn post_search_bound_with_retry_state(
+        &self,
+        route: &CodexBoundRoute,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+        retry_state: &mut BufferedRetryState,
+    ) -> Result<SearchResponse, CodexError> {
+        route
+            .validate_protocol(ProtocolLane::ResponsesFull)
+            .map_err(protocol_error)?;
+        let body_json = serde_json::to_string(body).map_err(|error| CodexError {
+            status: 500,
+            message: "Failed to serialize search request".to_string(),
+            detail: Some(error.to_string()),
             retry_after: None,
             origin: CodexErrorOrigin::Http,
-        })
+        })?;
+        loop {
+            let response = self
+                .attempt_post_search_bound(route, &body_json, ctx)
+                .await?;
+            if should_retry_codex_status(response.status)
+                && retry_state.transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES
+            {
+                let retry_after = response
+                    .headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+                    .map(|(_, value)| value.as_str());
+                let delay = compute_backoff_delay(retry_state.transport_failures, retry_after);
+                if delay.exceeds_budget {
+                    return Err(codex_status_error(response));
+                }
+                retry_state.transport_failures += 1;
+                sleep(delay.wait_ms).await;
+                continue;
+            }
+            if !(200..300).contains(&response.status) {
+                return Err(codex_status_error(response));
+            }
+            return serde_json::from_slice(&response.body).map_err(|error| CodexError {
+                status: 502,
+                message: "Failed to decode Codex search response".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            });
+        }
     }
 
     async fn post_codex_with_transport(
@@ -1985,7 +2157,6 @@ impl CodexHttpClient {
         }
     }
 
-    #[cfg(test)]
     async fn attempt_post_http(
         &self,
         auth: &StoredAuth,
@@ -2125,6 +2296,117 @@ impl CodexHttpClient {
 
         Ok(CodexResponse {
             body: body_bytes,
+            status,
+            headers,
+            transport: ActualTransport::Http,
+        })
+    }
+
+    async fn attempt_post_search_bound(
+        &self,
+        route: &CodexBoundRoute,
+        body_json: &str,
+        ctx: &RequestContext,
+    ) -> Result<CodexResponse, CodexError> {
+        let url = search_endpoint(route.canonical_endpoint().as_str());
+        let headers = build_bound_codex_search_headers(route)?;
+        self.attempt_post_search_at(&url, &headers, body_json, ctx)
+            .await
+    }
+
+    async fn attempt_post_search_at(
+        &self,
+        url: &str,
+        headers: &http::HeaderMap,
+        body_json: &str,
+        ctx: &RequestContext,
+    ) -> Result<CodexResponse, CodexError> {
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_codex_http_request_capture(traffic, url, headers, body_json);
+        }
+
+        let mut request = self.client.post(url);
+        for (key, value) in headers.iter() {
+            request = request.header(key.as_str(), value.as_bytes());
+        }
+        let started_at = Instant::now();
+        let mut response = tokio::time::timeout(
+            Duration::from_millis(self.header_timeout_ms),
+            request.body(body_json.to_string()).send(),
+        )
+        .await
+        .map_err(|_| CodexError {
+            status: 0,
+            message: format!(
+                "Timed out waiting {}ms for Codex search response headers",
+                self.header_timeout_ms
+            ),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?
+        .map_err(|e| CodexError {
+            status: 0,
+            message: format!("Codex search network error: {e}"),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
+
+        let status = response.status().as_u16();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let mut body = Vec::new();
+        let mut response_started = false;
+        loop {
+            let chunk = tokio::time::timeout(
+                Duration::from_millis(self.body_idle_timeout_ms),
+                response.chunk(),
+            )
+            .await
+            .map_err(|_| CodexError {
+                status: 0,
+                message: format!(
+                    "Timed out waiting {}ms for the next Codex search response body chunk",
+                    self.body_idle_timeout_ms
+                ),
+                detail: Some("http_response_body".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?
+            .map_err(|e| CodexError {
+                status: 0,
+                message: format!("Transport error reading Codex search response body: {e}"),
+                detail: Some("http_response_body".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if !response_started {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.generation_started(&ctx.req_id);
+                }
+                response_started = true;
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_upstream_response_capture(traffic, status, started_at.elapsed(), &headers, &body);
+        }
+
+        Ok(CodexResponse {
+            body,
             status,
             headers,
             transport: ActualTransport::Http,
@@ -2561,7 +2843,6 @@ pub(super) fn is_continuation_retry_error(err: &CodexError) -> bool {
     )
 }
 
-#[cfg(test)]
 fn websocket_pool_owner(
     continuation: Option<&super::continuation::ContinuationReservation>,
 ) -> Option<&ConversationIdentity> {
@@ -3740,8 +4021,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_search_client_is_fail_closed() {
+    async fn bound_search_rejects_responses_lite_route() {
         let client = authenticated_http_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesLite)
+            .await
+            .unwrap();
         let request = SearchRequest {
             id: "search-test".to_string(),
             model: "gpt-5.6-sol".to_string(),
@@ -3760,14 +4045,72 @@ mod tests {
             max_output_tokens: 2_500,
         };
         let error = client
-            .post_search(&request, &http_test_context())
+            .post_search_bound(&route, &request, &http_test_context())
             .await
             .unwrap_err();
-        assert_eq!(error.status, 501);
-        assert_eq!(
-            error.detail.as_deref(),
-            Some("route_safe_recovery_required")
+        assert_eq!(error.status, 500);
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("protocol mismatch"))
         );
+    }
+
+    #[tokio::test]
+    async fn bound_search_preserves_auth_snapshot_and_refreshes_only_next_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let full_route = client
+            .bind_conversation_route(None, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "rotated".into(),
+            refresh: "rotated-refresh".into(),
+            account_id: Some("acct-rotated".into()),
+            expires: u64::MAX,
+        });
+        let body = SearchRequest {
+            id: "search-test".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            reasoning: None,
+            input: None,
+            commands: super::super::search::SearchCommands {
+                search_query: vec![super::super::search::SearchQuery {
+                    q: "query".to_string(),
+                }],
+            },
+            settings: super::super::search::SearchSettings {
+                filters: None,
+                allowed_callers: vec!["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: 2_500,
+        };
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /alpha/search HTTP/1.1"));
+            assert!(request.contains("authorization: Bearer test"));
+            assert!(!request.contains("rotated"));
+            let body = br#"{"encrypted_output":null,"output":"ok","results":null}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let response = client
+            .post_search_bound(&full_route, &body, &http_test_context())
+            .await
+            .unwrap();
+        assert_eq!(response.output, "ok");
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -3834,6 +4177,7 @@ mod tests {
             &first_response.body,
             first_response.socket_id,
             None,
+            None,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);
@@ -3862,6 +4206,7 @@ mod tests {
             &second_request,
             &second_response.body,
             second_response.socket_id,
+            None,
             None,
         );
 
@@ -3962,6 +4307,7 @@ mod tests {
             &first_request,
             &first_response.body,
             first_response.socket_id,
+            None,
             None,
         );
 
@@ -4075,6 +4421,7 @@ mod tests {
             &first_request,
             &first_response.body,
             first_response.socket_id,
+            None,
             None,
         );
 
@@ -4985,16 +5332,14 @@ mod tests {
     }
 
     #[test]
-    fn image_and_transcription_headers_are_stateless() {
+    fn image_headers_reuse_oauth_without_responses_beta_headers() {
         let auth = StoredAuth {
             access: "tok".into(),
             refresh: String::new(),
             account_id: Some("acct".into()),
             expires: u64::MAX,
         };
-        let mut ctx = http_test_context();
-        ctx.session_id = Some("raw-auxiliary-session".into());
-        let headers = build_codex_image_headers(&auth, &ctx).unwrap();
+        let headers = build_codex_image_headers(&auth, &http_test_context()).unwrap();
 
         assert_eq!(
             headers.get(http::header::AUTHORIZATION).unwrap(),
@@ -5011,15 +5356,6 @@ mod tests {
         );
         assert!(headers.get("openai-beta").is_none());
         assert!(headers.get("x-codex-beta-features").is_none());
-        assert!(headers.get("session_id").is_none());
-        assert!(headers.get("x-client-request-id").is_none());
-        assert!(headers.get("x-codex-window-id").is_none());
-
-        let transcription = build_codex_transcription_headers(&auth, &ctx).unwrap();
-        assert!(transcription.get("session_id").is_none());
-        assert!(transcription.get("x-client-request-id").is_none());
-        assert!(transcription.get("x-codex-window-id").is_none());
-        assert!(!format!("{headers:?}{transcription:?}").contains("raw-auxiliary-session"));
     }
 
     #[test]
