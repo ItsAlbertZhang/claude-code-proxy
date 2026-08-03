@@ -114,6 +114,18 @@ Multipart PNG, JPEG, WebP, and GIF signatures are validated and translated to Co
 
 The Images API is an internal ChatGPT Codex integration, not the public OpenAI Platform Images API. It consumes the signed-in ChatGPT account's entitlement and quota, and the internal contract can change independently of the public API.
 
+## `POST /v1/audio/transcriptions`
+
+Enable this route with `CCP_CODEX_TRANSCRIPTIONS_API=1` or `codex.transcriptionsApi: true`. It reuses the proxy-owned ChatGPT/Codex OAuth session and accepts OpenAI-style `multipart/form-data` with a required `file` and optional `language` field:
+
+```sh
+curl http://127.0.0.1:18765/v1/audio/transcriptions \
+  -F 'file=@recording.webm' \
+  -F 'language=en'
+```
+
+FLAC, M4A, MP3, MP4 audio, MPEG audio, Ogg, WAV, and WebM uploads are supported up to 25 MiB. Successful responses contain JSON with a `text` field. Requests and responses are bounded, transcription concurrency is limited, audio is not written to traffic captures, and this auxiliary route never consumes or publishes conversation state.
+
 ## `POST /v1/responses`
 
 Enable this route with `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi: true`. The `model` field selects Codex, Kimi, Grok, OpenCode Go, or Cursor.
@@ -139,9 +151,9 @@ Responses include the accepted tool settings. Grok search appears as a `web_sear
 
 ### Parallel tool calls
 
-The shared Kimi, Grok, and Cursor ingress accepts boolean `parallel_tool_calls` on both OpenAI routes. `false` preserves serial tool execution through translation, while `true` selects the existing parallel default. Omitting the field leaves the provider default unchanged. Non-boolean values return an `invalid_request_error` with `parallel_tool_calls` in `error.param`.
+The shared Kimi, Grok, OpenCode Go, and Cursor ingress accepts boolean `parallel_tool_calls` on both OpenAI routes. `false` preserves serial tool execution through translation, while `true` selects the existing parallel default. Omitting the field leaves the provider default unchanged. Non-boolean values return an `invalid_request_error` with `parallel_tool_calls` in `error.param`.
 
-The setting applies without changing the requested `tool_choice` mode. This includes omitted or `auto` choices, `none`, `required`, and named functions. Internally, an explicit OpenAI setting determines the equivalent Anthropic `tool_choice.disable_parallel_tool_use` value. Anthropic Messages requests can set `disable_parallel_tool_use` directly. Kimi and Grok receive the corresponding upstream `parallel_tool_calls` value, and Cursor's bridged tool loop remains serial between client tool results.
+The setting applies without changing the requested `tool_choice` mode. This includes omitted or `auto` choices, `none`, `required`, and named functions. Internally, an explicit OpenAI setting determines the equivalent Anthropic `tool_choice.disable_parallel_tool_use` value without synthesizing a tool choice for tool-free requests. Anthropic Messages requests can set `disable_parallel_tool_use` directly. Kimi, Grok, and OpenCode Go receive the corresponding upstream `parallel_tool_calls` value, and Cursor's bridged tool loop remains serial between client tool results.
 
 Codex Responses uses native passthrough and forwards `parallel_tool_calls` unchanged. Codex Chat Completions has its own field allowlist and rejects `parallel_tool_calls` because that path does not support function tools.
 
