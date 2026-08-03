@@ -568,7 +568,7 @@ async fn handler_transcription(State(state): State<Arc<AppState>>, req: Request<
     };
     let context = RequestContext {
         req_id: req_id.clone(),
-        session_id,
+        session_id: None,
         session_seq: None,
         provider: "codex".to_string(),
         traffic: None,
@@ -743,7 +743,7 @@ async fn dispatch_image_request(
     }
     let context = RequestContext {
         req_id: req_id.clone(),
-        session_id,
+        session_id: None,
         session_seq: None,
         provider: "codex".to_string(),
         traffic: None,

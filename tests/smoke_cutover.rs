@@ -7,7 +7,7 @@ use axum::response::Response;
 use claude_code_proxy::providers::codex::compaction::clear_all_compactions_for_tests;
 use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
-use claude_code_proxy::{config::AliasProvider, registry::Registry, server::app};
+use claude_code_proxy::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -858,8 +858,8 @@ async fn smoke_auto_review_effort_follows_kimi_routes() {
     assert_eq!(
         claude_code_proxy::session::existing_session_now(Some("smoke-effort-only-affinity"))
             .and_then(|state| state.affinity_provider),
-        Some(AliasProvider::Kimi),
-        "an effort-only auto-review request must retain normal affinity bookkeeping"
+        None,
+        "an effort-only auto-review request must not publish affinity"
     );
 
     {
@@ -888,6 +888,7 @@ async fn smoke_auto_review_effort_follows_kimi_routes() {
     assert_eq!(sent.len(), 3);
     assert_eq!(sent[0]["model"], "kimi-for-coding");
     assert_eq!(sent[0]["reasoning_effort"], "low");
+    assert!(sent[0].get("prompt_cache_key").is_none());
     assert_eq!(sent[1]["model"], "kimi-for-coding");
     assert_eq!(sent[1]["reasoning_effort"], "high");
     assert_eq!(sent[2]["model"], "kimi-for-coding");
