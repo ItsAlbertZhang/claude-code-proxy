@@ -14,6 +14,7 @@ use crate::provider::{ProviderError, ProviderErrorKind};
 pub const MAX_OPENAI_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROVIDER_STREAM_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_PARALLEL_TOOL_CALLS: bool = true;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiSurface {
@@ -34,7 +35,6 @@ impl OpenAiSurface {
 pub struct OpenAiResponseMetadata {
     pub tools: Vec<Value>,
     pub tool_choice: Value,
-    pub parallel_tool_calls: bool,
 }
 
 impl Default for OpenAiResponseMetadata {
@@ -42,7 +42,6 @@ impl Default for OpenAiResponseMetadata {
         Self {
             tools: Vec::new(),
             tool_choice: json!("auto"),
-            parallel_tool_calls: false,
         }
     }
 }

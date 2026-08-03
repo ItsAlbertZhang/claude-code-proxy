@@ -137,7 +137,7 @@ impl Provider for TranslatingProvider {
         body: MessagesRequest,
         _ctx: RequestContext,
     ) -> Result<Generation, ProviderError> {
-        let translated = match self.name {
+        let mut translated = match self.name {
             "kimi" => serde_json::to_value(
                 claude_code_proxy::providers::kimi::translate::request::translate_request(
                     &body,
@@ -168,6 +168,11 @@ impl Provider for TranslatingProvider {
             }),
             _ => unreachable!(),
         };
+        if translated.get("parallel_tool_calls").is_none()
+            && let Some(parallel_tool_calls) = body.extra.get("parallel_tool_calls")
+        {
+            translated["parallel_tool_calls"] = parallel_tool_calls.clone();
+        }
         *self.captured.lock().unwrap() = Some(translated);
         let sse = concat!(
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake\",\"model\":\"test\",\"usage\":{\"input_tokens\":1}}}\n\n",
@@ -1184,6 +1189,60 @@ async fn openai_routes_select_non_codex_providers_and_aliases() {
         };
         assert_eq!(text, Some(expected));
     }
+}
+
+#[tokio::test]
+async fn responses_omitted_parallel_policy_reports_existing_default() {
+    let request = |stream| {
+        json!({
+            "model":"sonnet",
+            "input":"look up x",
+            "stream":stream,
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
+        })
+    };
+
+    let buffered = app_with_options(routed_registry(), None, true)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(body_string(&request(false).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(buffered.status(), StatusCode::OK);
+    let buffered: Value = serde_json::from_slice(
+        &axum::body::to_bytes(buffered.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(buffered["parallel_tool_calls"], true);
+
+    let streaming = app_with_options(routed_registry(), None, true)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(body_string(&request(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(streaming.status(), StatusCode::OK);
+    let streaming = String::from_utf8(
+        axum::body::to_bytes(streaming.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(streaming.contains("\"parallel_tool_calls\":true"));
+    assert!(!streaming.contains("\"parallel_tool_calls\":false"));
 }
 
 #[tokio::test]

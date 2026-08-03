@@ -1,10 +1,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+
 use crate::providers::kimi::auth::constants::api_base_url;
 use crate::providers::kimi::auth::headers::common_headers;
 use crate::providers::kimi::auth::manager::KimiAuthManager;
 use crate::providers::kimi::auth::token_store::{StoredAuth, file_store};
-use crate::providers::kimi::translate::request::KimiChatRequest;
+use crate::providers::kimi::translate::request::{KimiChatRequest, KimiChatWireRequest};
 use crate::retry::{MAX_RATE_LIMIT_RETRIES, compute_backoff_delay};
 
 #[derive(Debug)]
@@ -48,6 +50,17 @@ impl KimiHttpClient {
     }
 
     pub fn post_kimi(&self, body: &KimiChatRequest) -> Result<KimiResponse, KimiError> {
+        self.post_serialized(body)
+    }
+
+    pub(crate) fn post_kimi_wire(
+        &self,
+        body: &KimiChatWireRequest,
+    ) -> Result<KimiResponse, KimiError> {
+        self.post_serialized(body)
+    }
+
+    fn post_serialized<T: Serialize + ?Sized>(&self, body: &T) -> Result<KimiResponse, KimiError> {
         let mut auth = self.auth_manager.get_auth().map_err(|e| KimiError {
             status: 401,
             message: "Auth error".to_string(),
@@ -93,10 +106,10 @@ impl KimiHttpClient {
         }
     }
 
-    fn attempt_post(
+    fn attempt_post<T: Serialize + ?Sized>(
         &self,
         access_token: &str,
-        body: &KimiChatRequest,
+        body: &T,
     ) -> Result<KimiResponse, KimiError> {
         let headers = common_headers().map_err(|e| KimiError {
             status: 500,

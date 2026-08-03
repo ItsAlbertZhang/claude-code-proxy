@@ -132,7 +132,6 @@ pub fn parse_request(
                 .filter(|value| !value.is_null())
                 .cloned()
                 .unwrap_or_else(|| json!("auto")),
-            parallel_tool_calls: parallel_tool_calls.unwrap_or(false),
         }
     } else {
         OpenAiResponseMetadata::default()
@@ -1198,7 +1197,6 @@ mod tests {
             .unwrap();
             assert!(!parsed.messages.extra.contains_key("tool_choice"));
             assert_eq!(parsed.messages.extra["parallel_tool_calls"], parallel);
-            assert_eq!(parsed.response_metadata.parallel_tool_calls, parallel);
         }
     }
 
@@ -1222,7 +1220,7 @@ mod tests {
             parsed.messages.extra["tool_choice"]["disable_parallel_tool_use"],
             true
         );
-        assert!(!parsed.response_metadata.parallel_tool_calls);
+        assert_eq!(parsed.response_metadata.tool_choice["type"], "function");
     }
 
     #[test]

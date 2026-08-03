@@ -32,7 +32,7 @@ use self::auth::token_store::file_store;
 use self::translate::{
     accumulate::accumulate_response_with_traffic,
     model_allowlist::{assert_allowed_model, resolve_model},
-    request::translate_request,
+    request::{translate_request, translate_wire_request},
     stream::{SseDecoder, StreamTranslator, stream_error},
 };
 
@@ -89,7 +89,7 @@ impl Provider for GrokProvider {
                 error.to_string(),
             );
         }
-        let translated = match translate_request(&body, resolved.clone()) {
+        let translated = match translate_wire_request(&body, resolved.clone()) {
             Ok(value) => value,
             Err(error) => {
                 return json_error(
@@ -103,7 +103,11 @@ impl Provider for GrokProvider {
             monitor.model_resolved(&ctx.req_id, &resolved);
             monitor.upstream_started(&ctx.req_id);
         }
-        let upstream = match self.client.post(&translated, ctx.traffic.clone()).await {
+        let upstream = match self
+            .client
+            .post_wire(&translated, ctx.traffic.clone())
+            .await
+        {
             Ok(response) => response,
             Err(error) => return map_error(error),
         };
@@ -206,7 +210,7 @@ impl Provider for GrokProvider {
                 error.to_string(),
             )
         })?;
-        let translated = translate_request(&body, resolved.clone()).map_err(|error| {
+        let translated = translate_wire_request(&body, resolved.clone()).map_err(|error| {
             ProviderError::new(
                 StatusCode::BAD_REQUEST,
                 ProviderErrorKind::InvalidRequest,
@@ -219,7 +223,7 @@ impl Provider for GrokProvider {
         }
         let upstream = self
             .client
-            .post(&translated, ctx.traffic.clone())
+            .post_wire(&translated, ctx.traffic.clone())
             .await
             .map_err(grok_provider_error)?;
         let response = stream_response(

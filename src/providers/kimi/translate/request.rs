@@ -21,8 +21,6 @@ pub struct KimiChatRequest {
     pub tools: Option<Vec<KimiTool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<KimiToolChoice>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parallel_tool_calls: Option<bool>,
     pub stream: bool,
     pub stream_options: KimiStreamOptions,
     pub max_tokens: u32,
@@ -32,6 +30,22 @@ pub struct KimiChatRequest {
     pub thinking: Option<KimiThinking>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct KimiChatWireRequest {
+    #[serde(flatten)]
+    request: KimiChatRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+}
+
+impl std::ops::Deref for KimiChatWireRequest {
+    type Target = KimiChatRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,8 +157,11 @@ pub fn translate_request(
 pub(crate) fn translate_request_scoped(
     req: &MessagesRequest,
     lane: Option<OpaqueLane>,
-) -> Result<KimiChatRequest, anyhow::Error> {
-    translate_request_with_prompt_cache(req, lane.map(|lane| lane.encode()))
+) -> Result<KimiChatWireRequest, anyhow::Error> {
+    Ok(KimiChatWireRequest {
+        request: translate_request_with_prompt_cache(req, lane.map(|lane| lane.encode()))?,
+        parallel_tool_calls: parallel_tool_calls(req),
+    })
 }
 
 fn translate_request_with_prompt_cache(
@@ -174,7 +191,6 @@ fn translate_request_with_prompt_cache(
         }),
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
-        parallel_tool_calls: parallel_tool_calls(req),
         prompt_cache_key,
     };
 
@@ -687,9 +703,9 @@ mod tests {
                 "parallel_tool_calls":parallel
             }))
             .unwrap();
-            let translated =
-                translate_request(&req, TranslateOptions { session_id: None }).unwrap();
-            assert_eq!(translated.parallel_tool_calls, Some(parallel));
+            let translated = translate_request_scoped(&req, None).unwrap();
+            let wire = serde_json::to_value(&translated).unwrap();
+            assert_eq!(wire["parallel_tool_calls"], parallel);
             assert!(translated.tool_choice.is_none());
             assert!(translated.tools.is_none());
         }
@@ -722,14 +738,17 @@ mod tests {
         let main_key = translate_request_scoped(&req, Some(main))
             .unwrap()
             .prompt_cache_key
+            .clone()
             .unwrap();
         let first_key = translate_request_scoped(&req, Some(first))
             .unwrap()
             .prompt_cache_key
+            .clone()
             .unwrap();
         let second_key = translate_request_scoped(&req, Some(second))
             .unwrap()
             .prompt_cache_key
+            .clone()
             .unwrap();
         assert_ne!(main_key, first_key);
         assert_ne!(first_key, second_key);
