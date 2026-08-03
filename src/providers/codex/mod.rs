@@ -1961,13 +1961,21 @@ mod tests {
     }
 
     fn authenticated_live_test_client(base_url: String) -> Arc<CodexHttpClient> {
+        authenticated_live_test_client_with_transport(base_url, config::CodexTransport::WebSocket)
+    }
+
+    fn authenticated_live_test_client_with_transport(
+        base_url: String,
+        transport: config::CodexTransport,
+    ) -> Arc<CodexHttpClient> {
         let client = CodexHttpClient::new_for_test(
             reqwest::Client::builder().no_proxy().build().unwrap(),
             base_url,
             1_000,
             1_000,
             0,
-        );
+        )
+        .with_test_transport(transport);
         client
             .auth_manager()
             .set_test_auth(auth::token_store::StoredAuth {
@@ -3788,7 +3796,10 @@ mod tests {
             while websocket.next().await.is_some() {}
             socket_closed_tx.send(()).unwrap();
         });
-        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let client = authenticated_live_test_client_with_transport(
+            format!("http://{addr}/responses"),
+            config::CodexTransport::Auto,
+        );
         let (route, continuation) =
             bind_live_test_route(client.as_ref(), &owner, &continuation).await;
         let compaction_permit = reserve_compaction_start(route.lane()).unwrap();
