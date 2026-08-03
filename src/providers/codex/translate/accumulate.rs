@@ -1,10 +1,11 @@
 use serde_json::Value;
 
+use crate::request_identity::OpaqueLane;
 use crate::traffic::TrafficCapture;
 
 use super::reducer::{
     AnthropicUsage, ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic,
-    reduce_upstream_bytes,
+    reduce_upstream_bytes, reduce_upstream_bytes_scoped,
 };
 use super::web_search_compat::{WebSearchCompatContent, build_web_search_compat_blocks};
 
@@ -16,13 +17,49 @@ pub fn accumulate_response(
     accumulate_response_with_traffic(upstream, message_id, model, None)
 }
 
+#[derive(Clone, Copy)]
+enum ReadLane {
+    Legacy,
+    Stable(Option<OpaqueLane>),
+}
+
 pub fn accumulate_response_with_traffic(
     upstream: &[u8],
     message_id: &str,
     model: &str,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Value, anyhow::Error> {
-    let events = match reduce_upstream_bytes(upstream) {
+    accumulate_response_with_lane(upstream, message_id, model, traffic, ReadLane::Legacy)
+}
+
+pub(crate) fn accumulate_response_scoped(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+    read_lane: Option<OpaqueLane>,
+) -> Result<Value, anyhow::Error> {
+    accumulate_response_with_lane(
+        upstream,
+        message_id,
+        model,
+        traffic,
+        ReadLane::Stable(read_lane),
+    )
+}
+
+fn accumulate_response_with_lane(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+    read_lane: ReadLane,
+) -> Result<Value, anyhow::Error> {
+    let reduced = match read_lane {
+        ReadLane::Legacy => reduce_upstream_bytes(upstream),
+        ReadLane::Stable(lane) => reduce_upstream_bytes_scoped(upstream, lane),
+    };
+    let events = match reduced {
         Ok(events) => events,
         Err(err) => {
             write_reducer_error_capture(traffic, &err);
@@ -263,7 +300,21 @@ fn write_reducer_error_capture(traffic: Option<&TrafficCapture>, err: &UpstreamS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::codex::translate::read_rewrite::read_offset_rewrite_scoped;
+    use crate::request_identity::{ConversationIdentity, LaneDomain, RequestPurpose, RequestScope};
     use serde_json::json;
+
+    fn read_lane(agent: &str) -> OpaqueLane {
+        RequestScope::from_conversation_identity(
+            Some(ConversationIdentity::Agent(
+                "read-scope-session".to_string(),
+                agent.to_string(),
+            )),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexReadRewrite)
+        .unwrap()
+    }
 
     fn sse_event(type_name: &str, payload: serde_json::Value) -> String {
         let mut obj = if let serde_json::Value::Object(m) = payload {
@@ -349,6 +400,54 @@ mod tests {
         let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
         assert_eq!(response["content"][0]["type"], "tool_use");
         assert_eq!(response["content"][0]["input"]["file_path"], "/tmp/a");
+    }
+
+    #[test]
+    fn buffered_read_rewrite_records_only_its_stable_lane() {
+        let _lock = crate::providers::codex::translate::read_rewrite::READ_REWRITE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_lane = read_lane("buffered-one");
+        let second_lane = read_lane("buffered-two");
+        let call_id = "call_buffered_stable_lane";
+        let upstream = format!(
+            "{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":call_id,"name":"Read"}
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "call_id":call_id,
+                        "name":"Read",
+                        "arguments":"{\"file_path\":\"/tmp/a\",\"offset\":1300000}"
+                    }
+                })
+            ),
+            sse_event(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+
+        let response = accumulate_response_scoped(
+            upstream.as_bytes(),
+            "msg_1",
+            "gpt-5.5",
+            None,
+            Some(first_lane),
+        )
+        .unwrap();
+        assert!(response["content"][0]["input"].get("offset").is_none());
+        assert!(read_offset_rewrite_scoped(Some(first_lane), call_id).is_some());
+        assert!(read_offset_rewrite_scoped(Some(second_lane), call_id).is_none());
     }
 
     #[test]

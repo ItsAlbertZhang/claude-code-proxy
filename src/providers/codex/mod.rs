@@ -33,7 +33,9 @@ use crate::provider::{
     legacy_scope,
 };
 use crate::registry;
-use crate::request_identity::{ConversationIdentity, LaneDomain, RequestPurpose, RequestScope};
+use crate::request_identity::{
+    ConversationIdentity, LaneDomain, OpaqueLane, RequestPurpose, RequestScope,
+};
 use crate::retry::{compute_backoff_delay, sleep};
 
 use self::auth::browser_login::run_browser_login;
@@ -52,21 +54,21 @@ use self::continuation::{
 };
 use self::count_tokens::count_translated_tokens;
 use self::state::{CodexBoundRoute, ProtocolLane};
-use self::translate::accumulate::accumulate_response_with_traffic;
+use self::translate::accumulate::accumulate_response_scoped;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
     uses_responses_lite_with_full_lane,
 };
-use self::translate::reducer::finish_metadata_from_upstream;
+use self::translate::reducer::finish_metadata_from_upstream_scoped;
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request_scoped,
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
-use self::translate::stream::translate_stream_bytes_with_traffic;
+use self::translate::stream::translate_stream_bytes_scoped;
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -137,7 +139,16 @@ impl CodexProvider {
     ) -> Response {
         let (ctx, scope) = scoped.into_parts();
         let conversation_identity = scope.conversational_lane().cloned();
+        let legacy_compaction_session = match conversation_identity.as_ref() {
+            Some(ConversationIdentity::Main(session))
+                if ctx.session_id.as_deref() == Some(session.as_str()) =>
+            {
+                Some(session.clone())
+            }
+            _ => None,
+        };
         let codex_lane = scope.provider_lane(LaneDomain::CodexConversation);
+        let read_lane = scope.provider_lane(LaneDomain::CodexReadRewrite);
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
@@ -155,10 +166,81 @@ impl CodexProvider {
             );
         }
         if search::is_standalone_search_request(&body) {
-            return json_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "invalid_request_error",
-                "Standalone Codex search is disabled until route-safe recovery is available",
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.model_resolved(&ctx.req_id, &resolved.model);
+            }
+            // Generate the stateless ID once. Stateful requests replace it with the
+            // current route's opaque conversation key on every route attempt.
+            let (base_search_request, query) =
+                match search::build_search_request(&body, &resolved.model, None) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            error.to_string(),
+                        );
+                    }
+                };
+            let mut route = match self
+                .client
+                .bind_conversation_route(codex_lane, ProtocolLane::ResponsesFull)
+                .await
+            {
+                Ok(route) => route,
+                Err(error) => return map_codex_error_to_response(&error),
+            };
+            let auth_rejection_budget = Arc::new(AuthRejectionBudget::default());
+            let mut buffered_retry_state = BufferedRetryState::default();
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.upstream_started(&ctx.req_id);
+            }
+            let (search_response, search_request) = loop {
+                let mut search_request = base_search_request.clone();
+                if let Some(id) = route.conversation_key_encoded() {
+                    search_request.id = id;
+                }
+                match self
+                    .client
+                    .post_search_bound_with_retry_state(
+                        &route,
+                        &search_request,
+                        &ctx,
+                        &mut buffered_retry_state,
+                    )
+                    .await
+                {
+                    Ok(response) => break (response, search_request),
+                    Err(error) => {
+                        if error.status == 401 && auth_rejection_budget.try_claim() {
+                            let Some(next_route) = self
+                                .client
+                                .refresh_conversation_route_after_rejection(&route)
+                                .await
+                                .into_route()
+                            else {
+                                return map_codex_error_to_response(&error);
+                            };
+                            route = next_route;
+                            continue;
+                        }
+                        return map_codex_error_to_response(&error);
+                    }
+                }
+            };
+            let input_tokens = search::search_request_input_tokens(&search_request);
+            let output_tokens = search::search_response_output_tokens(&search_response);
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.usage_updated(&ctx.req_id, Some(input_tokens), Some(output_tokens));
+            }
+            return search::anthropic_search_response(
+                &search_response,
+                &query,
+                &message_id,
+                model,
+                want_stream,
+                input_tokens,
+                ctx.traffic.as_deref(),
             );
         }
         let full_lane = config::codex_full_lane();
@@ -168,7 +250,7 @@ impl CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let original_translated = match translate_request(
+        let original_translated = match translate_request_scoped(
             &body,
             TranslateOptions {
                 // Route binding owns all upstream conversation identity. Never
@@ -178,6 +260,7 @@ impl CodexProvider {
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
+            read_lane,
         ) {
             Ok(translated) => translated,
             Err(error) => {
@@ -320,14 +403,20 @@ impl CodexProvider {
                         }
                     }
                 }
-            } else if server_compaction_enabled
-                && !compact_boundary
-                && let Some(replay) = apply_compaction_replay_for_route(&route, &translated)
-            {
-                translated = replay.request;
-                cleanup.replace_compaction_lease(Some(replay.lease));
-                request_continuation = request_continuation.full_context_retry();
-                cleanup.replace_continuation(request_continuation.clone());
+            } else if server_compaction_enabled && !compact_boundary {
+                if let Some(replay) = apply_compaction_replay_for_route(&route, &translated) {
+                    translated = replay.request;
+                    cleanup.replace_compaction_lease(Some(replay.lease));
+                    request_continuation = request_continuation.full_context_retry();
+                    cleanup.replace_continuation(request_continuation.clone());
+                } else if let Some(replay) = compaction::apply_compaction_replay(
+                    legacy_compaction_session.as_deref(),
+                    &translated,
+                ) {
+                    translated = replay;
+                    request_continuation = request_continuation.full_context_retry();
+                    cleanup.replace_continuation(request_continuation.clone());
+                }
             }
 
             if !upstream_started {
@@ -351,6 +440,7 @@ impl CodexProvider {
                     translated.clone(),
                     request_continuation.clone(),
                     cleanup.compaction_lease().cloned(),
+                    read_lane,
                     auth_rejection_budget.clone(),
                     &mut live_start_attempt,
                 )
@@ -446,12 +536,13 @@ impl CodexProvider {
 
             return if want_stream {
                 let estimated_input_tokens = count_translated_tokens(&translated);
-                let sse_bytes = match translate_stream_bytes_with_traffic(
+                let sse_bytes = match translate_stream_bytes_scoped(
                     &upstream.body,
                     &message_id,
                     model,
                     estimated_input_tokens,
                     ctx.traffic.as_deref(),
+                    read_lane,
                 ) {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -477,6 +568,7 @@ impl CodexProvider {
                     &upstream.body,
                     upstream.socket_id,
                     cleanup.compaction_lease(),
+                    read_lane,
                 );
                 cleanup.disarm();
 
@@ -487,11 +579,12 @@ impl CodexProvider {
                 ];
                 (headers, sse_bytes).into_response()
             } else {
-                match accumulate_response_with_traffic(
+                match accumulate_response_scoped(
                     &upstream.body,
                     &message_id,
                     model,
                     ctx.traffic.as_deref(),
+                    read_lane,
                 ) {
                     Ok(json) => {
                         if let Some(monitor) = ctx.monitor.as_ref() {
@@ -508,6 +601,7 @@ impl CodexProvider {
                             &upstream.body,
                             upstream.socket_id,
                             cleanup.compaction_lease(),
+                            read_lane,
                         );
                         cleanup.disarm();
                         (StatusCode::OK, Json(json)).into_response()
@@ -585,7 +679,7 @@ impl Provider for CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let translated = match translate_request(
+        let translated = match translate_request_scoped(
             &body,
             TranslateOptions {
                 session_id: None,
@@ -593,6 +687,7 @@ impl Provider for CodexProvider {
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
+            None,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -777,6 +872,7 @@ async fn live_stream_response(
     continuation: ContinuationReservation,
     compaction_lease: Option<CompactionLease>,
     compaction_start_permit: Option<CompactionStartPermit>,
+    read_lane: Option<OpaqueLane>,
 ) -> Response {
     let mut cleanup = LiveRequestStateCleanup::new(
         continuation.clone(),
@@ -793,6 +889,7 @@ async fn live_stream_response(
         request_body,
         continuation,
         compaction_lease,
+        read_lane,
         Arc::new(AuthRejectionBudget::default()),
         &mut attempt,
     )
@@ -819,6 +916,7 @@ async fn live_stream_route_attempt(
     request_body: translate::request::ResponsesRequest,
     request_continuation: ContinuationReservation,
     compaction_lease: Option<CompactionLease>,
+    read_lane: Option<OpaqueLane>,
     auth_rejection_budget: Arc<AuthRejectionBudget>,
     attempt: &mut u32,
 ) -> LiveRouteOutcome {
@@ -870,6 +968,7 @@ async fn live_stream_route_attempt(
             request_continuation.clone(),
             request_body.clone(),
             compaction_lease.clone(),
+            read_lane,
         )
         .await
         {
@@ -932,12 +1031,14 @@ async fn live_stream_response_once(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compaction_lease: Option<CompactionLease>,
+    read_lane: Option<OpaqueLane>,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
-    let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
+    let mut translator = LiveStreamTranslator::with_stable_read_lane(
         message_id,
         model.to_string(),
         estimated_input_tokens,
+        read_lane,
     );
     let mut upstream_sse_body = Vec::new();
     // Keep protocol framing private until real output makes a transparent retry unsafe.
@@ -1057,6 +1158,7 @@ async fn live_stream_response_once(
                     &upstream_sse_body,
                     upstream_events.socket_id(),
                     compaction_lease.as_ref(),
+                    read_lane,
                 );
                 return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
             }
@@ -1069,6 +1171,7 @@ async fn live_stream_response_once(
                 request_body,
                 upstream_sse_body,
                 compaction_lease,
+                read_lane,
                 client,
                 route,
                 auth_rejection_budget,
@@ -1081,6 +1184,7 @@ async fn live_stream_response_once(
                 &upstream_sse_body,
                 upstream_events.socket_id(),
                 compaction_lease.as_ref(),
+                read_lane,
             );
             if pending_chunk.is_empty() {
                 return LiveStreamStart::Response(empty_live_stream_response());
@@ -1223,6 +1327,7 @@ fn remaining_live_stream_response(
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
     compaction_lease: Option<CompactionLease>,
+    read_lane: Option<OpaqueLane>,
     client: Arc<CodexHttpClient>,
     route: CodexBoundRoute,
     auth_rejection_budget: Arc<AuthRejectionBudget>,
@@ -1303,6 +1408,7 @@ fn remaining_live_stream_response(
                             &upstream_sse_body,
                             upstream_events.socket_id(),
                             compaction_lease.as_ref(),
+                            read_lane,
                         );
                         return;
                     }
@@ -1534,8 +1640,9 @@ fn update_continuation_from_upstream(
     upstream_body: &[u8],
     socket_id: Option<u64>,
     compaction_lease: Option<&CompactionLease>,
+    read_lane: Option<OpaqueLane>,
 ) {
-    match finish_metadata_from_upstream(upstream_body) {
+    match finish_metadata_from_upstream_scoped(upstream_body, read_lane) {
         Ok(Some(finish)) if finish.continuation_eligible => {
             if let Some(lease) = compaction_lease {
                 activate_compaction_for_route(lease, &finish.output_items);
@@ -2107,43 +2214,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_search_is_rejected_before_auth_or_dispatch() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let client = CodexHttpClient::new_for_test(
-            reqwest::Client::builder().no_proxy().build().unwrap(),
-            format!("http://{address}/v1/responses"),
-            1_000,
-            1_000,
-            0,
-        );
-        client
-            .auth_manager()
-            .set_test_auth(auth::token_store::StoredAuth {
-                access: "search-disabled".into(),
-                refresh: "refresh-disabled".into(),
-                expires: u64::MAX,
-                account_id: Some("search-account".into()),
+    async fn standalone_search_401_rebuilds_stateful_route_and_preserves_stateless_id() {
+        for (case, session_id) in [("stateful", Some("raw-search-lane")), ("stateless", None)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = CodexHttpClient::new_for_test(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                format!("http://{address}/v1/responses"),
+                1_000,
+                1_000,
+                0,
+            );
+            client
+                .auth_manager()
+                .set_test_auth(auth::token_store::StoredAuth {
+                    access: format!("search-{case}-a"),
+                    refresh: "refresh-a".into(),
+                    expires: u64::MAX,
+                    account_id: Some("search-account".into()),
+                });
+            let provider = CodexProvider::with_client(client);
+            let server_client = provider.client.clone();
+            let server = tokio::spawn(async move {
+                let mut captured = Vec::new();
+                for attempt in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    captured.push(http_request_parts(&read_http_request(&mut socket).await));
+                    if attempt == 0 {
+                        server_client
+                            .auth_manager()
+                            .set_test_auth(auth::token_store::StoredAuth {
+                                access: format!("search-{case}-b"),
+                                refresh: "refresh-b".into(),
+                                expires: u64::MAX,
+                                account_id: Some("search-account".into()),
+                            });
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 5\r\nconnection: close\r\n\r\nstale",
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        let body = br#"{"output":"search answer","results":[]}"#;
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        socket.write_all(head.as_bytes()).await.unwrap();
+                        socket.write_all(body).await.unwrap();
+                    }
+                }
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "search sent a third route attempt"
+                );
+                captured
             });
-        let provider = CodexProvider::with_client(client);
 
-        let response = provider
-            .handle_messages(
-                standalone_search_request(),
-                messages_test_context("search-disabled", Some("raw-search-lane")),
-            )
-            .await;
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("route-safe recovery"));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            let response = provider
+                .handle_messages(
+                    standalone_search_request(),
+                    messages_test_context(&format!("search-{case}"), session_id),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
-                .is_err(),
-            "fail-closed standalone search must not dispatch"
-        );
+                .unwrap();
+
+            let captured = server.await.unwrap();
+            assert_eq!(captured.len(), 2, "{case}");
+            assert!(
+                captured[0]
+                    .0
+                    .contains(&format!("authorization: Bearer search-{case}-a"))
+            );
+            assert!(
+                captured[1]
+                    .0
+                    .contains(&format!("authorization: Bearer search-{case}-b"))
+            );
+            let mut body_a = captured[0].1.clone();
+            let mut body_b = captured[1].1.clone();
+            let id_a = body_a.as_object_mut().unwrap().remove("id").unwrap();
+            let id_b = body_b.as_object_mut().unwrap().remove("id").unwrap();
+            assert_eq!(body_a, body_b, "{case}");
+            if session_id.is_some() {
+                assert_ne!(id_a, id_b);
+                for ((headers, _), id) in captured.iter().zip([id_a, id_b]) {
+                    let id = id.as_str().unwrap();
+                    for name in ["session_id", "x-client-request-id", "x-codex-window-id"] {
+                        assert!(headers.contains(&format!("{name}: {id}")));
+                    }
+                    assert!(!headers.contains("raw-search-lane"));
+                }
+            } else {
+                assert_eq!(id_a, id_b, "stateless search changed its generated id");
+                assert!(
+                    id_a.as_str().is_some_and(|id| id.starts_with("search-")),
+                    "stateless search id was not generated"
+                );
+                for (headers, _) in &captured {
+                    assert!(!headers.contains("\nsession_id: "));
+                    assert!(!headers.contains("x-client-request-id:"));
+                    assert!(!headers.contains("x-codex-window-id:"));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2516,6 +2696,197 @@ mod tests {
         compaction::clear_all_compactions_for_tests();
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_correction_survives_route_rollover_and_stays_agent_scoped() {
+        let _read_guard = translate::read_rewrite::READ_REWRITE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_transport(config::CodexTransport::Http);
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "read-route-a".into(),
+                refresh: "read-refresh-a".into(),
+                expires: u64::MAX,
+                account_id: Some("read-account".into()),
+            });
+        let provider = CodexProvider::with_client(client);
+        let read_call = "call_read_after_rollover";
+        let first_response = upstream_sse(&[
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"function_call","call_id":read_call,"name":"Read"}
+            }),
+            serde_json::json!({
+                "type":"response.function_call_arguments.delta",
+                "output_index":0,
+                "delta":"{\"file_path\":\"/tmp/route-read\",\"offset\":1300007,\"limit\":20}"
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"function_call",
+                    "call_id":read_call,
+                    "name":"Read",
+                    "arguments":"{\"file_path\":\"/tmp/route-read\",\"offset\":1300007,\"limit\":20}"
+                }
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"resp_read_a","status":"completed","usage":{}}
+            }),
+        ]);
+        let success = upstream_sse(&[
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_read_done"}
+            }),
+            serde_json::json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "delta":"done"
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_read_done"}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"resp_read_done","status":"completed","usage":{}}
+            }),
+        ]);
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for response_body in [&first_response, &success, &success] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(http_request_parts(&read_http_request(&mut socket).await));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(response_body).await.unwrap();
+            }
+            captured
+        });
+
+        let scope = |agent: &str, req_id: &str| {
+            let mut context = messages_test_context(req_id, Some("raw-shared-session"));
+            context.session_id = Some("raw-context-must-not-own-read-state".to_string());
+            ScopedRequestContext::new(
+                context,
+                RequestScope::from_conversation_identity(
+                    Some(ConversationIdentity::Agent(
+                        "raw-shared-session".to_string(),
+                        agent.to_string(),
+                    )),
+                    RequestPurpose::Conversation,
+                ),
+            )
+        };
+        let initial: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-5.4",
+            "max_tokens":256,
+            "stream":false,
+            "messages":[{"role":"user","content":"read the file"}]
+        }))
+        .unwrap();
+        let response = provider
+            .handle_messages_inner(initial, scope("agent-a", "read-first"))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let downstream: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(downstream["content"][0]["name"], "Read");
+        assert!(downstream["content"][0]["input"].get("offset").is_none());
+
+        provider
+            .client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "read-route-b".into(),
+                refresh: "read-refresh-b".into(),
+                expires: u64::MAX,
+                account_id: Some("read-account".into()),
+            });
+        let result_request = || {
+            serde_json::from_value::<MessagesRequest>(serde_json::json!({
+                "model":"gpt-5.4",
+                "max_tokens":256,
+                "stream":false,
+                "messages":[
+                    {"role":"assistant","content":[{
+                        "type":"tool_use",
+                        "id":read_call,
+                        "name":"Read",
+                        "input":{"file_path":"/tmp/route-read","limit":20}
+                    }]},
+                    {"role":"user","content":[{
+                        "type":"tool_result",
+                        "tool_use_id":read_call,
+                        "content":[{"type":"text","text":"1\tcontent"}]
+                    }]}
+                ]
+            }))
+            .unwrap()
+        };
+        for (agent, req_id) in [("agent-a", "read-same-lane"), ("agent-b", "read-sibling")] {
+            let response = provider
+                .handle_messages_inner(result_request(), scope(agent, req_id))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+
+        let captured = server.await.unwrap();
+        assert!(captured[0].0.contains("authorization: Bearer read-route-a"));
+        assert!(captured[1].0.contains("authorization: Bearer read-route-b"));
+        assert_ne!(
+            captured_header(&captured[0].0, "session_id"),
+            captured_header(&captured[1].0, "session_id")
+        );
+        let same_lane_output = captured[1].1["input"][1]["output"]
+            .as_str()
+            .expect("same-lane tool output");
+        assert!(same_lane_output.contains("Proxy Read offset note:"));
+        assert!(same_lane_output.contains("1300007"));
+        assert!(same_lane_output.contains("/tmp/route-read"));
+        let sibling_output = captured[2].1["input"][1]["output"]
+            .as_str()
+            .expect("sibling tool output");
+        assert!(!sibling_output.contains("Proxy Read offset note:"));
+        for (headers, _) in captured {
+            for raw in [
+                "raw-shared-session",
+                "raw-context-must-not-own-read-state",
+                "agent-a",
+                "agent-b",
+            ] {
+                assert!(!headers.contains(raw));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cancellation_during_auth_refresh_aborts_reserved_request_state() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
@@ -2839,6 +3210,7 @@ mod tests {
                 live_test_context(session_id),
                 request.clone(),
                 continuation.clone(),
+                None,
                 None,
                 None,
             ),
@@ -3166,6 +3538,7 @@ mod tests {
                 task_continuation,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -3260,6 +3633,7 @@ mod tests {
                 request.clone(),
                 continuation.clone(),
                 Some(dropped_replay.lease),
+                None,
                 None,
             ),
         )
@@ -3672,6 +4046,7 @@ mod tests {
                 live_test_context(session_id),
                 task_request,
                 task_continuation,
+                None,
                 None,
                 None,
             )

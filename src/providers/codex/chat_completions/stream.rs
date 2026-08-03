@@ -6,6 +6,7 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
+use crate::providers::codex::client::InBandAuthRefreshDetector;
 use crate::providers::codex::native::NativeResponseOutcome;
 use crate::{provider::RequestContext, traffic::MAX_SSE_CAPTURE_BYTES};
 
@@ -20,6 +21,42 @@ pub fn streaming_response(
     include_usage: bool,
     body_idle_timeout_ms: u64,
 ) -> Response {
+    streaming_response_inner(
+        upstream,
+        ctx,
+        model,
+        include_usage,
+        body_idle_timeout_ms,
+        None,
+    )
+}
+
+pub(crate) fn streaming_response_with_auth_refresh(
+    upstream: reqwest::Response,
+    ctx: RequestContext,
+    model: String,
+    include_usage: bool,
+    body_idle_timeout_ms: u64,
+    auth_refresh: InBandAuthRefreshDetector,
+) -> Response {
+    streaming_response_inner(
+        upstream,
+        ctx,
+        model,
+        include_usage,
+        body_idle_timeout_ms,
+        Some(auth_refresh),
+    )
+}
+
+fn streaming_response_inner(
+    upstream: reqwest::Response,
+    ctx: RequestContext,
+    model: String,
+    include_usage: bool,
+    body_idle_timeout_ms: u64,
+    auth_refresh: Option<InBandAuthRefreshDetector>,
+) -> Response {
     let outcome = NativeResponseOutcome::default();
     let state = StreamState {
         upstream: Box::pin(upstream.bytes_stream()),
@@ -32,6 +69,7 @@ pub fn streaming_response(
         generation_started: false,
         ctx,
         outcome: outcome.clone(),
+        auth_refresh,
         body_idle_timeout_ms,
         raw: Vec::new(),
         raw_truncated: 0,
@@ -83,6 +121,9 @@ async fn next_frame(
                 )));
             }
             Ok(None) => {
+                if let Some(auth_refresh) = state.auth_refresh.as_mut() {
+                    auth_refresh.finish();
+                }
                 if !state.completion.completed {
                     state.fail(ChatError::upstream(
                         "Codex event stream ended before completion",
@@ -112,6 +153,7 @@ struct StreamState {
     generation_started: bool,
     ctx: RequestContext,
     outcome: NativeResponseOutcome,
+    auth_refresh: Option<InBandAuthRefreshDetector>,
     body_idle_timeout_ms: u64,
     raw: Vec<u8>,
     raw_truncated: u64,
@@ -119,6 +161,9 @@ struct StreamState {
 
 impl StreamState {
     fn observe_chunk(&mut self, chunk: &[u8]) {
+        if let Some(auth_refresh) = self.auth_refresh.as_mut() {
+            auth_refresh.observe(chunk);
+        }
         if !chunk.is_empty() && !self.generation_started {
             if let Some(monitor) = self.ctx.monitor.as_ref() {
                 monitor.generation_started(&self.ctx.req_id);

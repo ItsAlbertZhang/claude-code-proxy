@@ -8,7 +8,7 @@ use crate::{
         stream::openai_response as render_openai_response,
     },
     project,
-    provider::RequestContext,
+    provider::{RequestContext, ScopedRequestContext},
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
         images::{
@@ -954,18 +954,6 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
             Err(error) => return monitor_response_body(error.response(), request_guard),
         }
     };
-    if provider.name() == "codex" {
-        return monitor_response_body(
-            openai_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented_error",
-                "Codex native Responses routing is disabled until route-safe recovery is available",
-                None,
-                Some("route_safe_recovery_required"),
-            ),
-            request_guard,
-        );
-    }
     if provider.name() != "codex"
         && let Some(identity) = request_scope.conversational_lane()
     {
@@ -1075,13 +1063,11 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         }
     } else {
         match state.native_responses.as_ref() {
-            Some(_) => openai_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented_error",
-                "Codex native Responses routing is disabled until route-safe recovery is available",
-                None,
-                Some("route_safe_recovery_required"),
-            ),
+            Some(backend) => {
+                backend
+                    .handle_scoped(body, ScopedRequestContext::new(context, request_scope))
+                    .await
+            }
             None => openai_error(
                 StatusCode::NOT_FOUND,
                 "not_found_error",
@@ -1214,18 +1200,6 @@ async fn handler_chat_completions(
         };
         (None, Some(parsed))
     };
-    if provider.name() == "codex" {
-        return monitor_response_body(
-            openai_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented_error",
-                "Codex Chat Completions routing is disabled until route-safe recovery is available",
-                None,
-                Some("route_safe_recovery_required"),
-            ),
-            request_guard,
-        );
-    }
     if provider.name() != "codex"
         && let Some(identity) = request_scope.conversational_lane()
     {
@@ -1307,15 +1281,16 @@ async fn handler_chat_completions(
         traffic: traffic.clone(),
         monitor: state.monitor.clone(),
     };
-    let response = if let Some(_translated) = translated {
+    let response = if let Some(translated) = translated {
         match state.chat_completions.as_ref() {
-            Some(_) => openai_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_implemented_error",
-                "Codex Chat Completions routing is disabled until route-safe recovery is available",
-                None,
-                Some("route_safe_recovery_required"),
-            ),
+            Some(backend) => {
+                backend
+                    .handle_scoped(
+                        translated,
+                        ScopedRequestContext::new(context, request_scope),
+                    )
+                    .await
+            }
             None => openai_error(
                 StatusCode::NOT_FOUND,
                 "not_found_error",

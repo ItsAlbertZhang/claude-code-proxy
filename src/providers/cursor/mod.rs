@@ -21,7 +21,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{
     CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
-    RequestContext,
+    RequestContext, compatible_explicit_identity,
 };
 use crate::providers::cursor::auth::{
     clear_cursor_auth, expired_auth_message, load_cursor_auth, missing_auth_message,
@@ -34,8 +34,11 @@ use crate::providers::cursor::response::{
     CursorDecodeError, decode_cursor_upstream, decode_upstream_response,
 };
 use crate::providers::cursor::tool_bridge::{
-    BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
-    resume_cursor_tool_bridge, start_cursor_tool_bridge,
+    BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools_scoped, find_tool_result,
+    resume_cursor_tool_bridge_scoped, start_cursor_tool_bridge_scoped,
+};
+use crate::request_identity::{
+    ConversationIdentity, LaneDomain, OpaqueLane, RequestPurpose, RequestScope,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,41 +59,132 @@ impl CursorProvider {
     }
 }
 
-#[async_trait]
-impl Provider for CursorProvider {
-    fn name(&self) -> &'static str {
-        "cursor"
+fn cursor_bridge_lane(session_id: Option<&str>) -> Option<OpaqueLane> {
+    RequestScope::legacy(session_id, RequestPurpose::Conversation)
+        .provider_lane(LaneDomain::CursorToolBridge)
+}
+
+async fn handle_messages_with_lane(
+    body: MessagesRequest,
+    ctx: RequestContext,
+    bridge_lane: Option<OpaqueLane>,
+) -> Response {
+    let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let want_stream = body.stream;
+    let model = body.model.as_deref().unwrap_or("cursor");
+
+    let resolved = resolve_cursor_model(model);
+    if let Err(e) = resolved {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("Model \"{model}\" is not supported: {e}"),
+        );
     }
 
-    fn supported_models(&self) -> Vec<String> {
-        model::cursor_supported_models()
-    }
-
-    fn cli(&self) -> &'static dyn CliHandlers {
-        &CURSOR_CLI
-    }
-
-    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-        let want_stream = body.stream;
-        let model = body.model.as_deref().unwrap_or("cursor");
-
-        let resolved = resolve_cursor_model(model);
-        if let Err(e) = resolved {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("Model \"{model}\" is not supported: {e}"),
+    if let Some(lane) = bridge_lane
+        && let Some(pending) = BridgeRegistry::pending_tool_scoped(lane)
+        && let Some(result) = find_tool_result(&body, pending.tool_use_id())
+    {
+        let (_result_messages, sse_bytes) =
+            resume_cursor_tool_bridge_scoped(lane, &message_id, model, result, &pending);
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+            monitor.stream_progress(
+                &ctx.req_id,
+                sse_bytes.len() as u64,
+                count_sse_events(&sse_bytes),
+                input_tokens,
+                output_tokens,
             );
         }
+        let headers = [
+            (http::header::CONTENT_TYPE, "text/event-stream"),
+            (http::header::CACHE_CONTROL, "no-cache"),
+            (http::header::CONNECTION, "keep-alive"),
+        ];
+        return (headers, sse_bytes).into_response();
+    }
 
-        if can_bridge_cursor_native_tools(&body, ctx.session_id.as_deref())
-            && let Some(ref session_id) = ctx.session_id
-            && let Some(pending) = BridgeRegistry::pending_tool(session_id)
-            && let Some(result) = find_tool_result(&body, pending.tool_use_id())
-        {
-            let (_result_messages, sse_bytes) =
-                resume_cursor_tool_bridge(session_id, &message_id, model, result, &pending);
+    let auth = match load_cursor_auth() {
+        Ok(Some(auth)) => auth,
+        Ok(None) => {
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                missing_auth_message(),
+            );
+        }
+        Err(err) => {
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                format!("Cursor auth failed: {err}"),
+            );
+        }
+    };
+
+    if matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000) {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            expired_auth_message(&auth),
+        );
+    }
+
+    let token = auth.access_token;
+
+    let prompt = render_cursor_prompt(&body);
+    let images = request::cursor_selected_images(&body);
+
+    let client = CursorHttpClient::new();
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.upstream_started(&ctx.req_id);
+    }
+    let upstream = match client.run_agent(&token, &prompt, model, &images).await {
+        Ok(r) => r,
+        Err(e) => {
+            return map_cursor_error_to_response(&e);
+        }
+    };
+
+    if want_stream {
+        let bridge_eligible = can_bridge_cursor_native_tools_scoped(&body, bridge_lane);
+
+        if bridge_eligible {
+            let events = match decode_upstream_response(&upstream.body) {
+                Ok(e) => e,
+                Err(e) => return map_cursor_decode_error_to_response(&e),
+            };
+
+            let allowed = advertised_tool_names(&body);
+            let (sse_bytes, _paused) = start_cursor_tool_bridge_scoped(
+                &message_id,
+                model,
+                bridge_lane.expect("bridge lane validated"),
+                &events,
+                allowed,
+                Box::new(|| uuid::Uuid::new_v4().to_string().replace('-', "")),
+            );
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+                monitor.stream_progress(
+                    &ctx.req_id,
+                    sse_bytes.len() as u64,
+                    count_sse_events(&sse_bytes),
+                    input_tokens,
+                    output_tokens,
+                );
+            }
+
+            let headers = [
+                (http::header::CONTENT_TYPE, "text/event-stream"),
+                (http::header::CACHE_CONTROL, "no-cache"),
+                (http::header::CONNECTION, "keep-alive"),
+            ];
+            (headers, sse_bytes).into_response()
+        } else {
+            let sse_bytes = sse::frame_cursor_stream(&upstream, &message_id, model);
             if let Some(monitor) = ctx.monitor.as_ref() {
                 let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
                 monitor.stream_progress(
@@ -106,122 +200,165 @@ impl Provider for CursorProvider {
                 (http::header::CACHE_CONTROL, "no-cache"),
                 (http::header::CONNECTION, "keep-alive"),
             ];
-            return (headers, sse_bytes).into_response();
+            (headers, sse_bytes).into_response()
         }
-
-        let auth = match load_cursor_auth() {
-            Ok(Some(auth)) => auth,
-            Ok(None) => {
-                return json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "authentication_error",
-                    missing_auth_message(),
-                );
+    } else {
+        match decode_cursor_upstream(&upstream, &message_id, model) {
+            Ok(json) => {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.usage_updated(
+                        &ctx.req_id,
+                        json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+                        json.pointer("/usage/output_tokens")
+                            .and_then(|v| v.as_u64()),
+                    );
+                }
+                (StatusCode::OK, Json(json)).into_response()
             }
-            Err(err) => {
-                return json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "authentication_error",
-                    format!("Cursor auth failed: {err}"),
-                );
-            }
-        };
+            Err(e) => map_cursor_decode_error_to_response(&e),
+        }
+    }
+}
 
-        if matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000) {
-            return json_error(
+async fn generate_anthropic_stream_with_lane(
+    mut body: MessagesRequest,
+    ctx: RequestContext,
+    bridge_lane: Option<OpaqueLane>,
+) -> Result<Generation, ProviderError> {
+    body.stream = true;
+    let requested = body.model.clone().unwrap_or_else(|| "cursor".to_string());
+    let resolved = resolve_cursor_model(&requested).map_err(|error| {
+        ProviderError::new(
+            StatusCode::BAD_REQUEST,
+            ProviderErrorKind::InvalidRequest,
+            format!("Model \"{requested}\" is not supported: {error}"),
+        )
+    })?;
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.model_resolved(&ctx.req_id, &resolved.model_id);
+    }
+    let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    if let Some(lane) = bridge_lane
+        && let Some(pending) = BridgeRegistry::pending_tool_scoped(lane)
+        && let Some(result) = find_tool_result(&body, pending.tool_use_id())
+    {
+        let (_, bytes) =
+            resume_cursor_tool_bridge_scoped(lane, &message_id, &requested, result, &pending);
+        return Ok(Generation {
+            body: GenerationBody::BufferedSse(bytes.into()),
+            resolved_model: resolved.model_id,
+        });
+    }
+    let auth = load_cursor_auth()
+        .map_err(|error| {
+            ProviderError::new(
                 StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                expired_auth_message(&auth),
-            );
-        }
+                ProviderErrorKind::Authentication,
+                format!("Cursor auth failed: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            ProviderError::new(
+                StatusCode::UNAUTHORIZED,
+                ProviderErrorKind::Authentication,
+                missing_auth_message(),
+            )
+        })?;
+    if matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000) {
+        return Err(ProviderError::new(
+            StatusCode::UNAUTHORIZED,
+            ProviderErrorKind::Authentication,
+            expired_auth_message(&auth),
+        ));
+    }
+    let prompt = render_cursor_prompt(&body);
+    let images = request::cursor_selected_images(&body);
+    if let Some(traffic) = ctx.traffic.as_ref() {
+        traffic.write_json(
+            "020-upstream-request",
+            &serde_json::json!({
+                "model": requested,
+                "prompt": prompt,
+                "image_count": images.len(),
+            }),
+        );
+    }
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.upstream_started(&ctx.req_id);
+    }
+    let upstream = CursorHttpClient::new()
+        .run_agent(&auth.access_token, &prompt, &requested, &images)
+        .await
+        .map_err(cursor_provider_error)?;
+    if let Some(traffic) = ctx.traffic.as_ref() {
+        traffic.write_bytes("032-upstream-response-body.bin", &upstream.body);
+    }
+    let bytes = if can_bridge_cursor_native_tools_scoped(&body, bridge_lane) {
+        let events =
+            decode_upstream_response(&upstream.body).map_err(cursor_decode_provider_error)?;
+        let allowed = advertised_tool_names(&body);
+        start_cursor_tool_bridge_scoped(
+            &message_id,
+            &requested,
+            bridge_lane.expect("bridge lane validated"),
+            &events,
+            allowed,
+            Box::new(|| uuid::Uuid::new_v4().simple().to_string()),
+        )
+        .0
+    } else {
+        sse::frame_cursor_stream(&upstream, &message_id, &requested)
+    };
+    if let Some(traffic) = ctx.traffic.as_ref() {
+        traffic.write_bytes("050-anthropic-intermediate.sse", &bytes);
+    }
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        let (input_tokens, output_tokens) = usage_from_anthropic_sse(&bytes);
+        monitor.stream_progress(
+            &ctx.req_id,
+            bytes.len() as u64,
+            count_sse_events(&bytes),
+            input_tokens,
+            output_tokens,
+        );
+    }
+    Ok(Generation {
+        body: GenerationBody::BufferedSse(bytes.into()),
+        resolved_model: resolved.model_id,
+    })
+}
 
-        let token = auth.access_token;
+#[async_trait]
+impl Provider for CursorProvider {
+    fn name(&self) -> &'static str {
+        "cursor"
+    }
 
-        let prompt = render_cursor_prompt(&body);
-        let images = request::cursor_selected_images(&body);
+    fn supported_models(&self) -> Vec<String> {
+        model::cursor_supported_models()
+    }
 
-        let client = CursorHttpClient::new();
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.upstream_started(&ctx.req_id);
-        }
-        let upstream = match client.run_agent(&token, &prompt, model, &images).await {
-            Ok(r) => r,
-            Err(e) => {
-                return map_cursor_error_to_response(&e);
-            }
-        };
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &CURSOR_CLI
+    }
 
-        if want_stream {
-            let session_id = ctx.session_id.as_deref();
-            let bridge_eligible = can_bridge_cursor_native_tools(&body, session_id);
+    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        let bridge_lane = cursor_bridge_lane(ctx.session_id.as_deref());
+        handle_messages_with_lane(body, ctx, bridge_lane).await
+    }
 
-            if bridge_eligible {
-                let events = match decode_upstream_response(&upstream.body) {
-                    Ok(e) => e,
-                    Err(e) => return map_cursor_decode_error_to_response(&e),
-                };
-
-                let allowed = advertised_tool_names(&body);
-                let (sse_bytes, _paused) = start_cursor_tool_bridge(
-                    &message_id,
-                    model,
-                    session_id.unwrap(),
-                    &events,
-                    allowed,
-                    Box::new(|| uuid::Uuid::new_v4().to_string().replace('-', "")),
-                );
-                if let Some(monitor) = ctx.monitor.as_ref() {
-                    let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                    monitor.stream_progress(
-                        &ctx.req_id,
-                        sse_bytes.len() as u64,
-                        count_sse_events(&sse_bytes),
-                        input_tokens,
-                        output_tokens,
-                    );
-                }
-
-                let headers = [
-                    (http::header::CONTENT_TYPE, "text/event-stream"),
-                    (http::header::CACHE_CONTROL, "no-cache"),
-                    (http::header::CONNECTION, "keep-alive"),
-                ];
-                (headers, sse_bytes).into_response()
-            } else {
-                let sse_bytes = sse::frame_cursor_stream(&upstream, &message_id, model);
-                if let Some(monitor) = ctx.monitor.as_ref() {
-                    let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                    monitor.stream_progress(
-                        &ctx.req_id,
-                        sse_bytes.len() as u64,
-                        count_sse_events(&sse_bytes),
-                        input_tokens,
-                        output_tokens,
-                    );
-                }
-                let headers = [
-                    (http::header::CONTENT_TYPE, "text/event-stream"),
-                    (http::header::CACHE_CONTROL, "no-cache"),
-                    (http::header::CONNECTION, "keep-alive"),
-                ];
-                (headers, sse_bytes).into_response()
-            }
-        } else {
-            match decode_cursor_upstream(&upstream, &message_id, model) {
-                Ok(json) => {
-                    if let Some(monitor) = ctx.monitor.as_ref() {
-                        monitor.usage_updated(
-                            &ctx.req_id,
-                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
-                            json.pointer("/usage/output_tokens")
-                                .and_then(|v| v.as_u64()),
-                        );
-                    }
-                    (StatusCode::OK, Json(json)).into_response()
-                }
-                Err(e) => map_cursor_decode_error_to_response(&e),
-            }
-        }
+    async fn handle_messages_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Response {
+        let scope = RequestScope::from_conversation_identity(
+            compatible_explicit_identity(&ctx, conversation_identity),
+            RequestPurpose::Conversation,
+        );
+        let bridge_lane = scope.provider_lane(LaneDomain::CursorToolBridge);
+        handle_messages_with_lane(body, ctx, bridge_lane).await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -241,111 +378,25 @@ impl Provider for CursorProvider {
 
     async fn generate_anthropic_stream(
         &self,
-        mut body: MessagesRequest,
+        body: MessagesRequest,
         ctx: RequestContext,
     ) -> Result<Generation, ProviderError> {
-        body.stream = true;
-        let requested = body.model.clone().unwrap_or_else(|| "cursor".to_string());
-        let resolved = resolve_cursor_model(&requested).map_err(|error| {
-            ProviderError::new(
-                StatusCode::BAD_REQUEST,
-                ProviderErrorKind::InvalidRequest,
-                format!("Model \"{requested}\" is not supported: {error}"),
-            )
-        })?;
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved.model_id);
-        }
-        let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        if can_bridge_cursor_native_tools(&body, ctx.session_id.as_deref())
-            && let Some(session_id) = ctx.session_id.as_deref()
-            && let Some(pending) = BridgeRegistry::pending_tool(session_id)
-            && let Some(result) = find_tool_result(&body, pending.tool_use_id())
-        {
-            let (_, bytes) =
-                resume_cursor_tool_bridge(session_id, &message_id, &requested, result, &pending);
-            return Ok(Generation {
-                body: GenerationBody::BufferedSse(bytes.into()),
-                resolved_model: resolved.model_id,
-            });
-        }
-        let auth = load_cursor_auth()
-            .map_err(|error| {
-                ProviderError::new(
-                    StatusCode::UNAUTHORIZED,
-                    ProviderErrorKind::Authentication,
-                    format!("Cursor auth failed: {error}"),
-                )
-            })?
-            .ok_or_else(|| {
-                ProviderError::new(
-                    StatusCode::UNAUTHORIZED,
-                    ProviderErrorKind::Authentication,
-                    missing_auth_message(),
-                )
-            })?;
-        if matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000) {
-            return Err(ProviderError::new(
-                StatusCode::UNAUTHORIZED,
-                ProviderErrorKind::Authentication,
-                expired_auth_message(&auth),
-            ));
-        }
-        let prompt = render_cursor_prompt(&body);
-        let images = request::cursor_selected_images(&body);
-        if let Some(traffic) = ctx.traffic.as_ref() {
-            traffic.write_json(
-                "020-upstream-request",
-                &serde_json::json!({
-                    "model": requested,
-                    "prompt": prompt,
-                    "image_count": images.len(),
-                }),
-            );
-        }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.upstream_started(&ctx.req_id);
-        }
-        let upstream = CursorHttpClient::new()
-            .run_agent(&auth.access_token, &prompt, &requested, &images)
-            .await
-            .map_err(cursor_provider_error)?;
-        if let Some(traffic) = ctx.traffic.as_ref() {
-            traffic.write_bytes("032-upstream-response-body.bin", &upstream.body);
-        }
-        let bytes = if can_bridge_cursor_native_tools(&body, ctx.session_id.as_deref()) {
-            let events =
-                decode_upstream_response(&upstream.body).map_err(cursor_decode_provider_error)?;
-            let allowed = advertised_tool_names(&body);
-            start_cursor_tool_bridge(
-                &message_id,
-                &requested,
-                ctx.session_id.as_deref().expect("bridge session validated"),
-                &events,
-                allowed,
-                Box::new(|| uuid::Uuid::new_v4().simple().to_string()),
-            )
-            .0
-        } else {
-            sse::frame_cursor_stream(&upstream, &message_id, &requested)
-        };
-        if let Some(traffic) = ctx.traffic.as_ref() {
-            traffic.write_bytes("050-anthropic-intermediate.sse", &bytes);
-        }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            let (input_tokens, output_tokens) = usage_from_anthropic_sse(&bytes);
-            monitor.stream_progress(
-                &ctx.req_id,
-                bytes.len() as u64,
-                count_sse_events(&bytes),
-                input_tokens,
-                output_tokens,
-            );
-        }
-        Ok(Generation {
-            body: GenerationBody::BufferedSse(bytes.into()),
-            resolved_model: resolved.model_id,
-        })
+        let bridge_lane = cursor_bridge_lane(ctx.session_id.as_deref());
+        generate_anthropic_stream_with_lane(body, ctx, bridge_lane).await
+    }
+
+    async fn generate_anthropic_stream_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Result<Generation, ProviderError> {
+        let scope = RequestScope::from_conversation_identity(
+            compatible_explicit_identity(&ctx, conversation_identity),
+            RequestPurpose::Conversation,
+        );
+        let bridge_lane = scope.provider_lane(LaneDomain::CursorToolBridge);
+        generate_anthropic_stream_with_lane(body, ctx, bridge_lane).await
     }
 }
 
@@ -492,6 +543,26 @@ pub(crate) static CURSOR_CLI: CursorCli = CursorCli;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_lane_legacy_session_cannot_alias_cursor_owner() {
+        let owner_lane = RequestScope::from_conversation_identity(
+            Some(ConversationIdentity::Main("cursor-owner".to_string())),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CursorToolBridge)
+        .unwrap();
+        let encoded_owner_lane = owner_lane.encode();
+
+        let legacy_lane = cursor_bridge_lane(Some(&encoded_owner_lane)).unwrap();
+        let expected_legacy_lane =
+            RequestScope::legacy(Some(&encoded_owner_lane), RequestPurpose::Conversation)
+                .provider_lane(LaneDomain::CursorToolBridge)
+                .unwrap();
+
+        assert_eq!(legacy_lane, expected_legacy_lane);
+        assert_ne!(legacy_lane, owner_lane);
+    }
 
     #[test]
     fn supported_models_includes_legacy_and_agent() {

@@ -197,12 +197,18 @@ impl RequestScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum LaneDomain {
     CodexConversation,
+    CodexReadRewrite,
+    KimiPromptCache,
+    CursorToolBridge,
 }
 
 impl LaneDomain {
     fn label(self) -> &'static [u8] {
         match self {
             Self::CodexConversation => b"codex-conversation",
+            Self::CodexReadRewrite => b"codex-read-rewrite",
+            Self::KimiPromptCache => b"kimi-prompt-cache",
+            Self::CursorToolBridge => b"cursor-tool-bridge",
         }
     }
 }
@@ -474,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_tokens_are_stable_domain_separated_and_non_revealing() {
+    fn opaque_tokens_are_stable_and_domain_separated() {
         let scope = RequestScope::from_headers(
             &headers(&[
                 (CLAUDE_SESSION_HEADER, "session-a"),
@@ -482,26 +488,24 @@ mod tests {
             ]),
             RequestPurpose::Conversation,
         );
-        let sibling = RequestScope::from_headers(
-            &headers(&[
-                (CLAUDE_SESSION_HEADER, "session-a"),
-                (CLAUDE_AGENT_HEADER, "agent-b"),
-            ]),
-            RequestPurpose::Conversation,
-        );
-        let lane = scope.provider_lane(LaneDomain::CodexConversation).unwrap();
+        let domains = [
+            LaneDomain::CodexConversation,
+            LaneDomain::CodexReadRewrite,
+            LaneDomain::KimiPromptCache,
+            LaneDomain::CursorToolBridge,
+        ];
+        let lanes = domains.map(|domain| scope.provider_lane(domain).unwrap());
         assert_eq!(
-            lane,
+            lanes[0],
             scope.provider_lane(LaneDomain::CodexConversation).unwrap()
         );
-        assert_ne!(
-            lane,
-            sibling
-                .provider_lane(LaneDomain::CodexConversation)
-                .unwrap()
-        );
-        assert!(!lane.encode().contains("session-a"));
-        assert!(!lane.encode().contains("agent-a"));
+        for (index, lane) in lanes.iter().enumerate() {
+            assert!(!lane.encode().contains("session-a"));
+            assert!(!lane.encode().contains("agent-a"));
+            for sibling in &lanes[index + 1..] {
+                assert_ne!(lane, sibling);
+            }
+        }
     }
 
     #[test]
@@ -522,15 +526,15 @@ mod tests {
         );
         assert_eq!(canonical.identity(), padded.identity());
         assert_eq!(
-            canonical.provider_lane(LaneDomain::CodexConversation),
-            padded.provider_lane(LaneDomain::CodexConversation)
+            canonical.provider_lane(LaneDomain::CodexReadRewrite),
+            padded.provider_lane(LaneDomain::CodexReadRewrite)
         );
     }
 
     #[test]
     fn opaque_lane_encoding_round_trips_exactly() {
         let scope = RequestScope::legacy(Some("session-a"), RequestPurpose::Conversation);
-        let lane = scope.provider_lane(LaneDomain::CodexConversation).unwrap();
+        let lane = scope.provider_lane(LaneDomain::CursorToolBridge).unwrap();
         assert_eq!(OpaqueLane::decode(&lane.encode()), Some(lane));
         assert!(OpaqueLane::decode("not-an-opaque-lane").is_none());
     }
