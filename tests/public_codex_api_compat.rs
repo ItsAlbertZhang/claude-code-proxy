@@ -9,7 +9,8 @@ use claude_code_proxy::providers::codex::client::{
     ActualTransport, CodexError, CodexHttpClient, CodexResponse,
 };
 use claude_code_proxy::providers::codex::compaction::{
-    abort_compaction_attempt, activate_compaction, apply_compaction_replay,
+    CompactionError, abort_compaction_attempt, activate_compaction, apply_compaction_replay,
+    clear_all_compactions_for_tests, clear_compaction, request_compaction,
     request_contains_compaction, store_compaction,
 };
 use claude_code_proxy::providers::codex::continuation::{
@@ -59,6 +60,26 @@ async fn baseline_client_forms(
         .await;
 }
 
+async fn baseline_compaction_forms(
+    client: &CodexHttpClient,
+    body: &ResponsesRequest,
+    ctx: &RequestContext,
+) {
+    let _: Result<Vec<ResponsesInputItem>, CompactionError> =
+        request_compaction(client, body, ctx).await;
+}
+
+fn baseline_compaction_error_forms(error: CompactionError) {
+    match error {
+        CompactionError::Upstream(error) => {
+            let _: CodexError = error;
+        }
+        CompactionError::InvalidResponse(message) => {
+            let _: String = message;
+        }
+    }
+}
+
 #[test]
 fn baseline_codex_public_api_forms_compile() {
     let (_tx, receiver) = tokio::sync::mpsc::channel::<Result<serde_json::Value, CodexError>>(1);
@@ -102,5 +123,9 @@ fn baseline_codex_public_api_forms_compile() {
         apply_compaction_replay;
     let _: fn(Option<&str>, bool, &ResponsesRequest) = abort_compaction_attempt;
     let _: fn(&ResponsesRequest) -> bool = request_contains_compaction;
+    let _: fn(&str) = clear_compaction;
+    let _: fn() = clear_all_compactions_for_tests;
+    let _: fn(CompactionError) = baseline_compaction_error_forms;
+    let _ = baseline_compaction_forms;
     let _ = baseline_client_forms;
 }
