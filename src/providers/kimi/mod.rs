@@ -48,9 +48,203 @@ impl KimiProvider {
 }
 
 fn kimi_prompt_cache_lane(session_id: Option<&str>) -> Option<OpaqueLane> {
-    session_id.and_then(OpaqueLane::decode).or_else(|| {
-        RequestScope::legacy(session_id, RequestPurpose::Conversation)
-            .provider_lane(LaneDomain::KimiPromptCache)
+    RequestScope::legacy(session_id, RequestPurpose::Conversation)
+        .provider_lane(LaneDomain::KimiPromptCache)
+}
+
+async fn handle_messages_with_lane(
+    body: MessagesRequest,
+    ctx: RequestContext,
+    prompt_cache_lane: Option<OpaqueLane>,
+) -> Response {
+    let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let want_stream = body.stream;
+    let model = body.model.as_deref().unwrap_or("kimi-for-coding");
+    let resolved = resolve_model(model);
+
+    if let Err(e) = assert_allowed_model(&resolved) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "Model \"{model}\" resolves to unsupported model \"{}\"",
+                e.model
+            ),
+        );
+    }
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.model_resolved(&ctx.req_id, &resolved);
+    }
+
+    let translated = match translate_request_scoped(&body, prompt_cache_lane) {
+        Ok(t) => t,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            );
+        }
+    };
+
+    // KimiHttpClient uses a blocking client whose lifecycle belongs on a
+    // blocking thread.
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.upstream_started(&ctx.req_id);
+    }
+    let upstream = match tokio::task::spawn_blocking(move || {
+        let client = client::KimiHttpClient::new();
+        let result = client.post_kimi(&translated);
+        drop(client);
+        result
+    })
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return map_kimi_error_to_response(&e);
+        }
+        Err(join_err) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                format!("Blocking task join error: {join_err}"),
+            );
+        }
+    };
+
+    if want_stream {
+        let sse_bytes = match translate_stream_bytes(&upstream.body, &message_id, model) {
+            Ok(b) => b,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    format!("Stream translation error: {e}"),
+                );
+            }
+        };
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+            monitor.stream_progress(
+                &ctx.req_id,
+                sse_bytes.len() as u64,
+                count_sse_events(&sse_bytes),
+                input_tokens,
+                output_tokens,
+            );
+        }
+
+        let headers = [
+            (http::header::CONTENT_TYPE, "text/event-stream"),
+            (http::header::CACHE_CONTROL, "no-cache"),
+            (http::header::CONNECTION, "keep-alive"),
+        ];
+        (headers, sse_bytes).into_response()
+    } else {
+        match accumulate_response(&upstream.body, &message_id, model) {
+            Ok(json) => {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.usage_updated(
+                        &ctx.req_id,
+                        json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+                        json.pointer("/usage/output_tokens")
+                            .and_then(|v| v.as_u64()),
+                    );
+                }
+                (StatusCode::OK, Json(json)).into_response()
+            }
+            Err(e) => json_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                format!("Accumulation error: {e}"),
+            ),
+        }
+    }
+}
+
+async fn generate_anthropic_stream_with_lane(
+    mut body: MessagesRequest,
+    ctx: RequestContext,
+    prompt_cache_lane: Option<OpaqueLane>,
+) -> Result<Generation, ProviderError> {
+    body.stream = true;
+    let requested = body
+        .model
+        .clone()
+        .unwrap_or_else(|| "kimi-for-coding".to_string());
+    let resolved = resolve_model(&requested);
+    assert_allowed_model(&resolved).map_err(|error| {
+        ProviderError::new(
+            StatusCode::BAD_REQUEST,
+            ProviderErrorKind::InvalidRequest,
+            format!(
+                "Model \"{requested}\" resolves to unsupported model \"{}\"",
+                error.model
+            ),
+        )
+    })?;
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.model_resolved(&ctx.req_id, &resolved);
+    }
+    let translated = translate_request_scoped(&body, prompt_cache_lane).map_err(|error| {
+        ProviderError::new(
+            StatusCode::BAD_REQUEST,
+            ProviderErrorKind::InvalidRequest,
+            error.to_string(),
+        )
+    })?;
+    if let Some(traffic) = ctx.traffic.as_ref() {
+        traffic.write_json(
+            "020-upstream-request",
+            &serde_json::to_value(&translated).unwrap_or_default(),
+        );
+    }
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.upstream_started(&ctx.req_id);
+    }
+    let upstream = tokio::task::spawn_blocking(move || {
+        let client = client::KimiHttpClient::new();
+        let result = client.post_kimi(&translated);
+        drop(client);
+        result
+    })
+    .await
+    .map_err(|error| {
+        ProviderError::new(
+            StatusCode::BAD_GATEWAY,
+            ProviderErrorKind::Api,
+            format!("Blocking task join error: {error}"),
+        )
+    })?
+    .map_err(kimi_provider_error)?;
+    if let Some(traffic) = ctx.traffic.as_ref() {
+        traffic.write_bytes("032-upstream-response-body.sse", &upstream.body);
+    }
+    let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let sse = translate_stream_bytes(&upstream.body, &message_id, &requested).map_err(|error| {
+        ProviderError::new(
+            StatusCode::BAD_GATEWAY,
+            ProviderErrorKind::Api,
+            format!("Stream translation error: {error}"),
+        )
+    })?;
+    if let Some(traffic) = ctx.traffic.as_ref() {
+        traffic.write_bytes("050-anthropic-intermediate.sse", &sse);
+    }
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse);
+        monitor.stream_progress(
+            &ctx.req_id,
+            sse.len() as u64,
+            count_sse_events(&sse),
+            input_tokens,
+            output_tokens,
+        );
+    }
+    Ok(Generation {
+        body: GenerationBody::BufferedSse(sse.into()),
+        resolved_model: resolved,
     })
 }
 
@@ -69,113 +263,8 @@ impl Provider for KimiProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-        let want_stream = body.stream;
-        let model = body.model.as_deref().unwrap_or("kimi-for-coding");
-        let resolved = resolve_model(model);
-
-        if let Err(e) = assert_allowed_model(&resolved) {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!(
-                    "Model \"{model}\" resolves to unsupported model \"{}\"",
-                    e.model
-                ),
-            );
-        }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved);
-        }
-
-        let translated = match translate_request_scoped(
-            &body,
-            kimi_prompt_cache_lane(ctx.session_id.as_deref()),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    e.to_string(),
-                );
-            }
-        };
-
-        // KimiHttpClient uses a blocking client whose lifecycle belongs on a
-        // blocking thread.
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.upstream_started(&ctx.req_id);
-        }
-        let upstream = match tokio::task::spawn_blocking(move || {
-            let client = client::KimiHttpClient::new();
-            let result = client.post_kimi(&translated);
-            drop(client);
-            result
-        })
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                return map_kimi_error_to_response(&e);
-            }
-            Err(join_err) => {
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    format!("Blocking task join error: {join_err}"),
-                );
-            }
-        };
-
-        if want_stream {
-            let sse_bytes = match translate_stream_bytes(&upstream.body, &message_id, model) {
-                Ok(b) => b,
-                Err(e) => {
-                    return json_error(
-                        StatusCode::BAD_GATEWAY,
-                        "api_error",
-                        format!("Stream translation error: {e}"),
-                    );
-                }
-            };
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                monitor.stream_progress(
-                    &ctx.req_id,
-                    sse_bytes.len() as u64,
-                    count_sse_events(&sse_bytes),
-                    input_tokens,
-                    output_tokens,
-                );
-            }
-
-            let headers = [
-                (http::header::CONTENT_TYPE, "text/event-stream"),
-                (http::header::CACHE_CONTROL, "no-cache"),
-                (http::header::CONNECTION, "keep-alive"),
-            ];
-            (headers, sse_bytes).into_response()
-        } else {
-            match accumulate_response(&upstream.body, &message_id, model) {
-                Ok(json) => {
-                    if let Some(monitor) = ctx.monitor.as_ref() {
-                        monitor.usage_updated(
-                            &ctx.req_id,
-                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
-                            json.pointer("/usage/output_tokens")
-                                .and_then(|v| v.as_u64()),
-                        );
-                    }
-                    (StatusCode::OK, Json(json)).into_response()
-                }
-                Err(e) => json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    format!("Accumulation error: {e}"),
-                ),
-            }
-        }
+        let prompt_cache_lane = kimi_prompt_cache_lane(ctx.session_id.as_deref());
+        handle_messages_with_lane(body, ctx, prompt_cache_lane).await
     }
 
     async fn handle_messages_with_conversation_identity(
@@ -188,12 +277,8 @@ impl Provider for KimiProvider {
             compatible_explicit_identity(&ctx, conversation_identity),
             RequestPurpose::Conversation,
         );
-        let prompt_cache_key = scope
-            .provider_lane(LaneDomain::KimiPromptCache)
-            .map(|lane| lane.encode());
-        let mut ctx = ctx;
-        ctx.session_id = prompt_cache_key;
-        self.handle_messages(body, ctx).await
+        let prompt_cache_lane = scope.provider_lane(LaneDomain::KimiPromptCache);
+        handle_messages_with_lane(body, ctx, prompt_cache_lane).await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -217,90 +302,11 @@ impl Provider for KimiProvider {
 
     async fn generate_anthropic_stream(
         &self,
-        mut body: MessagesRequest,
+        body: MessagesRequest,
         ctx: RequestContext,
     ) -> Result<Generation, ProviderError> {
-        body.stream = true;
-        let requested = body
-            .model
-            .clone()
-            .unwrap_or_else(|| "kimi-for-coding".to_string());
-        let resolved = resolve_model(&requested);
-        assert_allowed_model(&resolved).map_err(|error| {
-            ProviderError::new(
-                StatusCode::BAD_REQUEST,
-                ProviderErrorKind::InvalidRequest,
-                format!(
-                    "Model \"{requested}\" resolves to unsupported model \"{}\"",
-                    error.model
-                ),
-            )
-        })?;
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved);
-        }
-        let translated =
-            translate_request_scoped(&body, kimi_prompt_cache_lane(ctx.session_id.as_deref()))
-                .map_err(|error| {
-                    ProviderError::new(
-                        StatusCode::BAD_REQUEST,
-                        ProviderErrorKind::InvalidRequest,
-                        error.to_string(),
-                    )
-                })?;
-        if let Some(traffic) = ctx.traffic.as_ref() {
-            traffic.write_json(
-                "020-upstream-request",
-                &serde_json::to_value(&translated).unwrap_or_default(),
-            );
-        }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.upstream_started(&ctx.req_id);
-        }
-        let upstream = tokio::task::spawn_blocking(move || {
-            let client = client::KimiHttpClient::new();
-            let result = client.post_kimi(&translated);
-            drop(client);
-            result
-        })
-        .await
-        .map_err(|error| {
-            ProviderError::new(
-                StatusCode::BAD_GATEWAY,
-                ProviderErrorKind::Api,
-                format!("Blocking task join error: {error}"),
-            )
-        })?
-        .map_err(kimi_provider_error)?;
-        if let Some(traffic) = ctx.traffic.as_ref() {
-            traffic.write_bytes("032-upstream-response-body.sse", &upstream.body);
-        }
-        let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        let sse =
-            translate_stream_bytes(&upstream.body, &message_id, &requested).map_err(|error| {
-                ProviderError::new(
-                    StatusCode::BAD_GATEWAY,
-                    ProviderErrorKind::Api,
-                    format!("Stream translation error: {error}"),
-                )
-            })?;
-        if let Some(traffic) = ctx.traffic.as_ref() {
-            traffic.write_bytes("050-anthropic-intermediate.sse", &sse);
-        }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse);
-            monitor.stream_progress(
-                &ctx.req_id,
-                sse.len() as u64,
-                count_sse_events(&sse),
-                input_tokens,
-                output_tokens,
-            );
-        }
-        Ok(Generation {
-            body: GenerationBody::BufferedSse(sse.into()),
-            resolved_model: resolved,
-        })
+        let prompt_cache_lane = kimi_prompt_cache_lane(ctx.session_id.as_deref());
+        generate_anthropic_stream_with_lane(body, ctx, prompt_cache_lane).await
     }
 
     async fn generate_anthropic_stream_with_conversation_identity(
@@ -313,12 +319,8 @@ impl Provider for KimiProvider {
             compatible_explicit_identity(&ctx, conversation_identity),
             RequestPurpose::Conversation,
         );
-        let prompt_cache_key = scope
-            .provider_lane(LaneDomain::KimiPromptCache)
-            .map(|lane| lane.encode());
-        let mut ctx = ctx;
-        ctx.session_id = prompt_cache_key;
-        self.generate_anthropic_stream(body, ctx).await
+        let prompt_cache_lane = scope.provider_lane(LaneDomain::KimiPromptCache);
+        generate_anthropic_stream_with_lane(body, ctx, prompt_cache_lane).await
     }
 }
 
@@ -421,3 +423,28 @@ impl CliHandlers for KimiCli {
 }
 
 pub(crate) static KIMI_CLI: KimiCli = KimiCli;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_lane_legacy_session_cannot_alias_kimi_owner() {
+        let owner_lane = RequestScope::from_conversation_identity(
+            Some(ConversationIdentity::Main("kimi-owner".to_string())),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::KimiPromptCache)
+        .unwrap();
+        let encoded_owner_lane = owner_lane.encode();
+
+        let legacy_lane = kimi_prompt_cache_lane(Some(&encoded_owner_lane)).unwrap();
+        let expected_legacy_lane =
+            RequestScope::legacy(Some(&encoded_owner_lane), RequestPurpose::Conversation)
+                .provider_lane(LaneDomain::KimiPromptCache)
+                .unwrap();
+
+        assert_eq!(legacy_lane, expected_legacy_lane);
+        assert_ne!(legacy_lane, owner_lane);
+    }
+}

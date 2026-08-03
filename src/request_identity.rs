@@ -243,6 +243,7 @@ impl OpaqueLane {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0)
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(value: &str) -> Option<Self> {
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(value)
