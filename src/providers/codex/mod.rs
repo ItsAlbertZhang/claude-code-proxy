@@ -21,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::StatusCode;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
@@ -192,6 +193,16 @@ impl CodexProvider {
             };
             let auth_rejection_budget = Arc::new(AuthRejectionBudget::default());
             let mut buffered_retry_state = BufferedRetryState::default();
+            let log = create_logger("codex");
+            let started_at = Instant::now();
+            log.info(
+                "codex_standalone_search_started",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                    ("model".to_string(), serde_json::json!(&resolved.model)),
+                    ("stream".to_string(), serde_json::json!(want_stream)),
+                ])),
+            );
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.upstream_started(&ctx.req_id);
             }
@@ -224,10 +235,37 @@ impl CodexProvider {
                             route = next_route;
                             continue;
                         }
+                        log.warn(
+                            "codex_standalone_search_failed",
+                            Some(serde_json::Map::from_iter([
+                                ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                                ("model".to_string(), serde_json::json!(&resolved.model)),
+                                ("status".to_string(), serde_json::json!(error.status)),
+                                (
+                                    "ms".to_string(),
+                                    serde_json::json!(started_at.elapsed().as_millis()),
+                                ),
+                            ])),
+                        );
                         return map_codex_error_to_response(&error);
                     }
                 }
             };
+            log.info(
+                "codex_standalone_search_completed",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                    ("model".to_string(), serde_json::json!(&resolved.model)),
+                    (
+                        "resultCount".to_string(),
+                        serde_json::json!(search_response.results.as_ref().map(Vec::len)),
+                    ),
+                    (
+                        "ms".to_string(),
+                        serde_json::json!(started_at.elapsed().as_millis()),
+                    ),
+                ])),
+            );
             let input_tokens = search::search_request_input_tokens(&search_request);
             let output_tokens = search::search_response_output_tokens(&search_response);
             if let Some(monitor) = ctx.monitor.as_ref() {

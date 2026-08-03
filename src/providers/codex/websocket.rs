@@ -311,7 +311,7 @@ enum WebSocketPoolKey {
 struct PoolEntry {
     ws: Arc<AsyncMutex<CodexWebSocketStream>>,
     socket_id: u64,
-    created_at: u64,
+    last_used_at: AtomicU64,
     last_activity: AtomicU64,
     owner: OnceLock<ConversationIdentity>,
     pool_key: OnceLock<WebSocketPoolKey>,
@@ -319,17 +319,22 @@ struct PoolEntry {
 
 impl PoolEntry {
     fn new(ws: CodexWebSocketStream) -> Self {
+        Self::new_at(ws, now_ms())
+    }
+
+    fn new_at(ws: CodexWebSocketStream, now: u64) -> Self {
         Self {
             ws: Arc::new(AsyncMutex::new(ws)),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
-            created_at: now_ms(),
+            last_used_at: AtomicU64::new(now),
             last_activity: AtomicU64::new(next_pool_activity()),
             owner: OnceLock::new(),
             pool_key: OnceLock::new(),
         }
     }
 
-    fn touch(&self) {
+    fn touch_at(&self, now: u64) {
+        self.last_used_at.fetch_max(now, Ordering::Relaxed);
         self.last_activity
             .fetch_max(next_pool_activity(), Ordering::Relaxed);
     }
@@ -435,7 +440,7 @@ pub fn invalidate_codex_websocket_pool_key(session_id: &str) {
         let keys = guard
             .iter()
             .filter(|(key, entry)| {
-                let owner = entry.owner.get().or_else(|| match key {
+                let owner = entry.owner.get().or(match key {
                     WebSocketPoolKey::Compatibility(owner) => Some(owner),
                     WebSocketPoolKey::Route(_) => None,
                 });
@@ -599,10 +604,19 @@ fn pool_insert_if_vacant_or_same(
     owner: ConversationIdentity,
     entry: Arc<PoolEntry>,
 ) -> bool {
+    pool_insert_if_vacant_or_same_at(key, owner, entry, now_ms())
+}
+
+fn pool_insert_if_vacant_or_same_at(
+    key: WebSocketPoolKey,
+    owner: ConversationIdentity,
+    entry: Arc<PoolEntry>,
+    now: u64,
+) -> bool {
     if !entry.assign_pool_identity(&owner, &key) {
         return false;
     }
-    entry.touch();
+    entry.touch_at(now);
     let mut guard = WS_POOL.lock().unwrap();
     if let Some(existing) = guard.get(&key) {
         return Arc::ptr_eq(existing, &entry);
@@ -612,8 +626,9 @@ fn pool_insert_if_vacant_or_same(
     {
         guard.remove(&oldest_key);
     }
-    let now = now_ms();
-    guard.retain(|_, pooled| now.saturating_sub(pooled.created_at) < POOL_IDLE_TTL_MS);
+    guard.retain(|_, pooled| {
+        now.saturating_sub(pooled.last_used_at.load(Ordering::Relaxed)) < POOL_IDLE_TTL_MS
+    });
     guard.insert(key, entry);
     true
 }
@@ -2517,11 +2532,51 @@ mod tests {
         Arc::new(PoolEntry {
             ws: ws.clone(),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
-            created_at: now_ms(),
+            last_used_at: AtomicU64::new(now_ms()),
             last_activity: AtomicU64::new(next_pool_activity()),
             owner: OnceLock::new(),
             pool_key: OnceLock::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn pool_idle_ttl_is_refreshed_when_socket_is_reused() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let owner_a = main_owner("session-a");
+        let key_a = compatibility_pool_key(&owner_a);
+        let entry_a = Arc::new(PoolEntry::new_at(raw_test_stream(None).await, 1));
+        assert!(pool_insert_if_vacant_or_same_at(
+            key_a.clone(),
+            owner_a.clone(),
+            entry_a.clone(),
+            1,
+        ));
+        assert!(Arc::ptr_eq(
+            &WS_POOL.lock().unwrap().remove(&key_a).unwrap(),
+            &entry_a,
+        ));
+        assert!(pool_insert_if_vacant_or_same_at(
+            key_a.clone(),
+            owner_a,
+            entry_a,
+            POOL_IDLE_TTL_MS,
+        ));
+
+        let owner_b = main_owner("session-b");
+        let key_b = compatibility_pool_key(&owner_b);
+        let entry_b = Arc::new(PoolEntry::new_at(
+            raw_test_stream(None).await,
+            POOL_IDLE_TTL_MS + 1,
+        ));
+        assert!(pool_insert_if_vacant_or_same_at(
+            key_b,
+            owner_b,
+            entry_b,
+            POOL_IDLE_TTL_MS + 1,
+        ));
+        assert!(WS_POOL.lock().unwrap().contains_key(&key_a));
+        clear_codex_websocket_pool_for_tests();
     }
 
     #[tokio::test]
@@ -2550,7 +2605,12 @@ mod tests {
             .insert(compatibility_pool_key(&entry_50), shared_pool_entry(&ws));
         let entry_00 = compatibility_pool_key(&main_owner("entry-00"));
         let entry_01 = compatibility_pool_key(&main_owner("entry-01"));
-        WS_POOL.lock().unwrap().get(&entry_00).unwrap().touch();
+        WS_POOL
+            .lock()
+            .unwrap()
+            .get(&entry_00)
+            .unwrap()
+            .touch_at(now_ms());
         let leased = WS_POOL.lock().unwrap().get(&entry_01).unwrap().clone();
 
         cleanup_pool_before_connect();

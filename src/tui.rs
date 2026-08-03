@@ -143,11 +143,12 @@ fn run_monitor_events(
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) => match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if app.handle_ctrl_c() {
-                            return Ok(MonitorExit::ForceQuit);
-                        }
+                    KeyCode::Char('c')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && app.handle_ctrl_c() =>
+                    {
+                        return Ok(MonitorExit::ForceQuit);
                     }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
                     _ if app.phase == MonitorPhase::ShuttingDown => {}
                     KeyCode::Char('y') if app.phase == MonitorPhase::ConfirmingShutdown => {
                         app.begin_shutdown()
