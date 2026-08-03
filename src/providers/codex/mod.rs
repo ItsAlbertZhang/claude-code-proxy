@@ -2107,116 +2107,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_search_401_rebuilds_stateful_route_and_preserves_stateless_id() {
-        for (case, session_id) in [("stateful", Some("raw-search-lane")), ("stateless", None)] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let client = CodexHttpClient::new_for_test(
-                reqwest::Client::builder().no_proxy().build().unwrap(),
-                format!("http://{address}/v1/responses"),
-                1_000,
-                1_000,
-                0,
-            );
-            client
-                .auth_manager()
-                .set_test_auth(auth::token_store::StoredAuth {
-                    access: format!("search-{case}-a"),
-                    refresh: "refresh-a".into(),
-                    expires: u64::MAX,
-                    account_id: Some("search-account".into()),
-                });
-            let provider = CodexProvider::with_client(client);
-            let server_client = provider.client.clone();
-            let server = tokio::spawn(async move {
-                let mut captured = Vec::new();
-                for attempt in 0..2 {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    captured.push(http_request_parts(&read_http_request(&mut socket).await));
-                    if attempt == 0 {
-                        server_client
-                            .auth_manager()
-                            .set_test_auth(auth::token_store::StoredAuth {
-                                access: format!("search-{case}-b"),
-                                refresh: "refresh-b".into(),
-                                expires: u64::MAX,
-                                account_id: Some("search-account".into()),
-                            });
-                        socket
-                            .write_all(
-                                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 5\r\nconnection: close\r\n\r\nstale",
-                            )
-                            .await
-                            .unwrap();
-                    } else {
-                        let body = br#"{"output":"search answer","results":[]}"#;
-                        let head = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        socket.write_all(head.as_bytes()).await.unwrap();
-                        socket.write_all(body).await.unwrap();
-                    }
-                }
-                assert!(
-                    tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
-                        .await
-                        .is_err(),
-                    "search sent a third route attempt"
-                );
-                captured
+    async fn standalone_search_is_rejected_before_auth_or_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        );
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "search-disabled".into(),
+                refresh: "refresh-disabled".into(),
+                expires: u64::MAX,
+                account_id: Some("search-account".into()),
             });
+        let provider = CodexProvider::with_client(client);
 
-            let response = provider
-                .handle_messages(
-                    standalone_search_request(),
-                    messages_test_context(&format!("search-{case}"), session_id),
-                )
-                .await;
-            assert_eq!(response.status(), StatusCode::OK, "{case}");
-            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let response = provider
+            .handle_messages(
+                standalone_search_request(),
+                messages_test_context("search-disabled", Some("raw-search-lane")),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("route-safe recovery"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
                 .await
-                .unwrap();
-
-            let captured = server.await.unwrap();
-            assert_eq!(captured.len(), 2, "{case}");
-            assert!(
-                captured[0]
-                    .0
-                    .contains(&format!("authorization: Bearer search-{case}-a"))
-            );
-            assert!(
-                captured[1]
-                    .0
-                    .contains(&format!("authorization: Bearer search-{case}-b"))
-            );
-            let mut body_a = captured[0].1.clone();
-            let mut body_b = captured[1].1.clone();
-            let id_a = body_a.as_object_mut().unwrap().remove("id").unwrap();
-            let id_b = body_b.as_object_mut().unwrap().remove("id").unwrap();
-            assert_eq!(body_a, body_b, "{case}");
-            if session_id.is_some() {
-                assert_ne!(id_a, id_b);
-                for ((headers, _), id) in captured.iter().zip([id_a, id_b]) {
-                    let id = id.as_str().unwrap();
-                    for name in ["session_id", "x-client-request-id", "x-codex-window-id"] {
-                        assert!(headers.contains(&format!("{name}: {id}")));
-                    }
-                    assert!(!headers.contains("raw-search-lane"));
-                }
-            } else {
-                assert_eq!(id_a, id_b, "stateless search changed its generated id");
-                assert!(
-                    id_a.as_str().is_some_and(|id| id.starts_with("search-")),
-                    "stateless search id was not generated"
-                );
-                for (headers, _) in &captured {
-                    assert!(!headers.contains("\nsession_id: "));
-                    assert!(!headers.contains("x-client-request-id:"));
-                    assert!(!headers.contains("x-codex-window-id:"));
-                }
-            }
-        }
+                .is_err(),
+            "fail-closed standalone search must not dispatch"
+        );
     }
 
     #[tokio::test]
