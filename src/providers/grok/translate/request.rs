@@ -339,6 +339,7 @@ fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
             "system",
             "tools",
             "tool_choice",
+            "parallel_tool_calls",
             "context_management",
             "diagnostics",
             "metadata",
@@ -1143,6 +1144,21 @@ mod tests {
             item["role"] == "assistant" && item["content"][0]["text"] == "Found it"
         }));
         assert!(!value.to_string().contains("srvtoolu_1"));
+    }
+
+    #[test]
+    fn tool_free_parallel_policy_is_preserved_for_grok() {
+        for parallel in [false, true] {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"user","content":"hello"}],
+                "parallel_tool_calls":parallel
+            }))
+            .unwrap();
+            let translated = translate_request(&request, "grok-4.5".into()).unwrap();
+            assert_eq!(translated.parallel_tool_calls, Some(parallel));
+            assert!(translated.tool_choice.is_none());
+        }
     }
 
     #[test]

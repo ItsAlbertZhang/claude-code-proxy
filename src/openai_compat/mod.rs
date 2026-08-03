@@ -34,6 +34,7 @@ impl OpenAiSurface {
 pub struct OpenAiResponseMetadata {
     pub tools: Vec<Value>,
     pub tool_choice: Value,
+    pub parallel_tool_calls: bool,
 }
 
 impl Default for OpenAiResponseMetadata {
@@ -41,6 +42,7 @@ impl Default for OpenAiResponseMetadata {
         Self {
             tools: Vec::new(),
             tool_choice: json!("auto"),
+            parallel_tool_calls: false,
         }
     }
 }

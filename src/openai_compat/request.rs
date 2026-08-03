@@ -132,6 +132,7 @@ pub fn parse_request(
                 .filter(|value| !value.is_null())
                 .cloned()
                 .unwrap_or_else(|| json!("auto")),
+            parallel_tool_calls: parallel_tool_calls.unwrap_or(false),
         }
     } else {
         OpenAiResponseMetadata::default()
@@ -153,6 +154,12 @@ pub fn parse_request(
     }
     if !tools.is_empty() {
         extra.insert("tools".to_string(), Value::Array(tools));
+    }
+    if let Some(parallel_tool_calls) = parallel_tool_calls {
+        extra.insert(
+            "parallel_tool_calls".to_string(),
+            Value::Bool(parallel_tool_calls),
+        );
     }
     if let Some(choice) = tool_choice {
         extra.insert("tool_choice".to_string(), choice);
@@ -243,10 +250,10 @@ fn validate_single_choice(object: &Map<String, Value>) -> Result<(), OpenAiError
 }
 
 fn apply_parallel_tool_calls(tool_choice: &mut Option<Value>, parallel_tool_calls: Option<bool>) {
-    let Some(parallel_tool_calls) = parallel_tool_calls else {
+    let (Some(parallel_tool_calls), Some(choice)) = (parallel_tool_calls, tool_choice.as_mut())
+    else {
         return;
     };
-    let choice = tool_choice.get_or_insert_with(|| json!({"type":"auto"}));
     choice
         .as_object_mut()
         .expect("translated tool choice is an object")
@@ -1143,26 +1150,23 @@ mod tests {
     #[test]
     fn parallel_tool_calls_sets_anthropic_tool_choice_policy() {
         let cases = [
-            (None, "auto"),
-            (Some(json!("auto")), "auto"),
-            (Some(json!("none")), "none"),
-            (Some(json!("required")), "any"),
+            (json!("auto"), "auto"),
+            (json!("none"), "none"),
+            (json!("required"), "any"),
             (
-                Some(json!({"type":"function","function":{"name":"lookup"}})),
+                json!({"type":"function","function":{"name":"lookup"}}),
                 "tool",
             ),
         ];
         for parallel in [false, true] {
             for (choice, expected_type) in &cases {
-                let mut body = json!({
+                let body = json!({
                     "model":"kimi-k2.6",
                     "messages":[{"role":"user","content":"look up x"}],
                     "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                    "tool_choice":choice,
                     "parallel_tool_calls":parallel,
                 });
-                if let Some(choice) = choice {
-                    body["tool_choice"] = choice.clone();
-                }
                 let parsed = parse_request(
                     OpenAiSurface::ChatCompletions,
                     body,
@@ -1173,7 +1177,28 @@ mod tests {
                 let translated = &parsed.messages.extra["tool_choice"];
                 assert_eq!(translated["type"], *expected_type);
                 assert_eq!(translated["disable_parallel_tool_use"], !parallel);
+                assert_eq!(parsed.messages.extra["parallel_tool_calls"], parallel);
             }
+        }
+    }
+
+    #[test]
+    fn tool_free_responses_parallel_policy_does_not_synthesize_tool_choice() {
+        for parallel in [false, true] {
+            let parsed = parse_request(
+                OpenAiSurface::Responses,
+                json!({
+                    "model":"glm-5.2",
+                    "input":"hello",
+                    "parallel_tool_calls":parallel,
+                }),
+                "opencode",
+                None,
+            )
+            .unwrap();
+            assert!(!parsed.messages.extra.contains_key("tool_choice"));
+            assert_eq!(parsed.messages.extra["parallel_tool_calls"], parallel);
+            assert_eq!(parsed.response_metadata.parallel_tool_calls, parallel);
         }
     }
 
@@ -1197,6 +1222,7 @@ mod tests {
             parsed.messages.extra["tool_choice"]["disable_parallel_tool_use"],
             true
         );
+        assert!(!parsed.response_metadata.parallel_tool_calls);
     }
 
     #[test]

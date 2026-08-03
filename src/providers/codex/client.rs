@@ -1686,9 +1686,7 @@ impl CodexHttpClient {
         auth_rejection_budget: &AuthRejectionBudget,
     ) -> Result<(reqwest::Response, Instant), CodexError> {
         loop {
-            let (resp, started_at) = self
-                .start_post_http_bound(route, body_json, ctx)
-                .await?;
+            let (resp, started_at) = self.start_post_http_bound(route, body_json, ctx).await?;
 
             if resp.status().as_u16() == 401
                 && allow_auth_refresh
@@ -1787,13 +1785,8 @@ impl CodexHttpClient {
             .await?;
         match websocket.recv().await {
             Some(Err(error)) if should_fallback_to_http(&error) => {
-                self.stream_codex_http_events_bound(
-                    route,
-                    body,
-                    ctx,
-                    auth_rejection_budget,
-                )
-                .await
+                self.stream_codex_http_events_bound(route, body, ctx, auth_rejection_budget)
+                    .await
             }
             Some(item) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(64);

@@ -17,7 +17,8 @@ use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
 use crate::providers::{
     grok::translate::stream::SseDecoder,
     translate_shared::{
-        ContentBlock, flatten_system_text, image_source_to_url, normalize_content, read_effort,
+        ContentBlock, flatten_system_text, image_source_to_url, normalize_content,
+        parallel_tool_calls, read_effort,
     },
 };
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
@@ -313,20 +314,22 @@ fn read_tools(req: &MessagesRequest) -> anyhow::Result<Vec<Value>> {
 }
 
 fn read_tool_choice(req: &MessagesRequest) -> anyhow::Result<(Option<Value>, Option<bool>)> {
+    let resolved_parallel = parallel_tool_calls(req);
     let Some(value) = req.extra.get("tool_choice") else {
-        return Ok((None, None));
+        return Ok((None, resolved_parallel));
     };
     if value.is_null() {
-        return Ok((None, None));
-    }
+        return Ok((None, resolved_parallel));
+    };
     let choice = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("tool_choice must be an object"))?;
-    let parallel = match choice.get("disable_parallel_tool_use") {
-        Some(Value::Bool(disabled)) => Some(!disabled),
-        Some(_) => anyhow::bail!("tool_choice.disable_parallel_tool_use must be a boolean"),
-        None => None,
-    };
+    if choice
+        .get("disable_parallel_tool_use")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        anyhow::bail!("tool_choice.disable_parallel_tool_use must be a boolean");
+    }
     let translated = match choice.get("type").and_then(Value::as_str) {
         Some("auto") => Some(Value::String("auto".into())),
         Some("none") => Some(Value::String("none".into())),
@@ -342,7 +345,7 @@ fn read_tool_choice(req: &MessagesRequest) -> anyhow::Result<(Option<Value>, Opt
         Some(kind) => anyhow::bail!("unsupported tool_choice type: {kind}"),
         None => anyhow::bail!("tool_choice.type must be a string"),
     };
-    Ok((translated, parallel))
+    Ok((translated, resolved_parallel))
 }
 
 fn map_reasoning_effort(req: &MessagesRequest, model: &str) -> anyhow::Result<Option<String>> {
@@ -1294,6 +1297,22 @@ mod tests {
             wire["messages"][1]["tool_calls"][0]["function"]["arguments"],
             "{\"q\":\"rust\"}"
         );
+    }
+
+    #[test]
+    fn tool_free_explicit_parallel_policy_reaches_opencode() {
+        for parallel in [false, true] {
+            let req = request(json!({
+                "model":"opencode-go/glm-5.2",
+                "max_tokens":123,
+                "messages":[{"role":"user","content":"hello"}],
+                "parallel_tool_calls":parallel
+            }));
+            let wire = serde_json::to_value(prepare_request(&req, "glm-5.2").unwrap()).unwrap();
+            assert_eq!(wire["parallel_tool_calls"], parallel);
+            assert!(wire.get("tool_choice").is_none());
+            assert!(wire.get("tools").is_none());
+        }
     }
 
     #[test]

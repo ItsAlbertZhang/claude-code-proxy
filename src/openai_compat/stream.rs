@@ -720,7 +720,7 @@ fn response_shell(
         "status":status,
         "model":model,
         "output":[],
-        "parallel_tool_calls":false,
+        "parallel_tool_calls":response_metadata.parallel_tool_calls,
         "tool_choice":response_metadata.tool_choice,
         "tools":response_metadata.tools,
         "error":null,
@@ -859,7 +859,10 @@ mod tests {
                 "resp_test".into(),
                 "grok-4.5".into(),
                 1,
-                OpenAiResponseMetadata::default(),
+                OpenAiResponseMetadata {
+                    parallel_tool_calls: true,
+                    ..OpenAiResponseMetadata::default()
+                },
             ),
             None,
         );
@@ -868,6 +871,7 @@ mod tests {
         assert!(text.contains("event: response.created"));
         assert!(text.contains("event: response.output_text.delta"));
         assert!(text.contains("event: response.completed"));
+        assert!(text.contains("\"parallel_tool_calls\":true"));
         assert!(text.contains("\"sequence_number\":0"));
     }
 }
