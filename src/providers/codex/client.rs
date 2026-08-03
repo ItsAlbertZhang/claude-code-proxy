@@ -3111,7 +3111,15 @@ async fn forward_codex_events(
     mut source: tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>,
     tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
 ) {
-    while let Some(item) = source.recv().await {
+    loop {
+        let item = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            item = source.recv() => item,
+        };
+        let Some(item) = item else {
+            return;
+        };
         if tx.send(item).await.is_err() {
             return;
         }
