@@ -638,6 +638,15 @@ pub(crate) fn has_continuation_for_owner_for_tests(owner: &ConversationIdentity)
         .is_some_and(|state| state.continuation.is_some())
 }
 
+#[cfg(test)]
+pub(crate) fn has_continuation_owner_state_for_tests(owner: &ConversationIdentity) -> bool {
+    REGISTRY
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|registry| registry.owners.contains_key(owner))
+}
+
 pub fn clear_all_continuations_for_tests() {
     let mut guard = REGISTRY.lock().unwrap();
     *guard = None;
