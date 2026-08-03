@@ -21,7 +21,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{
     CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
-    RequestContext, ScopedRequestContext,
+    RequestContext, compatible_explicit_identity,
 };
 use crate::providers::cursor::auth::{
     clear_cursor_auth, expired_auth_message, load_cursor_auth, missing_auth_message,
@@ -37,7 +37,9 @@ use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools_scoped, find_tool_result,
     resume_cursor_tool_bridge_scoped, start_cursor_tool_bridge_scoped,
 };
-use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
+use crate::request_identity::{
+    ConversationIdentity, LaneDomain, OpaqueLane, RequestPurpose, RequestScope,
+};
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -345,13 +347,18 @@ impl Provider for CursorProvider {
         handle_messages_with_lane(body, ctx, bridge_lane).await
     }
 
-    async fn handle_messages_scoped(
+    async fn handle_messages_with_conversation_identity(
         &self,
         body: MessagesRequest,
-        scoped: ScopedRequestContext,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        let bridge_lane = scoped.scope().provider_lane(LaneDomain::CursorToolBridge);
-        handle_messages_with_lane(body, scoped.into_legacy(), bridge_lane).await
+        let scope = RequestScope::from_conversation_identity(
+            compatible_explicit_identity(&ctx, conversation_identity),
+            RequestPurpose::Conversation,
+        );
+        let bridge_lane = scope.provider_lane(LaneDomain::CursorToolBridge);
+        handle_messages_with_lane(body, ctx, bridge_lane).await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -378,13 +385,18 @@ impl Provider for CursorProvider {
         generate_anthropic_stream_with_lane(body, ctx, bridge_lane).await
     }
 
-    async fn generate_anthropic_stream_scoped(
+    async fn generate_anthropic_stream_with_conversation_identity(
         &self,
         body: MessagesRequest,
-        scoped: ScopedRequestContext,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
     ) -> Result<Generation, ProviderError> {
-        let bridge_lane = scoped.scope().provider_lane(LaneDomain::CursorToolBridge);
-        generate_anthropic_stream_with_lane(body, scoped.into_legacy(), bridge_lane).await
+        let scope = RequestScope::from_conversation_identity(
+            compatible_explicit_identity(&ctx, conversation_identity),
+            RequestPurpose::Conversation,
+        );
+        let bridge_lane = scope.provider_lane(LaneDomain::CursorToolBridge);
+        generate_anthropic_stream_with_lane(body, ctx, bridge_lane).await
     }
 }
 

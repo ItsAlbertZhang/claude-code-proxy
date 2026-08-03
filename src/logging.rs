@@ -154,14 +154,14 @@ fn create_dir(path: &Path, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn set_mode(path: &Path, mode: u32) {
+fn set_mode(_path: &Path, _mode: u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
+        if let Ok(meta) = fs::metadata(_path) {
             let mut perm = meta.permissions();
-            perm.set_mode(mode);
-            let _ = fs::set_permissions(path, perm);
+            perm.set_mode(_mode);
+            let _ = fs::set_permissions(_path, perm);
         }
     }
 }

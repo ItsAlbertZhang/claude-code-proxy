@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use crate::anthropic::sse::parse_sse_events;
 
-use super::ChatError;
+use super::{ChatError, MAX_CHAT_OUTPUT_BYTES, MAX_CHAT_UPSTREAM_BYTES};
 
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
@@ -29,10 +29,20 @@ pub struct CompletionState {
     pub usage: Usage,
     pub finish_reason: &'static str,
     pub completed: bool,
+    retain_text: bool,
+    saw_text: bool,
 }
 
 impl CompletionState {
     pub fn new(model: &str) -> Self {
+        Self::new_with_text_retention(model, true)
+    }
+
+    pub fn new_streaming(model: &str) -> Self {
+        Self::new_with_text_retention(model, false)
+    }
+
+    fn new_with_text_retention(model: &str, retain_text: bool) -> Self {
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             created: unix_seconds(),
@@ -41,6 +51,8 @@ impl CompletionState {
             usage: Usage::default(),
             finish_reason: "stop",
             completed: false,
+            retain_text,
+            saw_text: false,
         }
     }
 
@@ -59,7 +71,15 @@ impl CompletionState {
                 let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     ChatError::upstream("Codex output-text delta did not contain text")
                 })?;
-                self.text.push_str(delta);
+                self.saw_text |= !delta.is_empty();
+                if self.retain_text {
+                    if self.text.len().saturating_add(delta.len()) > MAX_CHAT_OUTPUT_BYTES {
+                        return Err(ChatError::upstream(
+                            "Codex translated output exceeded the configured limit",
+                        ));
+                    }
+                    self.text.push_str(delta);
+                }
                 return Ok(Some(delta.to_string()));
             }
             Some("response.completed" | "response.incomplete") => {
@@ -84,6 +104,10 @@ impl CompletionState {
             }
         }
         Ok(None)
+    }
+
+    pub fn has_output_text(&self) -> bool {
+        self.saw_text
     }
 
     fn update_metadata(&mut self, response: &Value) {
@@ -115,6 +139,11 @@ impl CompletionState {
 }
 
 pub fn aggregate_sse(body: &[u8], requested_model: &str) -> Result<Value, ChatError> {
+    if body.len() > MAX_CHAT_UPSTREAM_BYTES {
+        return Err(ChatError::upstream(
+            "Codex response body exceeded the configured limit",
+        ));
+    }
     let events = parse_sse_events(body);
     if events.is_empty() {
         return Err(ChatError::upstream(
@@ -136,10 +165,16 @@ pub fn aggregate_sse(body: &[u8], requested_model: &str) -> Result<Value, ChatEr
             "Codex event stream ended before completion",
         ));
     }
-    if state.text.is_empty() {
+    if !state.has_output_text() {
         return Err(ChatError::upstream("Codex completed without output text"));
     }
-    Ok(completion_value(&state))
+    let value = completion_value(&state);
+    if serde_json::to_vec(&value).map_or(true, |body| body.len() > MAX_CHAT_OUTPUT_BYTES) {
+        return Err(ChatError::upstream(
+            "Codex translated output exceeded the configured limit",
+        ));
+    }
+    Ok(value)
 }
 
 pub fn completion_value(state: &CompletionState) -> Value {
@@ -197,6 +232,25 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_state_does_not_retain_emitted_text() {
+        let mut state = CompletionState::new_streaming("model");
+        let delta = "x".repeat(1024);
+        assert_eq!(
+            state
+                .observe(&json!({
+                    "type": "response.output_text.delta",
+                    "delta": delta,
+                }))
+                .unwrap()
+                .unwrap()
+                .len(),
+            1024
+        );
+        assert!(state.text.is_empty());
+        assert!(state.has_output_text());
+    }
 
     #[test]
     fn aggregates_ordered_deltas_and_usage() {

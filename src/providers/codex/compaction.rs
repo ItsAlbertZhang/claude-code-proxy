@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::anthropic::sse::parse_sse_events;
 use crate::provider::RequestContext;
 use crate::providers::codex::client::{BufferedRetryState, CodexError, CodexHttpClient};
-use crate::request_identity::OpaqueLane;
+use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
 
 use super::state::{CodexBoundRoute, CodexConversationKey};
 
@@ -883,6 +883,7 @@ pub fn store_compaction(
     store_compaction_state(session_id, model, None, native_history)
 }
 
+#[cfg(test)]
 pub(crate) fn store_compaction_for_request(
     session_id: &str,
     request: &ResponsesRequest,
@@ -931,6 +932,7 @@ pub fn activate_compaction(
     activate_compaction_state(session_id, model, None, output)
 }
 
+#[cfg(test)]
 pub(crate) fn activate_compaction_for_request(
     session_id: Option<&str>,
     request: &ResponsesRequest,
@@ -1068,6 +1070,12 @@ pub fn clear_compaction(session_id: &str) {
     if let Some(registry) = guard.as_mut() {
         registry.states.remove(session_id);
         update_total_bytes(registry);
+    }
+    drop(guard);
+    if let Some(lane) = RequestScope::legacy(Some(session_id), RequestPurpose::Conversation)
+        .provider_lane(LaneDomain::CodexConversation)
+    {
+        clear_compactions_for_lane(lane);
     }
 }
 
@@ -1468,6 +1476,21 @@ mod tests {
                 .conversation_key()
                 .is_some_and(|key| registry.bound_states.contains_key(&key))
         })
+    }
+
+    #[test]
+    fn public_clear_removes_route_bound_main_state() {
+        let _guard = lock_compaction_registry_for_tests();
+        clear_all_compactions_for_tests();
+        let route = bound_route(main_lane("legacy-main"), "access-a");
+        let (permit, lease) = stage_bound(&route, "opaque");
+        anchor_bound(&lease);
+        assert!(has_bound_state(&route));
+
+        clear_compaction("legacy-main");
+
+        assert!(!has_bound_state(&route));
+        drop(permit);
     }
 
     fn pending_anchor_contains(route: &CodexBoundRoute, expected: &str) -> bool {

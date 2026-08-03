@@ -46,12 +46,6 @@ pub(crate) fn existing_conversation(
     Some(state)
 }
 
-pub(crate) fn existing_conversation_now(
-    identity: Option<&ConversationIdentity>,
-) -> Option<SessionState> {
-    existing_conversation(identity, now_millis())
-}
-
 pub fn existing_session(session_id: Option<&str>, now: u64) -> Option<SessionState> {
     let identity = session_id.and_then(ConversationIdentity::from_legacy_main);
     existing_conversation(identity.as_ref(), now)
@@ -70,25 +64,6 @@ pub fn record_session_request(
 ) -> Option<SessionState> {
     let identity = session_id.and_then(ConversationIdentity::from_legacy_main);
     record_conversation_request(identity.as_ref(), prior, provider_name, model, true, now)
-}
-
-pub(crate) fn record_session_request_with_affinity_update(
-    session_id: Option<&str>,
-    prior: Option<&SessionState>,
-    provider_name: &str,
-    model: &str,
-    update_affinity: bool,
-    now: u64,
-) -> Option<SessionState> {
-    let identity = session_id.and_then(ConversationIdentity::from_legacy_main);
-    record_conversation_request(
-        identity.as_ref(),
-        prior,
-        provider_name,
-        model,
-        update_affinity,
-        now,
-    )
 }
 
 pub(crate) fn record_scoped_request(

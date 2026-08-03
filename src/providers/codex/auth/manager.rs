@@ -139,16 +139,15 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
 
         let status = resp.status().as_u16();
         if status == 401 || status == 403 {
-            if let Some(latest) = self.store.load_auth()?
-                && latest != *current
-            {
-                return Ok(latest);
-            }
-            self.store.clear_auth()?;
             let err_msg = resp
                 .text()
                 .await
                 .unwrap_or_else(|_| "Token refresh unauthorized".to_string());
+            if !self.replace_auth_if_current(current, None)?
+                && let Some(latest) = self.load_auth()?
+            {
+                return Ok(latest);
+            }
             anyhow::bail!("{err_msg}");
         }
 
@@ -169,15 +168,33 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             expires,
             account_id,
         };
-        #[cfg(test)]
-        if let Ok(mut test_auth) = self.test_auth.lock()
-            && test_auth.is_some()
-        {
-            *test_auth = Some(next.clone());
+        if self.replace_auth_if_current(current, Some(next.clone()))? {
             return Ok(next);
         }
-        self.store.save_auth(next.clone())?;
-        Ok(next)
+        self.load_auth()?
+            .ok_or_else(|| anyhow::anyhow!("Not authenticated"))
+    }
+
+    fn replace_auth_if_current(
+        &self,
+        current: &StoredAuth,
+        replacement: Option<StoredAuth>,
+    ) -> Result<bool, anyhow::Error> {
+        #[cfg(test)]
+        {
+            let mut test_auth = self
+                .test_auth
+                .lock()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            if test_auth.is_some() {
+                if test_auth.as_ref() != Some(current) {
+                    return Ok(false);
+                }
+                *test_auth = replacement;
+                return Ok(true);
+            }
+        }
+        self.store.compare_and_swap_auth(Some(current), replacement)
     }
 
     pub fn persist_initial_tokens(
@@ -314,6 +331,52 @@ mod tests {
         let auth = manager.force_refresh("rejected").await.unwrap();
         assert_eq!(auth.access, "rotated");
         assert_eq!(auth.refresh, "rotated-refresh");
+    }
+
+    #[tokio::test]
+    async fn successful_stale_refresh_preserves_concurrent_account_switch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backing = InMemoryAuthStore::new();
+        let server_backing = backing.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            server_backing
+                .save(StoredAuth {
+                    access: "account-b-access".into(),
+                    refresh: "account-b-refresh".into(),
+                    expires: u64::MAX,
+                    account_id: Some("account-b".into()),
+                })
+                .unwrap();
+            let body = br#"{"access_token":"stale-a-access","refresh_token":"stale-a-refresh","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let store = CodexTokenStore::new(backing);
+        store
+            .save_auth(StoredAuth {
+                access: "expired-a".into(),
+                refresh: "refresh-a".into(),
+                expires: 0,
+                account_id: Some("account-a".into()),
+            })
+            .unwrap();
+        let manager =
+            CodexAuthManager::new_with_token_endpoint(store, format!("http://{addr}/oauth/token"));
+
+        let auth = manager.get_auth().await.unwrap();
+        server.join().unwrap();
+        assert_eq!(auth.access, "account-b-access");
+        assert_eq!(auth.account_id.as_deref(), Some("account-b"));
+        assert_eq!(manager.store.load_auth().unwrap(), Some(auth));
     }
 
     #[tokio::test]

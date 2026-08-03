@@ -39,31 +39,7 @@ pub trait Provider: Send + Sync {
         self.handle_messages(body, ctx).await
     }
 
-    #[doc(hidden)]
-    async fn handle_messages_scoped(
-        &self,
-        body: MessagesRequest,
-        ctx: ScopedRequestContext,
-    ) -> Response {
-        let (legacy, scope) = ctx.into_parts();
-        self.handle_messages_with_conversation_identity(
-            body,
-            legacy,
-            scope.conversational_lane().cloned(),
-        )
-        .await
-    }
-
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
-
-    #[doc(hidden)]
-    async fn handle_count_tokens_scoped(
-        &self,
-        body: MessagesRequest,
-        ctx: ScopedRequestContext,
-    ) -> Response {
-        self.handle_count_tokens(body, ctx.into_legacy()).await
-    }
 
     async fn generate_anthropic_stream(
         &self,
@@ -80,14 +56,15 @@ pub trait Provider: Send + Sync {
         ))
     }
 
-    #[doc(hidden)]
-    async fn generate_anthropic_stream_scoped(
+    async fn generate_anthropic_stream_with_conversation_identity(
         &self,
         body: MessagesRequest,
-        ctx: ScopedRequestContext,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
     ) -> Result<Generation, ProviderError> {
-        self.generate_anthropic_stream(body, ctx.into_legacy())
-            .await
+        let identity = compatible_explicit_identity(&ctx, conversation_identity);
+        let _ = identity;
+        self.generate_anthropic_stream(body, ctx).await
     }
 }
 
@@ -169,18 +146,6 @@ pub(crate) struct ScopedRequestContext {
 impl ScopedRequestContext {
     pub(crate) fn new(legacy: RequestContext, scope: RequestScope) -> Self {
         Self { legacy, scope }
-    }
-
-    pub(crate) fn legacy(&self) -> &RequestContext {
-        &self.legacy
-    }
-
-    pub(crate) fn scope(&self) -> &RequestScope {
-        &self.scope
-    }
-
-    pub(crate) fn into_legacy(self) -> RequestContext {
-        self.legacy
     }
 
     pub(crate) fn into_parts(self) -> (RequestContext, RequestScope) {

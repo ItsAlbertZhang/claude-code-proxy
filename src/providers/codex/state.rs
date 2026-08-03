@@ -168,10 +168,6 @@ impl CodexBoundRoute {
         self.account_id.as_deref()
     }
 
-    pub(crate) fn principal(&self) -> PrincipalFingerprint {
-        self.principal
-    }
-
     pub(crate) fn credential_generation(&self) -> CredentialGeneration {
         self.credential_generation
     }

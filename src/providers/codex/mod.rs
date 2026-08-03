@@ -75,10 +75,6 @@ use self::translate::stream::translate_stream_bytes_scoped;
 // Provider
 // ---------------------------------------------------------------------------
 
-pub(crate) fn clear_session_compaction(session_id: &str) {
-    compaction::clear_compaction(session_id);
-}
-
 pub(crate) fn clear_conversation_state(identity: &ConversationIdentity) {
     continuation::clear_continuation_for_owner(Some(identity));
     websocket::invalidate_codex_websocket_pool_owner(identity);
@@ -144,6 +140,14 @@ impl CodexProvider {
     ) -> Response {
         let (ctx, scope) = scoped.into_parts();
         let conversation_identity = scope.conversational_lane().cloned();
+        let legacy_compaction_session = match conversation_identity.as_ref() {
+            Some(ConversationIdentity::Main(session))
+                if ctx.session_id.as_deref() == Some(session.as_str()) =>
+            {
+                Some(session.clone())
+            }
+            _ => None,
+        };
         let codex_lane = scope.provider_lane(LaneDomain::CodexConversation);
         let read_lane = scope.provider_lane(LaneDomain::CodexReadRewrite);
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
@@ -409,34 +413,48 @@ impl CodexProvider {
                                 translated.input.len(),
                                 Some(&error.to_string()),
                             );
-                            if let compaction::CompactionError::Upstream(upstream) = error
-                                && upstream.status == 401
-                            {
-                                let Some(next_route) = rebuild_route_after_unauthorized(
-                                    client.as_ref(),
-                                    &route,
-                                    auth_rejection_budget.as_ref(),
-                                )
-                                .await
-                                else {
+                            if let compaction::CompactionError::Upstream(upstream) = error {
+                                if upstream.is_in_band_auth_rejection() {
+                                    client.refresh_conversation_auth_after_rejection_in_background(
+                                        &route,
+                                        auth_rejection_budget.clone(),
+                                    );
                                     cleanup.abort();
                                     return map_codex_error_to_response(&upstream);
-                                };
-                                route = next_route;
-                                route_rebuilt = true;
-                                continue 'routes;
+                                }
+                                if upstream.is_replayable_auth_rejection() {
+                                    let Some(next_route) = rebuild_route_after_unauthorized(
+                                        client.as_ref(),
+                                        &route,
+                                        auth_rejection_budget.as_ref(),
+                                    )
+                                    .await
+                                    else {
+                                        cleanup.abort();
+                                        return map_codex_error_to_response(&upstream);
+                                    };
+                                    route = next_route;
+                                    route_rebuilt = true;
+                                    continue 'routes;
+                                }
                             }
                         }
                     }
                 }
-            } else if server_compaction_enabled
-                && !compact_boundary
-                && let Some(replay) = apply_compaction_replay_for_route(&route, &translated)
-            {
-                translated = replay.request;
-                cleanup.replace_compaction_lease(Some(replay.lease));
-                request_continuation = request_continuation.full_context_retry();
-                cleanup.replace_continuation(request_continuation.clone());
+            } else if server_compaction_enabled && !compact_boundary {
+                if let Some(replay) = apply_compaction_replay_for_route(&route, &translated) {
+                    translated = replay.request;
+                    cleanup.replace_compaction_lease(Some(replay.lease));
+                    request_continuation = request_continuation.full_context_retry();
+                    cleanup.replace_continuation(request_continuation.clone());
+                } else if let Some(replay) = compaction::apply_compaction_replay(
+                    legacy_compaction_session.as_deref(),
+                    &translated,
+                ) {
+                    translated = replay;
+                    request_continuation = request_continuation.full_context_retry();
+                    cleanup.replace_continuation(request_continuation.clone());
+                }
             }
 
             if !upstream_started {
@@ -503,7 +521,15 @@ impl CodexProvider {
                 {
                     Ok(response) => response,
                     Err(error) => {
-                        if error.status == 401 {
+                        if error.is_in_band_auth_rejection() {
+                            client.refresh_conversation_auth_after_rejection_in_background(
+                                &route,
+                                auth_rejection_budget.clone(),
+                            );
+                            cleanup.abort();
+                            return map_codex_error_to_response(&error);
+                        }
+                        if error.is_replayable_auth_rejection() {
                             cleanup.abort_compaction();
                             websocket::invalidate_codex_websocket_pool_for_reservation(
                                 &request_continuation,
@@ -668,14 +694,6 @@ impl Provider for CodexProvider {
             RequestScope::from_conversation_identity(identity, RequestPurpose::Conversation);
         self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope))
             .await
-    }
-
-    async fn handle_messages_scoped(
-        &self,
-        body: MessagesRequest,
-        ctx: ScopedRequestContext,
-    ) -> Response {
-        self.handle_messages_inner(body, ctx).await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -2826,7 +2844,7 @@ mod tests {
         }))
         .unwrap();
         let response = provider
-            .handle_messages_scoped(initial, scope("agent-a", "read-first"))
+            .handle_messages_inner(initial, scope("agent-a", "read-first"))
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let downstream: serde_json::Value = serde_json::from_slice(
@@ -2870,7 +2888,7 @@ mod tests {
         };
         for (agent, req_id) in [("agent-a", "read-same-lane"), ("agent-b", "read-sibling")] {
             let response = provider
-                .handle_messages_scoped(result_request(), scope(agent, req_id))
+                .handle_messages_inner(result_request(), scope(agent, req_id))
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
             let _ = axum::body::to_bytes(response.into_body(), usize::MAX)

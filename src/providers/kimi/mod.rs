@@ -14,7 +14,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{
     CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
-    RequestContext, ScopedRequestContext,
+    RequestContext, compatible_explicit_identity,
 };
 use crate::providers::kimi::auth::token_store::file_store;
 use crate::providers::kimi::translate::accumulate::accumulate_response;
@@ -22,7 +22,9 @@ use crate::providers::kimi::translate::model_allowlist::{assert_allowed_model, r
 use crate::providers::kimi::translate::request::translate_request_scoped;
 use crate::providers::kimi::translate::stream::translate_stream_bytes;
 use crate::registry::KIMI_MODELS;
-use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
+use crate::request_identity::{
+    ConversationIdentity, LaneDomain, OpaqueLane, RequestPurpose, RequestScope,
+};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -265,13 +267,18 @@ impl Provider for KimiProvider {
         handle_messages_with_lane(body, ctx, prompt_cache_lane).await
     }
 
-    async fn handle_messages_scoped(
+    async fn handle_messages_with_conversation_identity(
         &self,
         body: MessagesRequest,
-        scoped: ScopedRequestContext,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        let prompt_cache_lane = scoped.scope().provider_lane(LaneDomain::KimiPromptCache);
-        handle_messages_with_lane(body, scoped.into_legacy(), prompt_cache_lane).await
+        let scope = RequestScope::from_conversation_identity(
+            compatible_explicit_identity(&ctx, conversation_identity),
+            RequestPurpose::Conversation,
+        );
+        let prompt_cache_lane = scope.provider_lane(LaneDomain::KimiPromptCache);
+        handle_messages_with_lane(body, ctx, prompt_cache_lane).await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -302,13 +309,18 @@ impl Provider for KimiProvider {
         generate_anthropic_stream_with_lane(body, ctx, prompt_cache_lane).await
     }
 
-    async fn generate_anthropic_stream_scoped(
+    async fn generate_anthropic_stream_with_conversation_identity(
         &self,
         body: MessagesRequest,
-        scoped: ScopedRequestContext,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
     ) -> Result<Generation, ProviderError> {
-        let prompt_cache_lane = scoped.scope().provider_lane(LaneDomain::KimiPromptCache);
-        generate_anthropic_stream_with_lane(body, scoped.into_legacy(), prompt_cache_lane).await
+        let scope = RequestScope::from_conversation_identity(
+            compatible_explicit_identity(&ctx, conversation_identity),
+            RequestPurpose::Conversation,
+        );
+        let prompt_cache_lane = scope.provider_lane(LaneDomain::KimiPromptCache);
+        generate_anthropic_stream_with_lane(body, ctx, prompt_cache_lane).await
     }
 }
 
