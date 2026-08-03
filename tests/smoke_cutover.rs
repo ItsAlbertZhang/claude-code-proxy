@@ -887,6 +887,7 @@ async fn smoke_auto_review_effort_follows_kimi_routes() {
     assert_eq!(sent.len(), 3);
     assert_eq!(sent[0]["model"], "kimi-for-coding");
     assert_eq!(sent[0]["reasoning_effort"], "low");
+    assert!(sent[0].get("prompt_cache_key").is_none());
     assert_eq!(sent[1]["model"], "kimi-for-coding");
     assert_eq!(sent[1]["reasoning_effort"], "high");
     assert_eq!(sent[2]["model"], "kimi-for-coding");

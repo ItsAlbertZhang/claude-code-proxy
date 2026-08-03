@@ -10,7 +10,9 @@ use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, read_effort,
 };
 
-use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
+use crate::request_identity::OpaqueLane;
+
+use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite, read_offset_rewrite_scoped};
 use super::reasoning_signature::decode_reasoning_signature;
 
 pub(crate) const RESPONSES_LITE_METADATA_KEY: &str =
@@ -431,13 +433,35 @@ pub fn has_hosted_web_search(req: &MessagesRequest) -> bool {
         })
 }
 
+#[derive(Clone, Copy)]
+enum ReadLane {
+    Legacy,
+    Stable(Option<OpaqueLane>),
+}
+
 pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_with_read_lane(req, opts, ReadLane::Legacy)
+}
+
+pub(crate) fn translate_request_scoped(
+    req: &MessagesRequest,
+    opts: TranslateOptions,
+    read_lane: Option<OpaqueLane>,
+) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_with_read_lane(req, opts, ReadLane::Stable(read_lane))
+}
+
+fn translate_request_with_read_lane(
+    req: &MessagesRequest,
+    opts: TranslateOptions,
+    read_lane: ReadLane,
+) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
-    let input = build_input(req);
+    let input = build_input(req, read_lane);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
     let parallel_tool_calls = !disable_parallel_tool_use(req);
@@ -773,7 +797,7 @@ fn disable_parallel_tool_use(req: &MessagesRequest) -> bool {
         .unwrap_or(false)
 }
 
-fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
+fn build_input(req: &MessagesRequest, read_lane: ReadLane) -> Vec<ResponsesInputItem> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
 
@@ -808,9 +832,11 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                             if is_error.unwrap_or(false) {
                                 rendered.prepend_text("[tool execution error]".to_string());
                             }
-                            if let Some(note) =
-                                rewritten_read_offset_note(&rendered.joined_text(), tool_use_id)
-                            {
+                            if let Some(note) = rewritten_read_offset_note(
+                                &rendered.joined_text(),
+                                tool_use_id,
+                                read_lane,
+                            ) {
                                 rendered.push_text(format!("\n{note}"));
                             }
                             if should_append_read_offset_guidance(
@@ -911,13 +937,19 @@ fn is_read_tool_use_with_offset(name: &str, input: &Value) -> bool {
     name == "Read" && input.get("offset").is_some()
 }
 
-fn rewritten_read_offset_note(output: &str, tool_use_id: &str) -> Option<String> {
+fn rewritten_read_offset_note(
+    output: &str,
+    tool_use_id: &str,
+    read_lane: ReadLane,
+) -> Option<String> {
     if output.contains("Proxy Read offset note:") {
         return None;
     }
-    read_offset_rewrite(tool_use_id)
-        .as_ref()
-        .map(read_offset_rewrite_note)
+    let rewrite = match read_lane {
+        ReadLane::Legacy => read_offset_rewrite(tool_use_id),
+        ReadLane::Stable(lane) => read_offset_rewrite_scoped(lane, tool_use_id),
+    };
+    rewrite.as_ref().map(read_offset_rewrite_note)
 }
 
 fn read_offset_rewrite_note(rewrite: &ReadOffsetRewrite) -> String {
@@ -1939,7 +1971,10 @@ mod tests {
     }
 
     #[test]
-    fn translate_read_result_adds_no_proxy_note_without_stable_lane() {
+    fn translate_rewritten_read_result_adds_proxy_note() {
+        let _lock = crate::providers::codex::translate::read_rewrite::READ_REWRITE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::providers::codex::translate::read_rewrite::sanitize_read_args(
             "Read",
             r#"{"file_path":"/tmp/a","offset":1300000,"limit":20}"#,
@@ -1966,11 +2001,72 @@ mod tests {
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
             let output = output.as_text().expect("text tool output");
-            assert_eq!(output, "1\tcontent");
-            assert!(!output.contains("Proxy Read offset note:"));
+            assert!(output.contains("1\tcontent"));
+            assert!(output.contains("Proxy Read offset note:"));
+            assert!(output.contains("1300000"));
+            assert!(output.contains("/tmp/a"));
         } else {
             panic!("expected FunctionCallOutput");
         }
+    }
+
+    #[test]
+    fn scoped_rewritten_read_result_replays_only_on_its_stable_lane() {
+        let _lock = crate::providers::codex::translate::read_rewrite::READ_REWRITE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crate::request_identity::{
+            ConversationIdentity, LaneDomain, RequestPurpose, RequestScope,
+        };
+
+        let lane = |agent: &str| {
+            RequestScope::from_conversation_identity(
+                Some(ConversationIdentity::Agent(
+                    "read-replay-session".to_string(),
+                    agent.to_string(),
+                )),
+                RequestPurpose::Conversation,
+            )
+            .provider_lane(LaneDomain::CodexReadRewrite)
+            .unwrap()
+        };
+        let first_lane = lane("replay-one");
+        let second_lane = lane("replay-two");
+        let call_id = "tu_scoped_rewritten_read";
+        crate::providers::codex::translate::read_rewrite::sanitize_read_args_scoped(
+            "Read",
+            r#"{"file_path":"/tmp/a","offset":1300000,"limit":20}"#,
+            Some(call_id),
+            Some(first_lane),
+        );
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role":"assistant", "content": [{
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/a", "limit": 20}
+                }]},
+                {"role":"user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": [{"type":"text", "text":"1\tcontent"}]
+                }]}
+            ]
+        }))
+        .unwrap();
+
+        let first = translate_request_scoped(&req, opts(), Some(first_lane)).unwrap();
+        let second = translate_request_scoped(&req, opts(), Some(second_lane)).unwrap();
+        let output_text = |request: &ResponsesRequest| match &request.input[1] {
+            ResponsesInputItem::FunctionCallOutput { output, .. } => {
+                output.as_text().unwrap().to_string()
+            }
+            _ => panic!("expected FunctionCallOutput"),
+        };
+        assert!(output_text(&first).contains("Proxy Read offset note:"));
+        assert!(!output_text(&second).contains("Proxy Read offset note:"));
     }
 
     #[test]
