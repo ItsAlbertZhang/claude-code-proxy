@@ -1820,14 +1820,13 @@ async fn smoke_codex_http_stream_returns_before_upstream_completion() {
     let mut body = response.into_body();
     let first = tokio::time::timeout(Duration::from_millis(200), body.frame())
         .await
-        .expect("initial Anthropic heartbeat must arrive before upstream completion")
+        .expect("initial Anthropic content must arrive before upstream completion")
         .unwrap()
         .unwrap()
         .into_data()
         .unwrap();
     let first = String::from_utf8(first.to_vec()).unwrap();
     assert!(first.contains("event: message_start"));
-    assert!(first.contains("event: ping"));
     assert!(first.contains("incremental ok"));
 
     release.notify_one();
