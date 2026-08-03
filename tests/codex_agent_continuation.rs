@@ -148,7 +148,7 @@ impl CapturedRequest {
             .and_then(Value::as_str)
     }
 
-    fn assert_protocol_headers(&self, expected_session: Option<&str>) {
+    fn assert_protocol_headers(&self, raw_session: Option<&str>) {
         assert_eq!(
             self.headers
                 .get(http::header::AUTHORIZATION)
@@ -173,22 +173,29 @@ impl CapturedRequest {
             "socket {} websocket protocol header",
             self.socket_ordinal
         );
+        let session_id = self
+            .headers
+            .get("session_id")
+            .and_then(|value| value.to_str().ok());
+        let request_id = self
+            .headers
+            .get("x-client-request-id")
+            .and_then(|value| value.to_str().ok());
         assert_eq!(
-            self.headers
-                .get("session_id")
-                .and_then(|value| value.to_str().ok()),
-            expected_session,
-            "socket {} session_id header",
+            session_id, request_id,
+            "socket {} route identity headers",
             self.socket_ordinal
         );
-        assert_eq!(
-            self.headers
-                .get("x-client-request-id")
-                .and_then(|value| value.to_str().ok()),
-            expected_session,
-            "socket {} x-client-request-id header",
-            self.socket_ordinal
-        );
+        match raw_session {
+            Some(raw_session) => {
+                let opaque = session_id.unwrap_or_else(|| {
+                    panic!("socket {} missing route identity", self.socket_ordinal)
+                });
+                assert_ne!(opaque, raw_session, "raw session leaked upstream");
+                assert!(!opaque.contains(raw_session), "raw session leaked upstream");
+            }
+            None => assert_eq!(session_id, None, "stateless request gained route identity"),
+        }
     }
 }
 
@@ -599,6 +606,11 @@ impl IdentityHeaders {
             ],
             upstream_session: None,
         }
+    }
+
+    fn stateless_upstream(mut self) -> Self {
+        self.upstream_session = None;
+        self
     }
 }
 
@@ -1345,7 +1357,7 @@ async fn auto_review_with_agent_headers_is_stateless() {
                 "messages": [{"role": "user", "content": review}],
                 "tools": []
             }),
-            headers.clone(),
+            headers.clone().stateless_upstream(),
             &review,
             &tagged(&case, "resp-review"),
             &tagged(&case, "review-reply"),

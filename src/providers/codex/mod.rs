@@ -2716,6 +2716,197 @@ mod tests {
         compaction::clear_all_compactions_for_tests();
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_correction_survives_route_rollover_and_stays_agent_scoped() {
+        let _read_guard = translate::read_rewrite::READ_REWRITE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_transport(config::CodexTransport::Http);
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "read-route-a".into(),
+                refresh: "read-refresh-a".into(),
+                expires: u64::MAX,
+                account_id: Some("read-account".into()),
+            });
+        let provider = CodexProvider::with_client(client);
+        let read_call = "call_read_after_rollover";
+        let first_response = upstream_sse(&[
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"function_call","call_id":read_call,"name":"Read"}
+            }),
+            serde_json::json!({
+                "type":"response.function_call_arguments.delta",
+                "output_index":0,
+                "delta":"{\"file_path\":\"/tmp/route-read\",\"offset\":1300007,\"limit\":20}"
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"function_call",
+                    "call_id":read_call,
+                    "name":"Read",
+                    "arguments":"{\"file_path\":\"/tmp/route-read\",\"offset\":1300007,\"limit\":20}"
+                }
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"resp_read_a","status":"completed","usage":{}}
+            }),
+        ]);
+        let success = upstream_sse(&[
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_read_done"}
+            }),
+            serde_json::json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "delta":"done"
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_read_done"}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"resp_read_done","status":"completed","usage":{}}
+            }),
+        ]);
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for response_body in [&first_response, &success, &success] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                captured.push(http_request_parts(&read_http_request(&mut socket).await));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(response_body).await.unwrap();
+            }
+            captured
+        });
+
+        let scope = |agent: &str, req_id: &str| {
+            let mut context = messages_test_context(req_id, Some("raw-shared-session"));
+            context.session_id = Some("raw-context-must-not-own-read-state".to_string());
+            ScopedRequestContext::new(
+                context,
+                RequestScope::from_conversation_identity(
+                    Some(ConversationIdentity::Agent(
+                        "raw-shared-session".to_string(),
+                        agent.to_string(),
+                    )),
+                    RequestPurpose::Conversation,
+                ),
+            )
+        };
+        let initial: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-5.4",
+            "max_tokens":256,
+            "stream":false,
+            "messages":[{"role":"user","content":"read the file"}]
+        }))
+        .unwrap();
+        let response = provider
+            .handle_messages_scoped(initial, scope("agent-a", "read-first"))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let downstream: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(downstream["content"][0]["name"], "Read");
+        assert!(downstream["content"][0]["input"].get("offset").is_none());
+
+        provider
+            .client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "read-route-b".into(),
+                refresh: "read-refresh-b".into(),
+                expires: u64::MAX,
+                account_id: Some("read-account".into()),
+            });
+        let result_request = || {
+            serde_json::from_value::<MessagesRequest>(serde_json::json!({
+                "model":"gpt-5.4",
+                "max_tokens":256,
+                "stream":false,
+                "messages":[
+                    {"role":"assistant","content":[{
+                        "type":"tool_use",
+                        "id":read_call,
+                        "name":"Read",
+                        "input":{"file_path":"/tmp/route-read","limit":20}
+                    }]},
+                    {"role":"user","content":[{
+                        "type":"tool_result",
+                        "tool_use_id":read_call,
+                        "content":[{"type":"text","text":"1\tcontent"}]
+                    }]}
+                ]
+            }))
+            .unwrap()
+        };
+        for (agent, req_id) in [("agent-a", "read-same-lane"), ("agent-b", "read-sibling")] {
+            let response = provider
+                .handle_messages_scoped(result_request(), scope(agent, req_id))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+
+        let captured = server.await.unwrap();
+        assert!(captured[0].0.contains("authorization: Bearer read-route-a"));
+        assert!(captured[1].0.contains("authorization: Bearer read-route-b"));
+        assert_ne!(
+            captured_header(&captured[0].0, "session_id"),
+            captured_header(&captured[1].0, "session_id")
+        );
+        let same_lane_output = captured[1].1["input"][1]["output"]
+            .as_str()
+            .expect("same-lane tool output");
+        assert!(same_lane_output.contains("Proxy Read offset note:"));
+        assert!(same_lane_output.contains("1300007"));
+        assert!(same_lane_output.contains("/tmp/route-read"));
+        let sibling_output = captured[2].1["input"][1]["output"]
+            .as_str()
+            .expect("sibling tool output");
+        assert!(!sibling_output.contains("Proxy Read offset note:"));
+        for (headers, _) in captured {
+            for raw in [
+                "raw-shared-session",
+                "raw-context-must-not-own-read-state",
+                "agent-a",
+                "agent-b",
+            ] {
+                assert!(!headers.contains(raw));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cancellation_during_auth_refresh_aborts_reserved_request_state() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;

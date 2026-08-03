@@ -243,6 +243,7 @@ impl OpaqueLane {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0)
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(value: &str) -> Option<Self> {
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(value)
@@ -487,17 +488,24 @@ mod tests {
             ]),
             RequestPurpose::Conversation,
         );
-        let codex = scope.provider_lane(LaneDomain::CodexConversation).unwrap();
+        let domains = [
+            LaneDomain::CodexConversation,
+            LaneDomain::CodexReadRewrite,
+            LaneDomain::KimiPromptCache,
+            LaneDomain::CursorToolBridge,
+        ];
+        let lanes = domains.map(|domain| scope.provider_lane(domain).unwrap());
         assert_eq!(
-            codex,
+            lanes[0],
             scope.provider_lane(LaneDomain::CodexConversation).unwrap()
         );
-        assert_ne!(
-            codex,
-            scope.provider_lane(LaneDomain::KimiPromptCache).unwrap()
-        );
-        assert!(!codex.encode().contains("session-a"));
-        assert!(!codex.encode().contains("agent-a"));
+        for (index, lane) in lanes.iter().enumerate() {
+            assert!(!lane.encode().contains("session-a"));
+            assert!(!lane.encode().contains("agent-a"));
+            for sibling in &lanes[index + 1..] {
+                assert_ne!(lane, sibling);
+            }
+        }
     }
 
     #[test]

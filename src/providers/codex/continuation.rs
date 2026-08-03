@@ -691,8 +691,10 @@ fn prompt_signature(body: &ResponsesRequest) -> String {
         Some(o) => o,
         None => return String::new(),
     };
-    let mut entries: Vec<(&String, &serde_json::Value)> =
-        obj.iter().filter(|(k, _)| *k != "input").collect();
+    let mut entries: Vec<(&String, &serde_json::Value)> = obj
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "input" | "prompt_cache_key"))
+        .collect();
     entries.sort_by_key(|(a, _)| *a);
     let mut sig = String::from("{");
     for (i, (key, val)) in entries.iter().enumerate() {
@@ -1105,6 +1107,25 @@ mod tests {
             Some("prompt_changed")
         );
         assert!(!has_continuation_for_owner_for_tests(&owner));
+    }
+
+    #[test]
+    fn route_owned_prompt_cache_key_does_not_break_append_only_detection() {
+        let _registry_guard = lock_registry();
+        let owner = agent_owner("session-a", "agent-a");
+        let first = request_with_input(
+            vec![input("one")],
+            Some(json!({"prompt_cache_key": "route-owned-key"})),
+        );
+        start_and_record(&owner, &first, "resp_1");
+
+        let appended = request_with_input(vec![input("one"), input("two")], None);
+        let reservation = continuation_candidate_for_owner(Some(&owner), &appended, true);
+        assert_eq!(
+            reservation.candidate().previous_response_id.as_deref(),
+            Some("resp_1")
+        );
+        assert_eq!(reservation.candidate().input_delta_count, 1);
     }
 
     #[test]

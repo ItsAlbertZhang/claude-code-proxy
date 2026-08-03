@@ -192,6 +192,22 @@ pub fn build_codex_headers(
     ctx: &RequestContext,
     use_responses_lite: bool,
 ) -> Result<http::HeaderMap, CodexError> {
+    let upstream_session_id = ctx.session_id.as_deref();
+    let window_id = upstream_session_id.map(|session_id| format!("{session_id}:0"));
+    build_codex_headers_for_session(
+        auth,
+        use_responses_lite,
+        upstream_session_id,
+        window_id.as_deref(),
+    )
+}
+
+fn build_codex_headers_for_session(
+    auth: &StoredAuth,
+    use_responses_lite: bool,
+    upstream_session_id: Option<&str>,
+    window_id: Option<&str>,
+) -> Result<http::HeaderMap, CodexError> {
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::CONTENT_TYPE,
@@ -232,16 +248,17 @@ pub fn build_codex_headers(
             header_value("ChatGPT-Account-Id", account_id)?,
         );
     }
-    if let Some(ref session_id) = ctx.session_id {
+    if let Some(session_id) = upstream_session_id {
         headers.insert("session_id", header_value("session_id", session_id)?);
         headers.insert(
             "x-client-request-id",
             header_value("x-client-request-id", session_id)?,
         );
-        let window_id = format!("{session_id}:0");
+    }
+    if let Some(window_id) = window_id {
         headers.insert(
             "x-codex-window-id",
-            header_value("x-codex-window-id", &window_id)?,
+            header_value("x-codex-window-id", window_id)?,
         );
     }
     let user_agent = config::codex_user_agent(&default_user_agent(use_responses_lite));
@@ -296,37 +313,21 @@ pub fn build_codex_search_headers(
     Ok(headers)
 }
 
-fn build_bound_codex_headers(
-    route: &CodexBoundRoute,
-    ctx: &RequestContext,
-) -> Result<http::HeaderMap, CodexError> {
-    let mut stateless = ctx.clone();
-    stateless.session_id = None;
-    let mut headers = build_codex_headers(
+fn build_bound_codex_headers(route: &CodexBoundRoute) -> Result<http::HeaderMap, CodexError> {
+    let conversation_key = route.conversation_key_encoded();
+    build_codex_headers_for_session(
         route.auth(),
-        &stateless,
         route.protocol().uses_responses_lite(),
-    )?;
-    if let Some(key) = route.conversation_key_encoded() {
-        headers.insert("session_id", header_value("session_id", &key)?);
-        headers.insert(
-            "x-client-request-id",
-            header_value("x-client-request-id", &key)?,
-        );
-        headers.insert(
-            "x-codex-window-id",
-            header_value("x-codex-window-id", &key)?,
-        );
-    }
-    Ok(headers)
+        conversation_key.as_deref(),
+        conversation_key.as_deref(),
+    )
 }
 
 fn build_bound_native_codex_headers(
     route: &CodexBoundRoute,
-    ctx: &RequestContext,
     stream: bool,
 ) -> Result<http::HeaderMap, CodexError> {
-    let mut headers = build_bound_codex_headers(route, ctx)?;
+    let mut headers = build_bound_codex_headers(route)?;
     headers.insert(
         http::header::ACCEPT,
         header_value(
@@ -343,12 +344,11 @@ fn build_bound_native_codex_headers(
 
 fn build_bound_codex_search_headers(
     route: &CodexBoundRoute,
-    ctx: &RequestContext,
 ) -> Result<http::HeaderMap, CodexError> {
     route
         .validate_protocol(ProtocolLane::ResponsesFull)
         .map_err(protocol_error)?;
-    let mut headers = build_bound_codex_headers(route, ctx)?;
+    let mut headers = build_bound_codex_headers(route)?;
     headers.insert(
         http::header::ACCEPT,
         header_value("accept", "application/json")?,
@@ -1146,7 +1146,7 @@ impl CodexHttpClient {
             retry_after: None,
             origin: CodexErrorOrigin::Http,
         })?;
-        let headers = build_bound_native_codex_headers(route, ctx, stream)?;
+        let headers = build_bound_native_codex_headers(route, stream)?;
         let started_at = Instant::now();
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_codex_http_request_capture(
@@ -1474,7 +1474,7 @@ impl CodexHttpClient {
                         .map(|response| OwnerAwareCodexResponse::new(response, None))
                 }
                 CodexTransport::WebSocket => {
-                    let ws_headers = build_bound_codex_headers(&route, ctx)?;
+                    let ws_headers = build_bound_codex_headers(&route)?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(
                         body,
@@ -1498,7 +1498,7 @@ impl CodexHttpClient {
                     .await
                 }
                 CodexTransport::Auto => {
-                    let ws_headers = build_bound_codex_headers(&route, ctx)?;
+                    let ws_headers = build_bound_codex_headers(&route)?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(
                         body,
@@ -1924,7 +1924,7 @@ impl CodexHttpClient {
 
         'attempt: loop {
             socket_id_publisher.publish(None);
-            let ws_headers = match build_bound_codex_headers(&route, &ctx) {
+            let ws_headers = match build_bound_codex_headers(&route) {
                 Ok(headers) => super::websocket::codex_websocket_headers(&headers),
                 Err(err) => {
                     if tx.send(Err(err)).await.is_err() {
@@ -2183,7 +2183,7 @@ impl CodexHttpClient {
         body_json: &str,
         ctx: &RequestContext,
     ) -> Result<CodexResponse, CodexError> {
-        let headers = build_bound_codex_headers(route, ctx)?;
+        let headers = build_bound_codex_headers(route)?;
         self.attempt_post_http_at(
             route.canonical_endpoint().as_str(),
             &headers,
@@ -2317,7 +2317,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
     ) -> Result<CodexResponse, CodexError> {
         let url = search_endpoint(route.canonical_endpoint().as_str());
-        let headers = build_bound_codex_search_headers(route, ctx)?;
+        let headers = build_bound_codex_search_headers(route)?;
         self.attempt_post_search_at(&url, &headers, body_json, ctx)
             .await
     }
@@ -3016,7 +3016,7 @@ mod tests {
         .unwrap();
         let mut context = http_test_context();
         context.session_id = Some("legacy-raw-session".to_string());
-        let headers = build_bound_codex_headers(&route, &context).unwrap();
+        let headers = build_bound_codex_headers(&route).unwrap();
         let expected = route.conversation_key_encoded().unwrap();
 
         for name in ["session_id", "x-client-request-id", "x-codex-window-id"] {

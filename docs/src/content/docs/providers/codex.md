@@ -26,11 +26,11 @@ Append `-fast` to any registered Codex model to request `service_tier: "priority
 
 ## Responses lanes and parallel tool calls
 
-Translated `/v1/messages` and `/v1/messages/count_tokens` requests use the Responses Lite lane for the GPT-5.6 family by default. Lite requires `parallel_tool_calls: false`, so independent Claude Code tools may need separate assistant turns.
+Translated `/v1/messages` requests use the Responses Lite lane for the GPT-5.6 family by default; local `/v1/messages/count_tokens` applies the same request shape without calling upstream. Lite requires `parallel_tool_calls: false`, so independent Claude Code tools may need separate assistant turns.
 
-Set `CCP_CODEX_FULL_LANE=1` or `codex.fullLane: true` to route `gpt-5.6-sol` and `gpt-5.6-terra` through the full Responses lane, where parallel tool calls remain enabled. `gpt-5.6-luna` always stays on Lite because it is not available on the full lane. Hosted web search still selects the full lane and upgrades Luna to Sol when necessary. Forced Claude web-search subrequests continue using the standalone `/alpha/search` endpoint and ignore this option.
+Set `CCP_CODEX_FULL_LANE=1` or `codex.fullLane: true` to route translated `gpt-5.6-sol` and `gpt-5.6-terra` Messages through the full Responses lane, where parallel tool calls remain enabled. `gpt-5.6-luna` always stays on Lite because it is not available on the full lane. Hosted web search always uses full Responses and upgrades Luna to Sol. Forced Claude web-search subrequests use the standalone full-lane `/alpha/search` route and ignore this option.
 
-This option affects only Anthropic Messages translation and its token-count shape. Native `/v1/responses` and `/v1/chat/completions` requests retain their existing lane behavior. The full-lane contract is specific to the default ChatGPT backend; custom `CCP_CODEX_BASE_URL` endpoints may not support it.
+The option affects only Anthropic Messages translation and its local token-count shape. Native `/v1/responses` and `/v1/chat/completions` ignore it: GPT-5.6 Luna, Sol, and Terra use Lite there, while other registered Codex models use full Responses. Native hosted search still requires full Responses and upgrades Luna to Sol. Each lane is part of the immutable route identity, so state from Lite is never reused on Full or vice versa. Custom `CCP_CODEX_BASE_URL` endpoints may not implement the same contracts.
 
 ## Reasoning
 
@@ -40,7 +40,7 @@ When reasoning is enabled, the proxy requests an automatic reasoning summary and
 
 Claude Code summary compaction requests are capped at low effort by default because they perform extraction over a large transcript. `CCP_COMPACT_EFFORT=off` disables the cap, `none` removes reasoning, and another valid effort sets a different maximum. The cap never raises effort.
 
-`CCP_AUTO_REVIEW_EFFORT` or the top-level `autoReviewEffort` key can replace the ordinary request effort for detected auto-review classifier requests before provider dispatch. Both are disabled by default; the environment setting takes precedence, and `off` explicitly disables a file-configured value. When the final provider is Codex, this more-specific value bypasses `CCP_CODEX_EFFORT` and `codex.effort`, while the normal request-effort validation and compaction cap still apply. See [Configuration](/reference/configuration/) for the provider-neutral routing behavior.
+`CCP_AUTO_REVIEW_EFFORT` or the top-level `autoReviewEffort` key can replace the ordinary request effort for detected auto-review classifier requests before provider dispatch. Detection remains limited to non-streaming requests with no non-empty `tools` array and at least one system text block beginning `You are a security monitor for autonomous AI coding agents.` Both settings are disabled by default; the environment setting takes precedence, and `off` explicitly disables a file-configured value. When the final provider is Codex, this more-specific value bypasses `CCP_CODEX_EFFORT` and `codex.effort`, while the normal request-effort validation and compaction cap still apply. The classifier request is stateless whether or not its model or effort changes: it cannot consume or mutate affinity, sequence, continuation, WebSocket, compaction, Kimi, Cursor, or `Read` state. See [Configuration](/reference/configuration/) for the provider-neutral routing behavior.
 
 ## Tools and multimodal input
 
@@ -64,11 +64,15 @@ WebSocket is the default transport. Set `CCP_CODEX_TRANSPORT=http` for HTTP SSE,
 
 WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `wss://` endpoint, `ALL_PROXY` as a fallback, and `NO_PROXY` exclusions. A normal HTTP proxy can therefore carry the default WebSocket connection with CONNECT; TUN mode is not required. Set proxy variables before starting the process and restart after changing them. For example, setting `HTTPS_PROXY` to `http://127.0.0.1:7890` sends HTTPS/WSS destinations through the HTTP proxy at port 7890; it does not require an `https://` proxy URL.
 
-`CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables append-only WebSocket continuation. A valid identity containing only a Claude Code session ID owns the Main continuation for that session. Each valid direct Agent ID owns an independent continuation and reusable WebSocket within the same session. Nested Agents are keyed by their direct child ID; the parent ID is validated but does not become part of the owner key. The proxy sends `previous_response_id` only when the translated request shape and transcript extension are safe, and only on the exact live WebSocket that produced that response.
+`CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables append-only WebSocket continuation for translated Anthropic Messages. A valid identity containing only a Claude Code session ID owns Main. Each valid direct Agent ID owns an independent continuation and reusable WebSocket within the same session; a nested Agent is keyed by its direct child ID, while the validated parent is lineage only. Raw identity values are converted into separate opaque conversation, `Read`, Kimi, and Cursor lanes before provider state or upstream identifiers are formed. Codex sends `previous_response_id` only when the translated request shape and transcript extension are safe, and only on the exact live WebSocket that produced that response.
 
-An absent, malformed, or ambiguous identity does not reject the HTTP request; that request proceeds without continuation or WebSocket reuse. If the originating socket is missing, dead, or has been replaced, the proxy retries once with the full translated input and without the stale response ID. Continuation and connection state is held only in memory and is lost when the proxy restarts.
+An absent, malformed, or ambiguous identity does not reject the HTTP request; it makes that request stateless. If the originating continuation socket is missing, dead, or replaced, Codex retries once with the complete translated input and no stale response ID. Continuation, socket, route, compaction, and correction state is memory-only, bounded, and lost on restart.
 
-Detected auto-review classifier subrequests are intentionally stateless even when valid session and Agent headers are present. They neither consume nor publish continuation or WebSocket ownership.
+Every conversational Codex request binds one immutable endpoint, known account, credential, and Full/Lite route before selecting state or transport. If route A receives a 401 before downstream semantic output, the proxy can rebuild the complete attempt exactly once as route B only when the replacement has the same known account, changed credentials, and all replayable request context. An unchanged credential, an unknown or changed account, or route B's 401 returns the current 401; there is no route C. Refreshed credentials can still serve a later request.
+
+After any semantic output is published, the proxy never replays the request. The Anthropic live adapter preserves already-published content and terminates with a sanitized Anthropic authentication error rather than forwarding a raw Codex failure frame. A native `/v1/responses` request carrying caller-supplied `previous_response_id` is also never replayed after a header 401 because the proxy cannot reconstruct that upstream state. Native JSON or SSE unauthorized failures discovered in an HTTP 200 body preserve the original status, bytes, and framing; they may refresh credentials for the next request only, with no current-request replay.
+
+Detected auto-review classifier subrequests are intentionally stateless even when valid session and Agent headers are present. They neither consume nor publish continuation, WebSocket, affinity, sequence, compaction, Kimi, Cursor, or `Read` state.
 
 ## Server compaction
 
@@ -82,7 +86,7 @@ This is most useful for long coding sessions where continuity after `/compact` o
 
 1. Claude Code reaches a manual or automatic compaction boundary.
 2. The proxy sends the translated conversation to Codex with a trailing `compaction_trigger`.
-3. Codex returns an encrypted `compaction` item, which the proxy keeps in memory for that Claude Code session, model, and Responses lane.
+3. Codex returns an encrypted `compaction` item, which the proxy keeps in memory for the exact Main or direct-Agent owner, Codex model, immutable account/credential route, and Responses lane.
 4. Claude Code completes its normal summary request. The proxy uses the resulting summary as an exact anchor.
 5. On subsequent matching turns, the proxy replaces the portable summary with the encrypted item, retained recent context, and post-compaction messages.
 
@@ -108,7 +112,9 @@ CCP_CODEX_SERVER_COMPACTION=1 claude-code-proxy serve
 
 ### Fallbacks and visibility
 
-Replay requires the same Claude Code session, Codex model, and Responses lane with append-only history. A branch, proxy restart, provider, model, or lane change, malformed response, upstream failure, memory limit, or 30 minutes without matching activity discards the native state and uses Claude Code's portable summary instead.
+Replay requires the same Main or direct-Agent owner, Codex model, account/credential route, and Responses lane with append-only history. A branch, proxy restart, provider, model, credential, account, or lane change, malformed response, upstream failure, memory limit, or 30 minutes without matching activity discards the native state and uses Claude Code's portable summary instead. Concurrent compaction attempts for one owner are fenced so an older result cannot overwrite a newer boundary.
+
+Native compaction retains at most 1,000 entries, 4 MiB per entry, and 20,000,000 bytes across the registry. Continuation and WebSocket owners expire after 30 idle minutes and cap at 10,000 entries each; continuation transcripts cap at 2 MB per owner and 20 MB total. Reaching a bound evicts or declines native state without making the portable Claude Code history unusable.
 
 While the native request is active, the monitor shows `compacting`. Structured log events named `server_compaction_triggered`, `server_compaction_completed`, and `server_compaction_failed` report each attempt and outcome.
 
@@ -116,7 +122,7 @@ While the native request is active, the monitor shows `compacting`. Structured l
 
 `CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, and Cursor models.
 
-The Responses route preserves native JSON or SSE response bodies for registered Codex models. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. Its omitted reasoning effort defaults to `medium`; the proxy-wide Codex effort override still takes precedence.
+The Responses route preserves native JSON or SSE response bodies for registered Codex models. Caller-supplied native `previous_response_id` passes through, but makes a header-401 attempt non-replayable because the proxy does not own that upstream chain. Unauthorized errors encoded inside an HTTP 200 JSON body or SSE stream also are not replayed: their status, bytes, and framing are returned unchanged, and refreshed credentials apply only to a later request. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. Its omitted reasoning effort defaults to `medium`; the proxy-wide Codex effort override still takes precedence.
 
 The proxy replaces incoming credentials with stored Codex auth for both routes. Response retrieval or deletion, function calling through Chat Completions, and WebSocket ingress are outside their scope. See [HTTP API](/reference/http-api/) for supported Chat Completions fields and error behavior.
 
