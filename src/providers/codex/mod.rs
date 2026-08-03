@@ -21,7 +21,9 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::StatusCode;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};

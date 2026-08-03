@@ -2811,18 +2811,6 @@ impl CodexHttpClient {
         }
     }
 
-    async fn start_post_http(
-        &self,
-        auth: &StoredAuth,
-        body_json: &str,
-        ctx: &RequestContext,
-        use_responses_lite: bool,
-    ) -> Result<(reqwest::Response, Instant), CodexError> {
-        let headers = build_codex_headers(auth, ctx, use_responses_lite)?;
-        self.start_post_http_at(&self.base_url, &headers, body_json, ctx)
-            .await
-    }
-
     async fn start_post_http_bound(
         &self,
         route: &CodexBoundRoute,
