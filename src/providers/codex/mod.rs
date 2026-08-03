@@ -1636,6 +1636,11 @@ fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
+    if err.origin == client::CodexErrorOrigin::Http {
+        // The HTTP event stream owns its bounded retry budget. Retrying the
+        // exhausted error here would multiply attempts across both layers.
+        return false;
+    }
     if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
         if err.detail.as_deref() == Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
             return false;
@@ -3330,6 +3335,19 @@ mod tests {
             detail: Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
             retry_after: None,
             origin: client::CodexErrorOrigin::WebSocketHandshake,
+        };
+
+        assert!(!retryable_live_start_codex_error(&err));
+    }
+
+    #[test]
+    fn exhausted_http_stream_error_is_not_retried_by_provider() {
+        let err = client::CodexError {
+            status: 503,
+            message: "Codex HTTP stream exhausted its retry budget".to_string(),
+            detail: Some("http_response_body".to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::Http,
         };
 
         assert!(!retryable_live_start_codex_error(&err));
