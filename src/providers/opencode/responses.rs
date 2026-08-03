@@ -8,9 +8,10 @@ use futures_util::StreamExt;
 use crate::anthropic::schema::MessagesRequest;
 use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
 use crate::providers::codex::translate::{
-    live_stream::LiveStreamTranslator, request::translate_openai_compatible_request,
+    live_stream::LiveStreamTranslator, request::translate_openai_compatible_request_scoped,
 };
 use crate::providers::grok::translate::stream::SseDecoder;
+use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use super::client::{OpenCodeError, OpenCodeResponse};
@@ -20,7 +21,23 @@ pub fn prepare_request(
     model: &str,
     session_id: Option<String>,
 ) -> anyhow::Result<serde_json::Value> {
-    let translated = translate_openai_compatible_request(body, model.to_string(), session_id)?;
+    let lane = RequestScope::legacy(session_id.as_deref(), RequestPurpose::Conversation)
+        .provider_lane(LaneDomain::OpenCodeResponses);
+    prepare_request_scoped(body, model, lane)
+}
+
+pub(crate) fn prepare_request_scoped(
+    body: &MessagesRequest,
+    model: &str,
+    lane: Option<OpaqueLane>,
+) -> anyhow::Result<serde_json::Value> {
+    let prompt_cache_key = lane.as_ref().map(OpaqueLane::encode);
+    let translated = translate_openai_compatible_request_scoped(
+        body,
+        model.to_string(),
+        prompt_cache_key,
+        lane,
+    )?;
     let mut value = serde_json::to_value(translated)?;
     if let Some(max_tokens) = body.max_tokens.filter(|value| *value > 0) {
         value["max_output_tokens"] = serde_json::json!(max_tokens);
@@ -293,9 +310,70 @@ mod tests {
         assert_eq!(translated["max_output_tokens"], 2048);
         assert_eq!(translated["reasoning"]["effort"], "xhigh");
         assert_eq!(translated["reasoning"]["summary"], "auto");
-        assert_eq!(translated["prompt_cache_key"], "session-1");
+        let expected_key = RequestScope::legacy(Some("session-1"), RequestPurpose::Conversation)
+            .provider_lane(LaneDomain::OpenCodeResponses)
+            .unwrap()
+            .encode();
+        assert_eq!(translated["prompt_cache_key"], expected_key);
+        assert!(!expected_key.contains("session-1"));
         assert!(translated.get("service_tier").is_none());
         assert!(translated.get("client_metadata").is_none());
+    }
+
+    #[test]
+    fn opencode_responses_uses_opaque_distinct_sibling_prompt_cache_keys() {
+        let body: MessagesRequest = serde_json::from_value(json!({
+            "model":"opencode-go/gpt-5.6-luna",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let lane = |agent: &str| {
+            RequestScope::from_conversation_identity(
+                Some(crate::request_identity::ConversationIdentity::Agent(
+                    "shared-session".into(),
+                    agent.into(),
+                )),
+                RequestPurpose::Conversation,
+            )
+            .provider_lane(LaneDomain::OpenCodeResponses)
+            .unwrap()
+        };
+        let first = prepare_request_scoped(&body, "gpt-5.6-luna", Some(lane("agent-one"))).unwrap();
+        let second =
+            prepare_request_scoped(&body, "gpt-5.6-luna", Some(lane("agent-two"))).unwrap();
+        let first_key = first["prompt_cache_key"].as_str().unwrap();
+        let second_key = second["prompt_cache_key"].as_str().unwrap();
+        assert_ne!(first_key, second_key);
+        assert!(!first_key.contains("shared-session"));
+        assert!(!first_key.contains("agent-one"));
+        assert!(!second_key.contains("agent-two"));
+    }
+
+    #[test]
+    fn opencode_malformed_and_auxiliary_identity_is_stateless() {
+        let malformed = RequestScope::from_conversation_identity(
+            Some(crate::request_identity::ConversationIdentity::Agent(
+                "shared-session".into(),
+                " \n".into(),
+            )),
+            RequestPurpose::Conversation,
+        );
+        let auxiliary = RequestScope::from_conversation_identity(
+            Some(crate::request_identity::ConversationIdentity::Main(
+                "shared-session".into(),
+            )),
+            RequestPurpose::Auxiliary,
+        );
+        assert!(
+            malformed
+                .provider_lane(LaneDomain::OpenCodeResponses)
+                .is_none()
+        );
+        assert!(
+            auxiliary
+                .provider_lane(LaneDomain::OpenCodeResponses)
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -20,11 +20,14 @@ use crate::anthropic::{
 };
 use crate::provider::{
     CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
-    RequestContext,
+    RequestContext, compatible_explicit_identity,
 };
 use crate::providers::{
     codex::translate::accumulate::accumulate_response as accumulate_responses_response,
     kimi::count_tokens,
+};
+use crate::request_identity::{
+    ConversationIdentity, LaneDomain, OpaqueLane, RequestPurpose, RequestScope,
 };
 
 use self::client::{OpenCodeClient, OpenCodeError};
@@ -69,6 +72,7 @@ impl OpenCodeProvider {
         &self,
         body: MessagesRequest,
         ctx: RequestContext,
+        responses_lane: Option<OpaqueLane>,
     ) -> Response {
         let requested = body.model.as_deref().unwrap_or_default();
         let Some(spec) = model::resolve(requested) else {
@@ -132,7 +136,7 @@ impl OpenCodeProvider {
             }
             EndpointKind::Responses => {
                 let translated =
-                    match responses::prepare_request(&body, spec.id, ctx.session_id.clone()) {
+                    match responses::prepare_request_scoped(&body, spec.id, responses_lane) {
                         Ok(translated) => translated,
                         Err(error) => return invalid_request_response(error),
                     };
@@ -162,67 +166,12 @@ impl OpenCodeProvider {
         update_buffered_usage(&ctx, &value);
         (StatusCode::OK, Json(value)).into_response()
     }
-}
 
-impl Default for OpenCodeProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn advertised_models() -> Vec<String> {
-    model::advertised_models()
-}
-
-#[async_trait]
-impl Provider for OpenCodeProvider {
-    fn name(&self) -> &'static str {
-        "opencode"
-    }
-
-    fn supported_models(&self) -> Vec<String> {
-        advertised_models()
-    }
-
-    fn cli(&self) -> &'static dyn CliHandlers {
-        &OPENCODE_CLI
-    }
-
-    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        if !body.stream {
-            return self.buffered_messages_response(body, ctx).await;
-        }
-        match self.generate_anthropic_stream(body, ctx).await {
-            Ok(generation) => sse_response(generation.body),
-            Err(error) => map_provider_error(error),
-        }
-    }
-
-    async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let requested = body.model.as_deref().unwrap_or_default();
-        let Some(spec) = model::resolve(requested) else {
-            return unsupported_model(requested);
-        };
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, spec.id);
-        }
-        let tokens = count_tokens::count_tokens(&body);
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.usage_updated(&ctx.req_id, Some(tokens), None);
-        }
-        (
-            StatusCode::OK,
-            Json(CountTokensResponse {
-                input_tokens: tokens,
-            }),
-        )
-            .into_response()
-    }
-
-    async fn generate_anthropic_stream(
+    async fn generate_anthropic_stream_with_lane(
         &self,
         mut body: MessagesRequest,
         ctx: RequestContext,
+        responses_lane: Option<OpaqueLane>,
     ) -> Result<Generation, ProviderError> {
         body.stream = true;
         let requested = body.model.as_deref().unwrap_or_default();
@@ -278,7 +227,7 @@ impl Provider for OpenCodeProvider {
                 )
             }
             EndpointKind::Responses => {
-                let translated = responses::prepare_request(&body, spec.id, ctx.session_id.clone())
+                let translated = responses::prepare_request_scoped(&body, spec.id, responses_lane)
                     .map_err(invalid_request_provider_error)?;
                 let upstream = client
                     .post(spec.endpoint, &translated, true, ctx.traffic.clone())
@@ -299,6 +248,122 @@ impl Provider for OpenCodeProvider {
             body: GenerationBody::LiveSse(body),
             resolved_model: spec.id.to_string(),
         })
+    }
+}
+
+impl Default for OpenCodeProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn advertised_models() -> Vec<String> {
+    model::advertised_models()
+}
+
+#[async_trait]
+impl Provider for OpenCodeProvider {
+    fn name(&self) -> &'static str {
+        "opencode"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        advertised_models()
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &OPENCODE_CLI
+    }
+
+    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        let responses_lane =
+            RequestScope::legacy(ctx.session_id.as_deref(), RequestPurpose::Conversation)
+                .provider_lane(LaneDomain::OpenCodeResponses);
+        if !body.stream {
+            return self
+                .buffered_messages_response(body, ctx, responses_lane)
+                .await;
+        }
+        match self
+            .generate_anthropic_stream_with_lane(body, ctx, responses_lane)
+            .await
+        {
+            Ok(generation) => sse_response(generation.body),
+            Err(error) => map_provider_error(error),
+        }
+    }
+
+    async fn handle_messages_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Response {
+        let responses_lane = RequestScope::from_conversation_identity(
+            compatible_explicit_identity(&ctx, conversation_identity),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::OpenCodeResponses);
+        if !body.stream {
+            return self
+                .buffered_messages_response(body, ctx, responses_lane)
+                .await;
+        }
+        match self
+            .generate_anthropic_stream_with_lane(body, ctx, responses_lane)
+            .await
+        {
+            Ok(generation) => sse_response(generation.body),
+            Err(error) => map_provider_error(error),
+        }
+    }
+
+    async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        let requested = body.model.as_deref().unwrap_or_default();
+        let Some(spec) = model::resolve(requested) else {
+            return unsupported_model(requested);
+        };
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.model_resolved(&ctx.req_id, spec.id);
+        }
+        let tokens = count_tokens::count_tokens(&body);
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.usage_updated(&ctx.req_id, Some(tokens), None);
+        }
+        (
+            StatusCode::OK,
+            Json(CountTokensResponse {
+                input_tokens: tokens,
+            }),
+        )
+            .into_response()
+    }
+
+    async fn generate_anthropic_stream(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+    ) -> Result<Generation, ProviderError> {
+        let responses_lane =
+            RequestScope::legacy(ctx.session_id.as_deref(), RequestPurpose::Conversation)
+                .provider_lane(LaneDomain::OpenCodeResponses);
+        self.generate_anthropic_stream_with_lane(body, ctx, responses_lane)
+            .await
+    }
+
+    async fn generate_anthropic_stream_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Result<Generation, ProviderError> {
+        let responses_lane = RequestScope::from_conversation_identity(
+            compatible_explicit_identity(&ctx, conversation_identity),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::OpenCodeResponses);
+        self.generate_anthropic_stream_with_lane(body, ctx, responses_lane)
+            .await
     }
 }
 
