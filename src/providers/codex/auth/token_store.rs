@@ -41,6 +41,14 @@ impl<S: AuthStorage<StoredAuth>> CodexTokenStore<S> {
         self.store.clear()
     }
 
+    pub fn compare_and_swap_auth(
+        &self,
+        expected: Option<&StoredAuth>,
+        replacement: Option<StoredAuth>,
+    ) -> Result<bool, anyhow::Error> {
+        self.store.compare_and_swap(expected, replacement)
+    }
+
     pub fn auth_path(&self) -> String {
         self.store.path()
     }

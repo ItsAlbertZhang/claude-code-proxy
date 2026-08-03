@@ -147,7 +147,7 @@ impl Provider for IdentityCaptureProvider {
 }
 
 struct OpenAiIdentityCaptureProvider {
-    captured: Arc<Mutex<Vec<Option<String>>>>,
+    captured: Arc<Mutex<Vec<CapturedIdentity>>>,
 }
 
 #[async_trait]
@@ -183,9 +183,8 @@ impl Provider for OpenAiIdentityCaptureProvider {
     async fn generate_anthropic_stream(
         &self,
         body: MessagesRequest,
-        ctx: RequestContext,
+        _ctx: RequestContext,
     ) -> Result<Generation, ProviderError> {
-        self.captured.lock().unwrap().push(ctx.session_id);
         let model = body.model.unwrap_or_else(|| "kimi-k2.6".to_string());
         let sse = format!(
             "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_identity\",\"model\":{model:?},\"usage\":{{\"input_tokens\":1}}}}}}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"ok\"}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
@@ -194,6 +193,18 @@ impl Provider for OpenAiIdentityCaptureProvider {
             body: GenerationBody::BufferedSse(sse.into()),
             resolved_model: model,
         })
+    }
+    async fn generate_anthropic_stream_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        identity: Option<ConversationIdentity>,
+    ) -> Result<Generation, ProviderError> {
+        self.captured
+            .lock()
+            .unwrap()
+            .push((identity, ctx.session_id.clone()));
+        self.generate_anthropic_stream(body, ctx).await
     }
 }
 
@@ -373,6 +384,14 @@ async fn openai_ingress_restores_legacy_identity_without_bypassing_claude_valida
             ("session_id", "ignored-legacy"),
         ],
         vec![
+            ("x-claude-code-session-id", "shared-session"),
+            ("x-claude-code-agent-id", "agent-a"),
+        ],
+        vec![
+            ("x-claude-code-session-id", "shared-session"),
+            ("x-claude-code-agent-id", "agent-b"),
+        ],
+        vec![
             ("x-claude-code-session-id", "claude-session"),
             ("x-claude-code-agent-id", "malformed agent"),
             ("session_id", "suppressed-legacy"),
@@ -391,11 +410,34 @@ async fn openai_ingress_restores_legacy_identity_without_bypassing_claude_valida
     assert_eq!(
         *captured.lock().unwrap(),
         vec![
-            Some("legacy-session".to_string()),
-            Some("legacy-request".to_string()),
-            Some("claude-session".to_string()),
-            None,
-            None,
+            (
+                Some(ConversationIdentity::Main("legacy-session".to_string())),
+                Some("legacy-session".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Main("legacy-request".to_string())),
+                Some("legacy-request".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Main("claude-session".to_string())),
+                Some("claude-session".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Agent(
+                    "shared-session".to_string(),
+                    "agent-a".to_string(),
+                )),
+                Some("shared-session".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Agent(
+                    "shared-session".to_string(),
+                    "agent-b".to_string(),
+                )),
+                Some("shared-session".to_string()),
+            ),
+            (None, None),
+            (None, None),
         ]
     );
 }

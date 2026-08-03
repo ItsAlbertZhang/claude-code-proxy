@@ -4,8 +4,10 @@ use std::time::{Duration, Instant};
 use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
-use crate::provider::RequestContext;
-use crate::request_identity::{ConversationIdentity, OpaqueLane};
+use crate::provider::{RequestContext, legacy_scope};
+#[cfg(test)]
+use crate::request_identity::ConversationIdentity;
+use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose};
 use crate::retry::{compute_backoff_delay, should_retry_status, sleep};
 use crate::traffic::TrafficCapture;
 
@@ -141,6 +143,24 @@ impl CodexError {
             origin: CodexErrorOrigin::Http,
         }
     }
+
+    pub(crate) fn is_replayable_auth_rejection(&self) -> bool {
+        self.status == 401
+            && matches!(
+                self.origin,
+                CodexErrorOrigin::Http
+                    | CodexErrorOrigin::WebSocket
+                    | CodexErrorOrigin::WebSocketHandshake
+            )
+    }
+
+    pub(crate) fn is_in_band_auth_rejection(&self) -> bool {
+        self.status == 401
+            && matches!(
+                self.origin,
+                CodexErrorOrigin::BufferedHttp | CodexErrorOrigin::BufferedWebSocket
+            )
+    }
 }
 
 impl std::fmt::Display for CodexError {
@@ -187,17 +207,27 @@ fn default_user_agent(use_responses_lite: bool) -> String {
     }
 }
 
+fn legacy_codex_lane(ctx: &RequestContext) -> Option<OpaqueLane> {
+    legacy_scope(ctx, RequestPurpose::Conversation).provider_lane(LaneDomain::CodexConversation)
+}
+
+fn legacy_upstream_session_id(ctx: &RequestContext) -> Option<String> {
+    legacy_codex_lane(ctx).map(|lane| lane.encode())
+}
+
 pub fn build_codex_headers(
     auth: &StoredAuth,
     ctx: &RequestContext,
     use_responses_lite: bool,
 ) -> Result<http::HeaderMap, CodexError> {
-    let upstream_session_id = ctx.session_id.as_deref();
-    let window_id = upstream_session_id.map(|session_id| format!("{session_id}:0"));
+    let upstream_session_id = legacy_upstream_session_id(ctx);
+    let window_id = upstream_session_id
+        .as_deref()
+        .map(|session_id| format!("{session_id}:0"));
     build_codex_headers_for_session(
         auth,
         use_responses_lite,
-        upstream_session_id,
+        upstream_session_id.as_deref(),
         window_id.as_deref(),
     )
 }
@@ -392,10 +422,10 @@ pub fn build_codex_image_headers(
             header_value("ChatGPT-Account-Id", account_id)?,
         );
     }
-    if let Some(session_id) = ctx.session_id.as_deref() {
+    if let Some(session_id) = legacy_upstream_session_id(ctx) {
         headers.insert(
             "x-client-request-id",
-            header_value("x-client-request-id", session_id)?,
+            header_value("x-client-request-id", &session_id)?,
         );
     }
     let user_agent = config::codex_user_agent(&default_user_agent(false));
@@ -428,10 +458,10 @@ pub fn build_codex_transcription_headers(
             header_value("ChatGPT-Account-Id", account_id)?,
         );
     }
-    if let Some(session_id) = ctx.session_id.as_deref() {
+    if let Some(session_id) = legacy_upstream_session_id(ctx) {
         headers.insert(
             "x-client-request-id",
-            header_value("x-client-request-id", session_id)?,
+            header_value("x-client-request-id", &session_id)?,
         );
     }
     let user_agent = config::codex_user_agent(&default_user_agent(false));
@@ -1106,22 +1136,32 @@ impl CodexHttpClient {
         stream: bool,
     ) -> Result<reqwest::Response, CodexError> {
         let protocol = ProtocolLane::from_uses_responses_lite(use_responses_lite);
-        let mut route = self.bind_conversation_route(None, protocol).await?;
+        let mut route = self
+            .bind_conversation_route(legacy_codex_lane(ctx), protocol)
+            .await?;
+        let caller_owns_continuation = body
+            .get("previous_response_id")
+            .is_some_and(|value| !value.is_null());
         let mut refresh_attempted = false;
 
         loop {
             let response = self
                 .post_native_responses_bound(&route, body, ctx, use_responses_lite, stream)
                 .await?;
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && !caller_owns_continuation
+                && !refresh_attempted
+            {
                 refresh_attempted = true;
-                drop(response);
-                let auth = self
-                    .auth_manager
-                    .force_refresh(&route.auth().access)
+                let Some(next_route) = self
+                    .refresh_conversation_route_after_rejection(&route)
                     .await
-                    .map_err(auth_refresh_error)?;
-                route = self.bind_route_with_auth(auth, protocol, None)?;
+                    .into_route()
+                else {
+                    return Ok(response);
+                };
+                drop(response);
+                route = next_route;
                 continue;
             }
             return Ok(response);
@@ -1334,6 +1374,7 @@ impl CodexHttpClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn post_search_bound(
         &self,
         route: &CodexBoundRoute,
@@ -1404,7 +1445,7 @@ impl CodexHttpClient {
     ) -> Result<OwnerAwareCodexResponse, CodexError> {
         let route = self
             .bind_conversation_route(
-                None,
+                legacy_codex_lane(ctx),
                 ProtocolLane::from_uses_responses_lite(request_uses_responses_lite(body)),
             )
             .await?;
@@ -1574,8 +1615,7 @@ impl CodexHttpClient {
                     .flatten()
                     .map(|failure| (failure, response.transport, response.socket_id))
             });
-            if (buffered_unauthorized.is_some()
-                || should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport))
+            if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport)
                 && !auth_refresh_attempted
             {
                 auth_refresh_attempted = true;
@@ -1847,7 +1887,7 @@ impl CodexHttpClient {
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let route = self
             .bind_conversation_route(
-                None,
+                legacy_codex_lane(ctx),
                 ProtocolLane::from_uses_responses_lite(request_uses_responses_lite(body)),
             )
             .await?;
@@ -1971,43 +2011,27 @@ impl CodexHttpClient {
                         && !forwarded_any => {
                         auth_refresh_attempted = true;
                         invalidate_live_continuation_pool(continuation.as_ref());
-                        let refresh = self.auth_manager.force_refresh(&route.auth().access);
-                        route = match refresh.await {
-                            Ok(auth) => {
-                                if tx.is_closed() {
-                                    abort_abandoned_live_continuation(
-                                        continuation.as_ref(),
-                                        &socket_id_publisher,
-                                    );
-                                    return;
-                                }
-                                match self.bind_route_with_auth(
-                                    auth,
-                                    route.protocol(),
-                                    route.lane(),
-                                ) {
-                                    Ok(route) => route,
-                                    Err(error) => {
-                                        if tx.send(Err(error)).await.is_err() {
-                                            abort_abandoned_live_continuation(
-                                                continuation.as_ref(),
-                                                &socket_id_publisher,
-                                            );
-                                        }
-                                        return;
-                                    }
-                                }
-                            },
-                            Err(refresh_err) => {
-                                if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
-                                    abort_abandoned_live_continuation(
-                                        continuation.as_ref(),
-                                        &socket_id_publisher,
-                                    );
-                                }
-                                return;
+                        let Some(next_route) = self
+                            .refresh_conversation_route_after_rejection(&route)
+                            .await
+                            .into_route()
+                        else {
+                            if tx.send(Err(err)).await.is_err() {
+                                abort_abandoned_live_continuation(
+                                    continuation.as_ref(),
+                                    &socket_id_publisher,
+                                );
                             }
+                            return;
                         };
+                        if tx.is_closed() {
+                            abort_abandoned_live_continuation(
+                                continuation.as_ref(),
+                                &socket_id_publisher,
+                            );
+                            return;
+                        }
+                        route = next_route;
                         if continuation_retry_available {
                             socket_id_publisher.mark_full_context_retry();
                         }
@@ -2073,57 +2097,28 @@ impl CodexHttpClient {
                 if allow_auth_refresh && unauthorized && !auth_refresh_attempted && !forwarded_any {
                     auth_refresh_attempted = true;
                     invalidate_live_continuation_pool(continuation.as_ref());
-                    let refresh = self.auth_manager.force_refresh(&route.auth().access);
-                    route = match refresh.await {
-                        Ok(auth) => {
-                            if tx.is_closed() {
-                                if let Some(reservation) = continuation.as_ref() {
-                                    super::websocket::invalidate_codex_websocket_pool_socket(
-                                        reservation,
-                                        stream.socket_id(),
-                                    );
-                                }
-                                abort_abandoned_live_continuation(
-                                    continuation.as_ref(),
-                                    &socket_id_publisher,
-                                );
-                                return;
-                            }
-                            match self.bind_route_with_auth(auth, route.protocol(), route.lane()) {
-                                Ok(route) => route,
-                                Err(error) => {
-                                    if tx.send(Err(error)).await.is_err() {
-                                        if let Some(reservation) = continuation.as_ref() {
-                                            super::websocket::invalidate_codex_websocket_pool_socket(
-                                                reservation,
-                                                stream.socket_id(),
-                                            );
-                                        }
-                                        abort_abandoned_live_continuation(
-                                            continuation.as_ref(),
-                                            &socket_id_publisher,
-                                        );
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                        Err(refresh_err) => {
-                            if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
-                                if let Some(reservation) = continuation.as_ref() {
-                                    super::websocket::invalidate_codex_websocket_pool_socket(
-                                        reservation,
-                                        stream.socket_id(),
-                                    );
-                                }
-                                abort_abandoned_live_continuation(
-                                    continuation.as_ref(),
-                                    &socket_id_publisher,
-                                );
-                            }
-                            return;
-                        }
+                    let Some(next_route) = self
+                        .refresh_conversation_route_after_rejection(&route)
+                        .await
+                        .into_route()
+                    else {
+                        let _ = tx.send(item).await;
+                        return;
                     };
+                    if tx.is_closed() {
+                        if let Some(reservation) = continuation.as_ref() {
+                            super::websocket::invalidate_codex_websocket_pool_socket(
+                                reservation,
+                                stream.socket_id(),
+                            );
+                        }
+                        abort_abandoned_live_continuation(
+                            continuation.as_ref(),
+                            &socket_id_publisher,
+                        );
+                        return;
+                    }
+                    route = next_route;
                     if continuation_retry_available {
                         socket_id_publisher.mark_full_context_retry();
                     }
@@ -2165,6 +2160,7 @@ impl CodexHttpClient {
         }
     }
 
+    #[cfg(test)]
     async fn attempt_post_http(
         &self,
         auth: &StoredAuth,
@@ -2851,6 +2847,7 @@ pub(super) fn is_continuation_retry_error(err: &CodexError) -> bool {
     )
 }
 
+#[cfg(test)]
 fn websocket_pool_owner(
     continuation: Option<&super::continuation::ContinuationReservation>,
 ) -> Option<&ConversationIdentity> {
@@ -3708,7 +3705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_responses_refreshes_once_before_returning_body() {
+    async fn native_responses_does_not_replay_after_account_change() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let client = Arc::new(authenticated_http_test_client(format!(
@@ -3716,36 +3713,28 @@ mod tests {
         )));
         let server_client = client.clone();
         let server = tokio::spawn(async move {
-            for attempt in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0_u8; 16 * 1024];
-                let read = stream.read(&mut request).await.unwrap();
-                let request = String::from_utf8_lossy(&request[..read]);
-                if attempt == 0 {
-                    assert!(request.contains("authorization: Bearer test"));
-                    server_client.auth_manager().set_test_auth(StoredAuth {
-                        access: "rotated".into(),
-                        refresh: "rotated-refresh".into(),
-                        account_id: Some("acct-rotated".into()),
-                        expires: u64::MAX,
-                    });
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                        )
-                        .await
-                        .unwrap();
-                } else {
-                    assert!(request.contains("authorization: Bearer rotated"));
-                    assert!(request.contains("chatgpt-account-id: acct-rotated"));
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
-                        )
-                        .await
-                        .unwrap();
-                }
-            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("authorization: Bearer test"));
+            server_client.auth_manager().set_test_auth(StoredAuth {
+                access: "rotated".into(),
+                refresh: "rotated-refresh".into(),
+                account_id: Some("acct-rotated".into()),
+                expires: u64::MAX,
+            });
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
         });
 
         let response = client
@@ -3757,8 +3746,57 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.bytes().await.unwrap(), b"{}".as_slice());
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_responses_does_not_replay_caller_owned_continuation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/v1/responses"
+        )));
+        let server_client = client.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("previous_response_id"));
+            server_client.auth_manager().set_test_auth(StoredAuth {
+                access: "rotated".into(),
+                refresh: "rotated-refresh".into(),
+                account_id: Some("acct".into()),
+                expires: u64::MAX,
+            });
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let response = client
+            .post_native_responses(
+                &serde_json::json!({
+                    "model":"gpt-5.4",
+                    "input":"hello",
+                    "previous_response_id":"resp_caller"
+                }),
+                &http_test_context(),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
         server.await.unwrap();
     }
 
@@ -5377,7 +5415,13 @@ mod tests {
             headers.get("openai-beta").unwrap(),
             "responses=experimental"
         );
-        assert_eq!(headers.get("session_id").unwrap(), "s");
+        let session = headers.get("session_id").unwrap().to_str().unwrap();
+        assert_ne!(session, "s");
+        assert_eq!(headers.get("x-client-request-id").unwrap(), session);
+        assert_eq!(
+            headers.get("x-codex-window-id").unwrap().to_str().unwrap(),
+            format!("{session}:0")
+        );
         assert_eq!(
             headers.get("x-codex-beta-features").unwrap(),
             "remote_compaction_v2"
@@ -5433,7 +5477,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_headers_return_error_for_invalid_session_header() {
+    fn codex_headers_omit_invalid_legacy_session_identity() {
         let auth = StoredAuth {
             access: "tok".into(),
             refresh: String::new(),
@@ -5448,9 +5492,10 @@ mod tests {
             traffic: None,
             monitor: None,
         };
-        let err = build_codex_headers(&auth, &ctx, false).unwrap_err();
-        assert_eq!(err.status, 500);
-        assert!(err.message.contains("session_id"));
+        let headers = build_codex_headers(&auth, &ctx, false).unwrap();
+        assert!(headers.get("session_id").is_none());
+        assert!(headers.get("x-client-request-id").is_none());
+        assert!(headers.get("x-codex-window-id").is_none());
     }
 
     #[test]

@@ -1031,9 +1031,10 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     };
     let response = if let Some(parsed) = parsed {
         match provider
-            .generate_anthropic_stream_scoped(
+            .generate_anthropic_stream_with_conversation_identity(
                 parsed.messages,
-                ScopedRequestContext::new(context, request_scope),
+                context,
+                request_scope.conversational_lane().cloned(),
             )
             .await
         {
@@ -1301,9 +1302,10 @@ async fn handler_chat_completions(
     } else {
         let parsed = parsed.expect("non-Codex request was parsed");
         match provider
-            .generate_anthropic_stream_scoped(
+            .generate_anthropic_stream_with_conversation_identity(
                 parsed.messages,
-                ScopedRequestContext::new(context, request_scope),
+                context,
+                request_scope.conversational_lane().cloned(),
             )
             .await
         {
@@ -1768,22 +1770,25 @@ async fn dispatch_request(
         );
     }
 
-    let context = ScopedRequestContext::new(
-        RequestContext {
-            req_id: req_id.clone(),
-            session_id,
-            session_seq: current.map(|s| s.seq),
-            provider: provider.name().to_string(),
-            traffic,
-            monitor: state.monitor.clone(),
-        },
-        request_scope,
-    );
+    let context = RequestContext {
+        req_id: req_id.clone(),
+        session_id,
+        session_seq: current.map(|s| s.seq),
+        provider: provider.name().to_string(),
+        traffic,
+        monitor: state.monitor.clone(),
+    };
 
     let response = if count_tokens {
-        provider.handle_count_tokens_scoped(body, context).await
+        provider.handle_count_tokens(body, context).await
     } else {
-        provider.handle_messages_scoped(body, context).await
+        provider
+            .handle_messages_with_conversation_identity(
+                body,
+                context,
+                request_scope.conversational_lane().cloned(),
+            )
+            .await
     };
     log_request_completed(
         &log,

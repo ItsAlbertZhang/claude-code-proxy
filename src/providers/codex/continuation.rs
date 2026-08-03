@@ -9,8 +9,8 @@ use super::translate::request::{ResponsesInputItem, ResponsesRequest};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_STATES: usize = 10_000;
-const MAX_OWNER_TRANSCRIPT_BYTES: u64 = 2_000_000;
-const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
+const MAX_OWNER_RETAINED_BYTES: u64 = 2_000_000;
+const MAX_TOTAL_RETAINED_BYTES: u64 = 20_000_000;
 
 #[derive(Clone)]
 struct ContinuationState {
@@ -19,7 +19,7 @@ struct ContinuationState {
     route_key: Option<SocketPoolKey>,
     prompt_signature: String,
     transcript: Vec<ResponsesInputItem>,
-    transcript_bytes: u64,
+    retained_bytes: u64,
     updated_at: u64,
 }
 
@@ -34,7 +34,7 @@ struct OwnerState {
 #[derive(Default)]
 struct ContinuationRegistry {
     owners: HashMap<ConversationIdentity, OwnerState>,
-    total_transcript_bytes: u64,
+    total_retained_bytes: u64,
 }
 
 static REGISTRY: Mutex<Option<ContinuationRegistry>> = Mutex::new(None);
@@ -128,6 +128,7 @@ impl ContinuationReservation {
         self.route_key
     }
 
+    #[cfg(test)]
     pub(crate) fn cleanup_epoch(&self) -> Option<u64> {
         self.cleanup_epoch
     }
@@ -274,22 +275,23 @@ fn continuation_candidate_inner(
         let registry = guard.get_or_insert_with(ContinuationRegistry::default);
         let existing = registry.owners.remove(owner);
         let superseded_turn = existing.is_some();
-        let state = existing.and_then(|owner| owner.continuation);
-        if let Some(state) = &state {
-            registry.total_transcript_bytes = registry
-                .total_transcript_bytes
-                .saturating_sub(state.transcript_bytes);
-        }
-        registry.owners.insert(
-            owner.clone(),
-            OwnerState {
-                current_turn: turn_id,
-                cleanup_epoch: 0,
-                bound_route_key: None,
-                continuation: None,
-                updated_at: now,
-            },
-        );
+        let state = existing.and_then(|owner_state| {
+            registry.total_retained_bytes = registry
+                .total_retained_bytes
+                .saturating_sub(owner_retained_size(owner, &owner_state));
+            owner_state.continuation
+        });
+        let owner_state = OwnerState {
+            current_turn: turn_id,
+            cleanup_epoch: 0,
+            bound_route_key: None,
+            continuation: None,
+            updated_at: now,
+        };
+        registry.total_retained_bytes = registry
+            .total_retained_bytes
+            .saturating_add(owner_retained_size(owner, &owner_state));
+        registry.owners.insert(owner.clone(), owner_state);
         evict_oldest(registry);
         (state, superseded_turn)
     };
@@ -432,9 +434,17 @@ pub(crate) fn record_continuation_for_owner(
     transcript.extend_from_slice(output_items);
 
     let transcript_json = serde_json::to_string(&transcript).unwrap_or_default();
-    let transcript_bytes = transcript_json.len() as u64;
+    let prompt_signature = prompt_signature(request_body);
+    let retained_bytes = continuation_retained_size(
+        owner,
+        &response_id,
+        reservation.route_key.as_ref(),
+        &prompt_signature,
+        &transcript,
+        transcript_json.len(),
+    );
 
-    if transcript_bytes > MAX_OWNER_TRANSCRIPT_BYTES {
+    if retained_bytes > MAX_OWNER_RETAINED_BYTES {
         abort_continuation_inner(Some(owner), Some(turn_id));
         return;
     }
@@ -443,9 +453,9 @@ pub(crate) fn record_continuation_for_owner(
         response_id,
         socket_id,
         route_key: reservation.route_key,
-        prompt_signature: prompt_signature(request_body),
+        prompt_signature,
         transcript,
-        transcript_bytes,
+        retained_bytes,
         updated_at: now_ms(),
     };
 
@@ -459,12 +469,13 @@ pub(crate) fn record_continuation_for_owner(
     if !reservation_matches_owner_state(reservation, owner_state) {
         return;
     }
-    if let Some(existing) = owner_state.continuation.replace(state) {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(existing.transcript_bytes);
-    }
-    registry.total_transcript_bytes += transcript_bytes;
+    let previous_size = owner_retained_size(owner, owner_state);
+    owner_state.continuation = Some(state);
+    let next_size = owner_retained_size(owner, owner_state);
+    registry.total_retained_bytes = registry
+        .total_retained_bytes
+        .saturating_sub(previous_size)
+        .saturating_add(next_size);
     evict_oldest(registry);
 }
 
@@ -486,12 +497,8 @@ pub(crate) fn abort_continuation_for_owner(reservation: &ContinuationReservation
         .owners
         .get(owner)
         .is_some_and(|state| reservation_matches_owner_state(reservation, state))
-        && let Some(state) = registry.owners.remove(owner)
-        && let Some(continuation) = state.continuation
     {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(continuation.transcript_bytes);
+        remove_owner(registry, owner);
     }
 }
 
@@ -507,12 +514,8 @@ fn abort_continuation_inner(owner: Option<&ConversationIdentity>, turn_id: Optio
         .owners
         .get(owner)
         .is_some_and(|state| state.current_turn == turn_id)
-        && let Some(state) = registry.owners.remove(owner)
-        && let Some(continuation) = state.continuation
     {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(continuation.transcript_bytes);
+        remove_owner(registry, owner);
     }
 }
 
@@ -615,13 +618,7 @@ pub(crate) fn clear_continuation_for_owner(owner: Option<&ConversationIdentity>)
     let Some(registry) = guard.as_mut() else {
         return;
     };
-    if let Some(state) = registry.owners.remove(owner)
-        && let Some(continuation) = state.continuation
-    {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(continuation.transcript_bytes);
-    }
+    remove_owner(registry, owner);
 }
 
 #[deprecated(note = "use the owner-aware test helper for typed conversation ownership")]
@@ -665,6 +662,55 @@ fn reservation_matches_owner_state(
         }
         (None, None) => true,
         _ => false,
+    }
+}
+
+fn owner_base_size(owner: &ConversationIdentity) -> u64 {
+    let identity_bytes = match owner {
+        ConversationIdentity::Main(session) => session.len(),
+        ConversationIdentity::Agent(session, agent) => session.len().saturating_add(agent.len()),
+    };
+    std::mem::size_of::<ConversationIdentity>()
+        .saturating_add(std::mem::size_of::<OwnerState>())
+        .saturating_add(3 * std::mem::size_of::<usize>())
+        .saturating_add(identity_bytes) as u64
+}
+
+fn continuation_retained_size(
+    owner: &ConversationIdentity,
+    response_id: &str,
+    route_key: Option<&SocketPoolKey>,
+    prompt_signature: &str,
+    transcript: &[ResponsesInputItem],
+    serialized_transcript_bytes: usize,
+) -> u64 {
+    let route_bytes = route_key.map_or(0, |_| std::mem::size_of::<SocketPoolKey>());
+    owner_base_size(owner).saturating_add(
+        std::mem::size_of::<ContinuationState>()
+            .saturating_add(response_id.len())
+            .saturating_add(route_bytes)
+            .saturating_add(prompt_signature.len())
+            .saturating_add(serialized_transcript_bytes)
+            .saturating_add(
+                transcript
+                    .len()
+                    .saturating_mul(std::mem::size_of::<ResponsesInputItem>()),
+            ) as u64,
+    )
+}
+
+fn owner_retained_size(owner: &ConversationIdentity, state: &OwnerState) -> u64 {
+    state
+        .continuation
+        .as_ref()
+        .map_or_else(|| owner_base_size(owner), |state| state.retained_bytes)
+}
+
+fn remove_owner(registry: &mut ContinuationRegistry, owner: &ConversationIdentity) {
+    if let Some(state) = registry.owners.remove(owner) {
+        registry.total_retained_bytes = registry
+            .total_retained_bytes
+            .saturating_sub(owner_retained_size(owner, &state));
     }
 }
 
@@ -737,7 +783,7 @@ fn stable_json(value: &serde_json::Value) -> String {
 
 fn evict_oldest(registry: &mut ContinuationRegistry) {
     while registry.owners.len() > MAX_STATES
-        || registry.total_transcript_bytes > MAX_TOTAL_TRANSCRIPT_BYTES
+        || registry.total_retained_bytes > MAX_TOTAL_RETAINED_BYTES
     {
         let owner = registry
             .owners
@@ -747,13 +793,7 @@ fn evict_oldest(registry: &mut ContinuationRegistry) {
         let Some(owner) = owner else {
             break;
         };
-        if let Some(state) = registry.owners.remove(&owner)
-            && let Some(continuation) = state.continuation
-        {
-            registry.total_transcript_bytes = registry
-                .total_transcript_bytes
-                .saturating_sub(continuation.transcript_bytes);
-        }
+        remove_owner(registry, &owner);
     }
 }
 
@@ -836,6 +876,19 @@ mod tests {
     ) {
         let reservation = continuation_candidate_for_owner(Some(owner), request, true);
         record_continuation_for_owner(&reservation, request, Some(response_id), Some(1), &[]);
+    }
+
+    #[test]
+    fn prompt_signature_bytes_count_toward_owner_quota() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("oversized-prompt");
+        let request = request_with_input(
+            vec![input("tiny")],
+            Some(json!({"instructions": "x".repeat(MAX_OWNER_RETAINED_BYTES as usize)})),
+        );
+        let reservation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        record_continuation_for_owner(&reservation, &request, Some("resp_oversized"), Some(1), &[]);
+        assert!(!has_continuation_for_owner_for_tests(&owner));
     }
 
     #[test]
@@ -1215,7 +1268,7 @@ mod tests {
             route_key: None,
             prompt_signature: prompt_signature(&lite),
             transcript: input,
-            transcript_bytes: 0,
+            retained_bytes: 0,
             updated_at: now_ms(),
         };
 

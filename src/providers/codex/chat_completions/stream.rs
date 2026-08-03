@@ -10,7 +10,10 @@ use crate::providers::codex::client::InBandAuthRefreshDetector;
 use crate::providers::codex::native::NativeResponseOutcome;
 use crate::{provider::RequestContext, traffic::MAX_SSE_CAPTURE_BYTES};
 
-use super::{ChatError, response::CompletionState};
+use super::{
+    ChatError, MAX_CHAT_OUTPUT_BYTES, MAX_CHAT_SSE_FRAME_BYTES, MAX_CHAT_UPSTREAM_BYTES,
+    response::CompletionState,
+};
 
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
@@ -60,9 +63,9 @@ fn streaming_response_inner(
     let outcome = NativeResponseOutcome::default();
     let state = StreamState {
         upstream: Box::pin(upstream.bytes_stream()),
-        pending: Vec::new(),
+        decoder: ChatSseDecoder::default(),
         output: VecDeque::new(),
-        completion: CompletionState::new(&model),
+        completion: CompletionState::new_streaming(&model),
         role_sent: false,
         include_usage,
         ended: false,
@@ -71,6 +74,7 @@ fn streaming_response_inner(
         outcome: outcome.clone(),
         auth_refresh,
         body_idle_timeout_ms,
+        translated_output_bytes: 0,
         raw: Vec::new(),
         raw_truncated: 0,
     };
@@ -124,7 +128,9 @@ async fn next_frame(
                 if let Some(auth_refresh) = state.auth_refresh.as_mut() {
                     auth_refresh.finish();
                 }
-                if !state.completion.completed {
+                if let Err(error) = state.decoder.finish() {
+                    state.fail(error);
+                } else if !state.completion.completed {
                     state.fail(ChatError::upstream(
                         "Codex event stream ended before completion",
                     ));
@@ -144,7 +150,7 @@ async fn next_frame(
 
 struct StreamState {
     upstream: UpstreamStream,
-    pending: Vec<u8>,
+    decoder: ChatSseDecoder,
     output: VecDeque<Bytes>,
     completion: CompletionState,
     role_sent: bool,
@@ -155,6 +161,7 @@ struct StreamState {
     outcome: NativeResponseOutcome,
     auth_refresh: Option<InBandAuthRefreshDetector>,
     body_idle_timeout_ms: u64,
+    translated_output_bytes: usize,
     raw: Vec<u8>,
     raw_truncated: u64,
 }
@@ -176,21 +183,16 @@ impl StreamState {
         self.raw_truncated = self
             .raw_truncated
             .saturating_add((chunk.len() - captured) as u64);
-        self.pending.extend_from_slice(chunk);
-
-        let mut event_count = 0;
-        while let Some((end, separator_len)) = find_boundary(&self.pending) {
-            let frame = self
-                .pending
-                .drain(..end + separator_len)
-                .collect::<Vec<_>>();
-            for event in crate::anthropic::sse::parse_sse_events(&frame) {
-                event_count += 1;
-                self.observe_event(&event.data);
-                if self.ended {
-                    break;
-                }
+        let events = match self.decoder.observe(chunk) {
+            Ok(events) => events,
+            Err(error) => {
+                self.fail(error);
+                Vec::new()
             }
+        };
+        let event_count = events.len();
+        for data in events {
+            self.observe_event(&data);
             if self.ended {
                 break;
             }
@@ -199,7 +201,7 @@ impl StreamState {
             monitor.stream_progress(
                 &self.ctx.req_id,
                 chunk.len() as u64,
-                event_count,
+                event_count as u64,
                 Some(self.completion.usage.prompt_tokens),
                 Some(self.completion.usage.completion_tokens),
             );
@@ -226,21 +228,32 @@ impl StreamState {
             Ok(Some(delta)) => {
                 if !self.role_sent {
                     self.role_sent = true;
-                    self.output.push_back(sse(json!({
+                    let role = sse(json!({
                         "id": self.completion.id,
                         "object": "chat.completion.chunk",
                         "created": self.completion.created,
                         "model": self.completion.model,
                         "choices": [{"index":0,"delta":{"role":"assistant"},"finish_reason":null}],
-                    })));
+                    }));
+                    if !self.push_output(role) {
+                        self.fail(ChatError::upstream(
+                            "Codex translated output exceeded the configured limit",
+                        ));
+                        return;
+                    }
                 }
-                self.output.push_back(sse(json!({
+                let content = sse(json!({
                     "id": self.completion.id,
                     "object": "chat.completion.chunk",
                     "created": self.completion.created,
                     "model": self.completion.model,
                     "choices": [{"index":0,"delta":{"content":delta},"finish_reason":null}],
-                })));
+                }));
+                if !self.push_output(content) {
+                    self.fail(ChatError::upstream(
+                        "Codex translated output exceeded the configured limit",
+                    ));
+                }
             }
             Ok(None) if self.completion.completed => self.finish_success(),
             Ok(None) => {}
@@ -252,7 +265,7 @@ impl StreamState {
         if self.ended {
             return;
         }
-        if self.completion.text.is_empty() {
+        if !self.completion.has_output_text() {
             self.fail(ChatError::upstream("Codex completed without output text"));
             return;
         }
@@ -273,10 +286,28 @@ impl StreamState {
                 Some(self.completion.usage.completion_tokens),
             );
         }
-        self.output.push_back(sse(terminal));
-        self.output
-            .push_back(Bytes::from_static(b"data: [DONE]\n\n"));
+        let done = Bytes::from_static(b"data: [DONE]\n\n");
+        let terminal = sse(terminal);
+        let additional = terminal.len().saturating_add(done.len());
+        if self.translated_output_bytes.saturating_add(additional) > MAX_CHAT_OUTPUT_BYTES {
+            self.fail(ChatError::upstream(
+                "Codex translated output exceeded the configured limit",
+            ));
+            return;
+        }
+        self.translated_output_bytes += additional;
+        self.output.push_back(terminal);
+        self.output.push_back(done);
         self.ended = true;
+    }
+
+    fn push_output(&mut self, frame: Bytes) -> bool {
+        if self.translated_output_bytes.saturating_add(frame.len()) > MAX_CHAT_OUTPUT_BYTES {
+            return false;
+        }
+        self.translated_output_bytes += frame.len();
+        self.output.push_back(frame);
+        true
     }
 
     fn fail(&mut self, error: ChatError) {
@@ -325,6 +356,57 @@ fn sse(value: Value) -> Bytes {
     ))
 }
 
+#[derive(Default)]
+pub(crate) struct ChatSseDecoder {
+    pending: Vec<u8>,
+    total_bytes: usize,
+}
+
+impl ChatSseDecoder {
+    pub(crate) fn observe(&mut self, chunk: &[u8]) -> Result<Vec<String>, ChatError> {
+        if self.total_bytes.saturating_add(chunk.len()) > MAX_CHAT_UPSTREAM_BYTES {
+            return Err(ChatError::upstream(
+                "Codex response body exceeded the configured limit",
+            ));
+        }
+        self.total_bytes += chunk.len();
+        self.pending.extend_from_slice(chunk);
+
+        let mut events = Vec::new();
+        while let Some((end, separator_len)) = find_boundary(&self.pending) {
+            if end > MAX_CHAT_SSE_FRAME_BYTES {
+                return Err(ChatError::upstream(
+                    "Codex event-stream frame exceeded the configured limit",
+                ));
+            }
+            let frame = self
+                .pending
+                .drain(..end + separator_len)
+                .collect::<Vec<_>>();
+            events.extend(
+                crate::anthropic::sse::parse_sse_events(&frame)
+                    .into_iter()
+                    .map(|event| event.data),
+            );
+        }
+        if self.pending.len() > MAX_CHAT_SSE_FRAME_BYTES {
+            return Err(ChatError::upstream(
+                "Codex event-stream frame exceeded the configured limit",
+            ));
+        }
+        Ok(events)
+    }
+
+    pub(crate) fn finish(&self) -> Result<(), ChatError> {
+        if self.pending.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            return Err(ChatError::upstream(
+                "Codex event stream ended with an incomplete frame",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn find_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
     for index in 0..bytes.len() {
         if bytes[index..].starts_with(b"\r\n\r\n") {
@@ -360,6 +442,25 @@ pub fn response_headers(upstream: &HeaderMap) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_rejects_oversized_incomplete_frame() {
+        let mut decoder = ChatSseDecoder::default();
+        let error = decoder
+            .observe(&vec![b'x'; MAX_CHAT_SSE_FRAME_BYTES + 1])
+            .unwrap_err();
+        assert!(error.message.contains("frame exceeded"));
+    }
+
+    #[test]
+    fn decoder_rejects_total_bytes_across_many_frames() {
+        let mut decoder = ChatSseDecoder {
+            pending: Vec::new(),
+            total_bytes: MAX_CHAT_UPSTREAM_BYTES,
+        };
+        let error = decoder.observe(b"x").unwrap_err();
+        assert!(error.message.contains("body exceeded"));
+    }
 
     #[test]
     fn boundary_supports_split_safe_delimiters() {
