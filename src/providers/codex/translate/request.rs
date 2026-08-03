@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, read_effort,
+    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
+    read_effort,
 };
 
 use crate::request_identity::OpaqueLane;
@@ -443,7 +444,7 @@ pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    translate_request_with_read_lane(req, opts, ReadLane::Legacy)
+    translate_request_inner(req, opts, ReadLane::Legacy, true)
 }
 
 pub(crate) fn translate_request_scoped(
@@ -451,20 +452,58 @@ pub(crate) fn translate_request_scoped(
     opts: TranslateOptions,
     read_lane: Option<OpaqueLane>,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    translate_request_with_read_lane(req, opts, ReadLane::Stable(read_lane))
+    translate_request_inner(req, opts, ReadLane::Stable(read_lane), true)
 }
 
-fn translate_request_with_read_lane(
+pub fn translate_openai_compatible_request(
+    req: &MessagesRequest,
+    model: String,
+    session_id: Option<String>,
+) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_inner(
+        req,
+        TranslateOptions {
+            session_id,
+            service_tier: None,
+            model,
+            use_responses_lite: false,
+        },
+        ReadLane::Legacy,
+        false,
+    )
+}
+
+pub(crate) fn translate_openai_compatible_request_scoped(
+    req: &MessagesRequest,
+    model: String,
+    prompt_cache_key: Option<String>,
+    read_lane: Option<OpaqueLane>,
+) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_inner(
+        req,
+        TranslateOptions {
+            session_id: prompt_cache_key,
+            service_tier: None,
+            model,
+            use_responses_lite: false,
+        },
+        ReadLane::Stable(read_lane),
+        false,
+    )
+}
+
+fn translate_request_inner(
     req: &MessagesRequest,
     opts: TranslateOptions,
     read_lane: ReadLane,
+    apply_codex_config: bool,
 ) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
     let input = build_input(req, read_lane);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
-    let parallel_tool_calls = !disable_parallel_tool_use(req);
+    let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
 
     let mut text = ResponsesText {
         verbosity: Some("low".to_string()),
@@ -550,18 +589,25 @@ fn translate_request_with_read_lane(
         out.prompt_cache_key = Some(sid);
     }
 
-    let service_tier = resolve_service_tier(opts.service_tier)?;
-    if let Some(ref tier) = service_tier {
-        out.service_tier = Some(tier.clone());
+    if apply_codex_config {
+        let service_tier = resolve_service_tier(opts.service_tier)?;
+        if let Some(ref tier) = service_tier {
+            out.service_tier = Some(tier.clone());
+        }
     }
 
     let effort = read_effort(req)?;
     let codex_effort = to_codex_effort(effort);
-    let global_effort = (!req.bypass_provider_effort_override)
-        .then(config::codex_effort)
-        .flatten();
-    let mut resolved_effort = resolve_effort_override(codex_effort, global_effort.as_deref())?;
-    if is_compact
+    let mut resolved_effort = if apply_codex_config {
+        let global_effort = (!req.bypass_provider_effort_override)
+            .then(config::codex_effort)
+            .flatten();
+        resolve_effort_override(codex_effort, global_effort.as_deref())?
+    } else {
+        codex_effort
+    };
+    if apply_codex_config
+        && is_compact
         && let Some(cap) = compact_effort_cap()
         && resolved_effort.as_ref().is_some_and(|effort| *effort > cap)
     {
@@ -569,7 +615,8 @@ fn translate_request_with_read_lane(
     }
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
-            && reasoning_summary_requested(config::codex_reasoning_summary().as_deref())
+            && (!apply_codex_config
+                || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
         {
             Some("auto".to_string())
         } else {
@@ -786,15 +833,6 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
         }
         _ => Ok(None),
     }
-}
-
-fn disable_parallel_tool_use(req: &MessagesRequest) -> bool {
-    req.extra
-        .get("tool_choice")
-        .and_then(Value::as_object)
-        .and_then(|choice| choice.get("disable_parallel_tool_use"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 fn build_input(req: &MessagesRequest, read_lane: ReadLane) -> Vec<ResponsesInputItem> {

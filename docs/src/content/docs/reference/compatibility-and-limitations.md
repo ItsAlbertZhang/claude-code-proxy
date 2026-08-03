@@ -31,8 +31,8 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 ## OpenAI API scope
 
-- `CCP_CODEX_RESPONSES_API=1` enables `/v1/chat/completions` and `/v1/responses` for Codex, Kimi, Grok, and Cursor models.
-- Codex Responses requests use native passthrough. Caller-supplied `previous_response_id` is preserved but prevents retrying a header 401 because the proxy does not own that native chain. A JSON or SSE unauthorized error encoded inside HTTP 200 preserves its status, bytes, and framing and can refresh credentials for only the next request. Requests for the other providers support text, reasoning, function tools, tool results, token limits, usage, streaming, aliases, and `[1m]` model hints.
+- `CCP_CODEX_RESPONSES_API=1` enables `/v1/chat/completions` and `/v1/responses` for Codex, Kimi, Grok, OpenCode Go, and Cursor models.
+- Codex Responses requests use native passthrough. Caller-supplied `previous_response_id` is preserved but prevents retrying a header 401 because the proxy does not own that native chain. A JSON or SSE unauthorized error encoded inside HTTP 200 preserves its status, bytes, and framing and can refresh credentials for only the next request. Requests for the other providers support their mapped subsets of text, reasoning, function tools, tool results, token limits, usage, streaming, aliases, and `[1m]` model hints; exact support depends on the selected provider and model.
 - Unsupported non-null request fields return an error instead of being ignored.
 - Grok search calls appear as Responses `web_search_call` items. Chat Completions returns the citations without a separate search item.
 - Cursor tool bridging supports `Read`, `Write`, and `Bash`. It requires streaming and a valid stable conversational lane; sibling Agent lanes do not share pending tools.

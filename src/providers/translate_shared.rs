@@ -57,6 +57,15 @@ pub fn flatten_system_text(system_val: Option<&Value>) -> Option<String> {
     }
 }
 
+pub fn parallel_tool_calls(req: &MessagesRequest) -> Option<bool> {
+    req.extra
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("disable_parallel_tool_use"))
+        .and_then(Value::as_bool)
+        .map(|disabled| !disabled)
+}
+
 pub fn read_effort(req: &MessagesRequest) -> Result<Option<&str>, anyhow::Error> {
     let output_config = match req.extra.get("output_config") {
         Some(Value::Object(m)) => m,

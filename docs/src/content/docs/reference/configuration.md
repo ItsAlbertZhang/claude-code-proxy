@@ -41,6 +41,10 @@ These settings configure the proxy process. Claude Code client settings such as 
     "baseUrl": "https://cli-chat-proxy.grok.com/v1",
     "clientVersion": "0.2.93"
   },
+  "opencode": {
+    "apiKey": "YOUR_OPENCODE_GO_API_KEY",
+    "baseUrl": "https://opencode.ai/zen/go/v1"
+  },
   "cursor": {
     "baseUrl": "https://api2.cursor.sh",
     "clientVersion": "0.48.5",
@@ -145,6 +149,14 @@ When an active auto-review effort reaches Codex, it bypasses `CCP_CODEX_EFFORT` 
 | `CCP_GROK_BASE_URL` | `grok.baseUrl` | `https://cli-chat-proxy.grok.com/v1` | Changes the Responses API base URL. |
 | `CCP_GROK_CLIENT_VERSION` | `grok.clientVersion` | `0.2.93` | Changes the Grok client version header. |
 | `CCP_GROK_TOOL_IMAGE` | none | `omit` | Selects `omit`, `reattach`, `inline`, or `reject` image handling. |
+
+## OpenCode Go
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_OPENCODE_API_KEY` | `opencode.apiKey` | unset | OpenCode Go API key; takes precedence over `OPENCODE_API_KEY` and config. |
+| `OPENCODE_API_KEY` | `opencode.apiKey` | unset | Fallback API-key variable accepted by the proxy when the CCP-specific variable is unset. |
+| `CCP_OPENCODE_BASE_URL` | `opencode.baseUrl` | `https://opencode.ai/zen/go/v1` | Changes the OpenCode Go API base URL. |
 
 ## Cursor Agent
 

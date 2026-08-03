@@ -124,6 +124,13 @@ impl CodexWebSocketEventStream {
     pub(crate) fn into_receiver(self) -> CodexWebSocketEventReceiver {
         self.receiver
     }
+
+    pub(crate) fn replace_receiver(
+        &mut self,
+        receiver: CodexWebSocketEventReceiver,
+    ) -> CodexWebSocketEventReceiver {
+        std::mem::replace(&mut self.receiver, receiver)
+    }
 }
 
 impl CodexWebSocketSocketIdPublisher {
@@ -622,9 +629,9 @@ fn pool_insert_if_vacant_or_same_at(
         return Arc::ptr_eq(existing, &entry);
     }
     if guard.len() >= MAX_POOL_ENTRIES
-        && let Some(oldest_key) = guard.keys().next().cloned()
+        && let Some(oldest_owner) = guard.keys().next().cloned()
     {
-        guard.remove(&oldest_key);
+        guard.remove(&oldest_owner);
     }
     guard.retain(|_, pooled| {
         now.saturating_sub(pooled.last_used_at.load(Ordering::Relaxed)) < POOL_IDLE_TTL_MS
