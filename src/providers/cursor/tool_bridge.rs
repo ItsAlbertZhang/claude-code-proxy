@@ -16,6 +16,7 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::response::CursorStreamEvent;
 use crate::providers::cursor::sse::CursorSseFramer;
 use crate::providers::cursor::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
+use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -151,7 +152,7 @@ static BRIDGE_REGISTRY: Lazy<Mutex<BridgeRegistryInner>> =
     Lazy::new(|| Mutex::new(BridgeRegistryInner::new()));
 
 struct BridgeRegistryInner {
-    sessions: Vec<CursorBridgeState>,
+    sessions: Vec<(OpaqueLane, CursorBridgeState)>,
 }
 
 impl BridgeRegistryInner {
@@ -162,59 +163,112 @@ impl BridgeRegistryInner {
     }
 }
 
+fn legacy_cursor_lane(session_id: &str) -> Option<OpaqueLane> {
+    RequestScope::legacy(Some(session_id), RequestPurpose::Conversation)
+        .provider_lane(LaneDomain::CursorToolBridge)
+}
+
 /// Global registry of active bridge sessions.
 pub struct BridgeRegistry;
 
 impl BridgeRegistry {
-    /// Insert a new bridge state for a session.
+    /// Insert a new bridge state for a legacy session.
     pub fn insert(state: CursorBridgeState) {
+        let Some(lane) = legacy_cursor_lane(&state.session_id) else {
+            return;
+        };
+        Self::insert_scoped(lane, state);
+    }
+
+    pub(crate) fn insert_scoped(lane: OpaqueLane, state: CursorBridgeState) {
         let mut reg = BRIDGE_REGISTRY.lock().unwrap();
-        reg.sessions.push(state);
+        reg.sessions.retain(|(stored_lane, _)| *stored_lane != lane);
+        reg.sessions.push((lane, state));
     }
 
-    /// Get the bridge state for a session.
+    /// Get the bridge state for a legacy session.
     pub fn get(session_id: &str) -> Option<usize> {
-        let reg = BRIDGE_REGISTRY.lock().unwrap();
-        reg.sessions.iter().position(|s| s.session_id == session_id)
+        Self::get_scoped(legacy_cursor_lane(session_id)?)
     }
 
-    /// Get the pending tool for a session (if any).
-    pub fn pending_tool(session_id: &str) -> Option<PendingCursorTool> {
+    pub(crate) fn get_scoped(lane: OpaqueLane) -> Option<usize> {
         let reg = BRIDGE_REGISTRY.lock().unwrap();
         reg.sessions
             .iter()
-            .find(|s| s.session_id == session_id)
-            .and_then(|s| s.pending_tool.clone())
+            .position(|(stored_lane, _)| *stored_lane == lane)
     }
 
-    /// Take the bridge state for a session (removes it).
+    /// Get the pending tool for a legacy session (if any).
+    pub fn pending_tool(session_id: &str) -> Option<PendingCursorTool> {
+        Self::pending_tool_scoped(legacy_cursor_lane(session_id)?)
+    }
+
+    pub(crate) fn pending_tool_scoped(lane: OpaqueLane) -> Option<PendingCursorTool> {
+        let reg = BRIDGE_REGISTRY.lock().unwrap();
+        reg.sessions
+            .iter()
+            .find(|(stored_lane, _)| *stored_lane == lane)
+            .and_then(|(_, state)| state.pending_tool.clone())
+    }
+
+    /// Take the bridge state for a legacy session (removes it).
     pub fn take(session_id: &str) -> Option<CursorBridgeState> {
+        Self::take_scoped(legacy_cursor_lane(session_id)?)
+    }
+
+    pub(crate) fn take_scoped(lane: OpaqueLane) -> Option<CursorBridgeState> {
         let mut reg = BRIDGE_REGISTRY.lock().unwrap();
-        let pos = reg
+        let position = reg
             .sessions
             .iter()
-            .position(|s| s.session_id == session_id)?;
-        Some(reg.sessions.swap_remove(pos))
+            .position(|(stored_lane, _)| *stored_lane == lane)?;
+        Some(reg.sessions.swap_remove(position).1)
     }
 
-    /// Remove a bridge state for a session.
+    /// Remove a bridge state for a legacy session.
     pub fn remove(session_id: &str) {
-        let mut reg = BRIDGE_REGISTRY.lock().unwrap();
-        reg.sessions.retain(|s| s.session_id != session_id);
+        if let Some(lane) = legacy_cursor_lane(session_id) {
+            Self::remove_scoped(lane);
+        }
     }
 
-    /// Insert or update the pending tool for a session.
-    pub fn set_pending_tool(session_id: &str, tool: PendingCursorTool) {
+    pub(crate) fn remove_scoped(lane: OpaqueLane) {
         let mut reg = BRIDGE_REGISTRY.lock().unwrap();
-        if let Some(state) = reg.sessions.iter_mut().find(|s| s.session_id == session_id) {
+        reg.sessions.retain(|(stored_lane, _)| *stored_lane != lane);
+    }
+
+    /// Insert or update the pending tool for a legacy session.
+    pub fn set_pending_tool(session_id: &str, tool: PendingCursorTool) {
+        if let Some(lane) = legacy_cursor_lane(session_id) {
+            Self::set_pending_tool_scoped(lane, tool);
+        }
+    }
+
+    pub(crate) fn set_pending_tool_scoped(lane: OpaqueLane, tool: PendingCursorTool) {
+        let mut reg = BRIDGE_REGISTRY.lock().unwrap();
+        if let Some((_, state)) = reg
+            .sessions
+            .iter_mut()
+            .find(|(stored_lane, _)| *stored_lane == lane)
+        {
             state.pending_tool = Some(tool);
         }
     }
 
-    /// Update usage for a session.
+    /// Update usage for a legacy session.
     pub fn record_usage(session_id: &str, input_tokens: u64, output_tokens: u64) {
+        if let Some(lane) = legacy_cursor_lane(session_id) {
+            Self::record_usage_scoped(lane, input_tokens, output_tokens);
+        }
+    }
+
+    pub(crate) fn record_usage_scoped(lane: OpaqueLane, input_tokens: u64, output_tokens: u64) {
         let mut reg = BRIDGE_REGISTRY.lock().unwrap();
-        if let Some(state) = reg.sessions.iter_mut().find(|s| s.session_id == session_id) {
+        if let Some((_, state)) = reg
+            .sessions
+            .iter_mut()
+            .find(|(stored_lane, _)| *stored_lane == lane)
+        {
             state.input_tokens = input_tokens.max(state.input_tokens);
             state.output_tokens = output_tokens.max(state.output_tokens);
         }
@@ -256,10 +310,16 @@ pub fn advertised_tool_names(body: &MessagesRequest) -> Option<BTreeSet<String>>
 /// Returns `true` when the request is streaming, has a session id, and
 /// advertises at least one of Read, Write, or Bash.
 pub fn can_bridge_cursor_native_tools(body: &MessagesRequest, session_id: Option<&str>) -> bool {
-    let _sid = match session_id {
-        Some(id) if !id.is_empty() => id,
-        _ => return false,
-    };
+    can_bridge_cursor_native_tools_scoped(body, session_id.and_then(legacy_cursor_lane))
+}
+
+pub(crate) fn can_bridge_cursor_native_tools_scoped(
+    body: &MessagesRequest,
+    lane: Option<OpaqueLane>,
+) -> bool {
+    if lane.is_none() {
+        return false;
+    }
     if !body.stream {
         return false;
     }
@@ -522,11 +582,51 @@ pub fn start_cursor_tool_bridge(
     allowed_tool_names: Option<BTreeSet<String>>,
     id_factory: Box<dyn FnMut() -> String + Send>,
 ) -> (Vec<u8>, bool) {
+    start_cursor_tool_bridge_in_lane(
+        message_id,
+        model,
+        legacy_cursor_lane(session_id),
+        session_id,
+        events,
+        allowed_tool_names,
+        id_factory,
+    )
+}
+
+pub(crate) fn start_cursor_tool_bridge_scoped(
+    message_id: &str,
+    model: &str,
+    lane: OpaqueLane,
+    events: &[CursorStreamEvent],
+    allowed_tool_names: Option<BTreeSet<String>>,
+    id_factory: Box<dyn FnMut() -> String + Send>,
+) -> (Vec<u8>, bool) {
+    let encoded_lane = lane.encode();
+    start_cursor_tool_bridge_in_lane(
+        message_id,
+        model,
+        Some(lane),
+        &encoded_lane,
+        events,
+        allowed_tool_names,
+        id_factory,
+    )
+}
+
+fn start_cursor_tool_bridge_in_lane(
+    message_id: &str,
+    model: &str,
+    lane: Option<OpaqueLane>,
+    state_session_id: &str,
+    events: &[CursorStreamEvent],
+    allowed_tool_names: Option<BTreeSet<String>>,
+    id_factory: Box<dyn FnMut() -> String + Send>,
+) -> (Vec<u8>, bool) {
     let mut sse = Vec::new();
     let mut framer = CursorSseFramer::new(&mut sse, message_id, model);
 
     let mut state = CursorBridgeState::new(
-        session_id.to_string(),
+        state_session_id.to_string(),
         message_id.to_string(),
         model.to_string(),
         allowed_tool_names,
@@ -613,7 +713,7 @@ pub fn start_cursor_tool_bridge(
     if paused {
         let remaining = state.remaining_events.clone();
         let mut stored_state = CursorBridgeState::new(
-            session_id.to_string(),
+            state_session_id.to_string(),
             message_id.to_string(),
             model.to_string(),
             state.allowed_tool_names.clone(),
@@ -629,7 +729,9 @@ pub fn start_cursor_tool_bridge(
         stored_state.event_cursor = 0;
         stored_state.input_tokens = state.input_tokens;
         stored_state.output_tokens = state.output_tokens;
-        BridgeRegistry::insert(stored_state);
+        if let Some(lane) = lane {
+            BridgeRegistry::insert_scoped(lane, stored_state);
+        }
     }
 
     if !paused {
@@ -660,6 +762,42 @@ pub fn start_cursor_tool_bridge(
 /// Claude's `tool_result`, and continues producing SSE from remaining events.
 pub fn resume_cursor_tool_bridge(
     session_id: &str,
+    new_message_id: &str,
+    new_model: &str,
+    result: &serde_json::Value,
+    pending_tool: &PendingCursorTool,
+) -> (Vec<serde_json::Value>, Vec<u8>) {
+    resume_cursor_tool_bridge_in_lane(
+        legacy_cursor_lane(session_id),
+        session_id,
+        new_message_id,
+        new_model,
+        result,
+        pending_tool,
+    )
+}
+
+pub(crate) fn resume_cursor_tool_bridge_scoped(
+    lane: OpaqueLane,
+    new_message_id: &str,
+    new_model: &str,
+    result: &serde_json::Value,
+    pending_tool: &PendingCursorTool,
+) -> (Vec<serde_json::Value>, Vec<u8>) {
+    let encoded_lane = lane.encode();
+    resume_cursor_tool_bridge_in_lane(
+        Some(lane),
+        &encoded_lane,
+        new_message_id,
+        new_model,
+        result,
+        pending_tool,
+    )
+}
+
+fn resume_cursor_tool_bridge_in_lane(
+    lane: Option<OpaqueLane>,
+    state_session_id: &str,
     new_message_id: &str,
     new_model: &str,
     result: &serde_json::Value,
@@ -700,8 +838,9 @@ pub fn resume_cursor_tool_bridge(
     let mut framer = CursorSseFramer::new(&mut sse, new_message_id, new_model);
 
     // Retrieve stored state for remaining events
-    let remaining: Vec<CursorStreamEvent> = BridgeRegistry::pending_tool(session_id)
-        .and_then(|_| BridgeRegistry::take(session_id))
+    let remaining: Vec<CursorStreamEvent> = lane
+        .and_then(BridgeRegistry::pending_tool_scoped)
+        .and_then(|_| lane.and_then(BridgeRegistry::take_scoped))
         .map(|state| state.remaining_events)
         .unwrap_or_default();
 
@@ -785,7 +924,7 @@ pub fn resume_cursor_tool_bridge(
 
         if paused_again && !remaining.is_empty() {
             let state = CursorBridgeState::new(
-                session_id.to_string(),
+                state_session_id.to_string(),
                 new_message_id.to_string(),
                 new_model.to_string(),
                 None,
@@ -796,7 +935,9 @@ pub fn resume_cursor_tool_bridge(
                     )
                 }),
             );
-            BridgeRegistry::insert(state);
+            if let Some(lane) = lane {
+                BridgeRegistry::insert_scoped(lane, state);
+            }
         }
     }
 
@@ -875,6 +1016,7 @@ fn pending_from_recovered_tool(
 mod tests {
     use super::*;
     use crate::anthropic::schema::MessagesRequest;
+    use crate::request_identity::ConversationIdentity;
     use std::sync::Mutex;
 
     /// Serialize tests that share the global bridge registry.
@@ -1249,6 +1391,57 @@ mod tests {
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().name(), "Read");
 
+        BridgeRegistry::clear();
+    }
+
+    #[test]
+    fn scoped_bridge_registry_isolates_sibling_agent_lanes() {
+        let _lock = REGISTRY_LOCK.lock().unwrap();
+        BridgeRegistry::clear();
+        let lane = |agent: &str| {
+            RequestScope::from_conversation_identity(
+                Some(ConversationIdentity::Agent(
+                    "shared-session".to_string(),
+                    agent.to_string(),
+                )),
+                RequestPurpose::Conversation,
+            )
+            .provider_lane(LaneDomain::CursorToolBridge)
+            .unwrap()
+        };
+        let first_lane = lane("agent-one");
+        let second_lane = lane("agent-two");
+        let make_state = |lane: OpaqueLane, call_id: &str| {
+            let mut state = CursorBridgeState::new(
+                lane.encode(),
+                "msg".into(),
+                "cursor-test".into(),
+                None,
+                Box::new(|| "id".into()),
+            );
+            state.pending_tool = Some(PendingCursorTool::Read {
+                tool_use_id: call_id.to_string(),
+                path: "/tmp/a".into(),
+            });
+            state
+        };
+
+        BridgeRegistry::insert_scoped(first_lane, make_state(first_lane, "call-one"));
+        BridgeRegistry::insert_scoped(second_lane, make_state(second_lane, "call-two"));
+
+        assert_eq!(
+            BridgeRegistry::pending_tool_scoped(first_lane)
+                .unwrap()
+                .tool_use_id(),
+            "call-one"
+        );
+        assert_eq!(
+            BridgeRegistry::pending_tool_scoped(second_lane)
+                .unwrap()
+                .tool_use_id(),
+            "call-two"
+        );
+        assert!(BridgeRegistry::pending_tool("shared-session").is_none());
         BridgeRegistry::clear();
     }
 

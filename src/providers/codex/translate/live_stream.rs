@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use crate::anthropic::sse::encode_sse_event;
 use crate::providers::codex::events::is_terminal_rate_limit_event;
+use crate::request_identity::OpaqueLane;
 use crate::traffic::TrafficCapture;
 
-use super::read_rewrite::sanitize_read_args;
+use super::read_rewrite::{sanitize_read_args, sanitize_read_args_scoped};
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
     CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
@@ -49,6 +50,12 @@ struct LiveThinking {
     anthropic_index: usize,
 }
 
+#[derive(Clone, Copy)]
+enum ReadLane {
+    Legacy,
+    Stable(Option<OpaqueLane>),
+}
+
 pub struct LiveStreamTranslator {
     message_id: String,
     model: String,
@@ -67,6 +74,7 @@ pub struct LiveStreamTranslator {
     // Seeds Claude Code's live subagent counter until the provider returns
     // authoritative usage in the terminal message_delta.
     estimated_input_tokens: u64,
+    read_lane: ReadLane,
     finished: bool,
 }
 
@@ -79,6 +87,29 @@ impl LiveStreamTranslator {
         message_id: impl Into<String>,
         model: impl Into<String>,
         estimated_input_tokens: u64,
+    ) -> Self {
+        Self::with_read_lane(message_id, model, estimated_input_tokens, ReadLane::Legacy)
+    }
+
+    pub(crate) fn with_stable_read_lane(
+        message_id: impl Into<String>,
+        model: impl Into<String>,
+        estimated_input_tokens: u64,
+        read_lane: Option<OpaqueLane>,
+    ) -> Self {
+        Self::with_read_lane(
+            message_id,
+            model,
+            estimated_input_tokens,
+            ReadLane::Stable(read_lane),
+        )
+    }
+
+    fn with_read_lane(
+        message_id: impl Into<String>,
+        model: impl Into<String>,
+        estimated_input_tokens: u64,
+        read_lane: ReadLane,
     ) -> Self {
         Self {
             message_id: message_id.into(),
@@ -96,6 +127,7 @@ impl LiveStreamTranslator {
             deferred_text: Vec::new(),
             semantic_output_started: false,
             estimated_input_tokens,
+            read_lane,
             finished: false,
         }
     }
@@ -113,11 +145,10 @@ impl LiveStreamTranslator {
         let mut out = Vec::new();
 
         match kind {
-            "codex.rate_limits" => {
-                if is_terminal_rate_limit_event(payload) {
-                    return Err("rate limit reached".to_string());
-                }
+            "codex.rate_limits" if is_terminal_rate_limit_event(payload) => {
+                return Err("rate limit reached".to_string());
             }
+            "codex.rate_limits" => {}
             "keepalive" => {}
             "response.failed" | "response.error" | "error" => {
                 return Err(error_message(payload));
@@ -536,9 +567,12 @@ impl LiveStreamTranslator {
                     "Buffered {name} tool arguments exceeded safe limits"
                 ));
             }
-            if let Some(repaired) =
-                repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
-            {
+            if let Some(repaired) = repair_whitespace_stalled_read_args(
+                name,
+                args_accum,
+                Some(call_id.as_str()),
+                self.read_lane,
+            ) {
                 *args_accum = repaired.clone();
                 *emitted_args = true;
                 repaired_read = Some((*index, repaired));
@@ -707,7 +741,12 @@ impl LiveStreamTranslator {
                     *args_accum = final_args.to_string();
                 }
                 if !args_accum.is_empty() {
-                    *args_accum = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
+                    *args_accum = sanitize_read_args_for_lane(
+                        name,
+                        args_accum,
+                        Some(call_id.as_str()),
+                        self.read_lane,
+                    );
                     if *buffer_until_done || !*emitted_args {
                         *emitted_args = true;
                         self.emit(
@@ -1094,10 +1133,23 @@ fn response_is_incomplete(payload: &serde_json::Value) -> bool {
             .is_some()
 }
 
+fn sanitize_read_args_for_lane(
+    name: &str,
+    args: &str,
+    call_id: Option<&str>,
+    read_lane: ReadLane,
+) -> String {
+    match read_lane {
+        ReadLane::Legacy => sanitize_read_args(name, args, call_id),
+        ReadLane::Stable(lane) => sanitize_read_args_scoped(name, args, call_id, lane),
+    }
+}
+
 fn repair_whitespace_stalled_read_args(
     name: &str,
     args: &str,
     call_id: Option<&str>,
+    read_lane: ReadLane,
 ) -> Option<String> {
     if name != "Read" {
         return None;
@@ -1107,21 +1159,26 @@ fn repair_whitespace_stalled_read_args(
     if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
         return None;
     }
-    parse_read_args_candidate(trimmed, call_id).or_else(|| {
+    parse_read_args_candidate(trimmed, call_id, read_lane).or_else(|| {
         let with_brace = format!("{trimmed}}}");
-        parse_read_args_candidate(&with_brace, call_id)
+        parse_read_args_candidate(&with_brace, call_id, read_lane)
     })
 }
 
-fn parse_read_args_candidate(args: &str, call_id: Option<&str>) -> Option<String> {
+fn parse_read_args_candidate(
+    args: &str,
+    call_id: Option<&str>,
+    read_lane: ReadLane,
+) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
     if !is_valid_read_args(&parsed) {
         return None;
     }
-    Some(sanitize_read_args(
+    Some(sanitize_read_args_for_lane(
         "Read",
         &serde_json::to_string(&parsed).ok()?,
         call_id,
+        read_lane,
     ))
 }
 
@@ -1182,7 +1239,21 @@ fn error_message(payload: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::anthropic::sse::parse_sse_events;
+    use crate::providers::codex::translate::read_rewrite::read_offset_rewrite_scoped;
+    use crate::request_identity::{ConversationIdentity, LaneDomain, RequestPurpose, RequestScope};
     use serde_json::json;
+
+    fn read_lane(agent: &str) -> OpaqueLane {
+        RequestScope::from_conversation_identity(
+            Some(ConversationIdentity::Agent(
+                "read-scope-session".to_string(),
+                agent.to_string(),
+            )),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexReadRewrite)
+        .unwrap()
+    }
 
     fn render(events: Vec<serde_json::Value>) -> String {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
@@ -1401,6 +1472,42 @@ mod tests {
         assert!(out.contains("input_json_delta"));
         assert!(out.contains("/tmp/a"));
         assert!(!out.contains("pages"));
+    }
+
+    #[test]
+    fn live_read_rewrite_records_only_its_stable_lane() {
+        let _lock = crate::providers::codex::translate::read_rewrite::READ_REWRITE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_lane = read_lane("live-one");
+        let second_lane = read_lane("live-two");
+        let call_id = "call_live_stable_lane";
+        let mut translator =
+            LiveStreamTranslator::with_stable_read_lane("msg_1", "gpt-5.5", 0, Some(first_lane));
+        let mut output = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"function_call","call_id":call_id,"name":"Read"}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type":"function_call",
+                    "call_id":call_id,
+                    "name":"Read",
+                    "arguments":"{\"file_path\":\"/tmp/a\",\"offset\":1300000}"
+                }
+            }),
+        ] {
+            output.extend(translator.accept(&event, None).unwrap());
+        }
+
+        assert!(!String::from_utf8(output).unwrap().contains("1300000"));
+        assert!(read_offset_rewrite_scoped(Some(first_lane), call_id).is_some());
+        assert!(read_offset_rewrite_scoped(Some(second_lane), call_id).is_none());
     }
 
     #[test]

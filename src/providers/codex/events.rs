@@ -134,6 +134,155 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     })
 }
 
+pub(crate) fn failure_with_status(
+    payload: &Value,
+    expected_status: u16,
+) -> Option<CodexEventFailure> {
+    classify_event_failure(payload).filter(|failure| failure.status == expected_status)
+}
+
+pub(crate) fn first_failure_with_status(
+    body: &[u8],
+    expected_status: u16,
+) -> Option<CodexEventFailure> {
+    for event in crate::anthropic::sse::parse_sse_events(body) {
+        if event.data == "[DONE]" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
+            continue;
+        };
+        if let Some(failure) = failure_with_status(&payload, expected_status) {
+            return Some(failure);
+        }
+    }
+    None
+}
+
+pub(crate) struct BoundedAuthFailureDetector {
+    format: AuthFailureFormat,
+    pending: Vec<u8>,
+    discarding_oversized_sse_frame: bool,
+    finished: bool,
+    detected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthFailureFormat {
+    Json,
+    Sse,
+}
+
+impl BoundedAuthFailureDetector {
+    pub(crate) fn json() -> Self {
+        Self::new(AuthFailureFormat::Json)
+    }
+
+    pub(crate) fn sse() -> Self {
+        Self::new(AuthFailureFormat::Sse)
+    }
+
+    fn new(format: AuthFailureFormat) -> Self {
+        Self {
+            format,
+            pending: Vec::new(),
+            discarding_oversized_sse_frame: false,
+            finished: false,
+            detected: false,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, chunk: &[u8]) -> bool {
+        if self.finished || self.detected {
+            return false;
+        }
+        match self.format {
+            AuthFailureFormat::Json => self.observe_json(chunk),
+            AuthFailureFormat::Sse => self.observe_sse(chunk),
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> bool {
+        if self.finished || self.detected {
+            return false;
+        }
+        self.finished = true;
+        let detected = match self.format {
+            AuthFailureFormat::Json => json_has_auth_failure(&self.pending),
+            AuthFailureFormat::Sse if !self.discarding_oversized_sse_frame => {
+                sse_has_auth_failure(&self.pending)
+            }
+            AuthFailureFormat::Sse => false,
+        };
+        self.detected = detected;
+        detected
+    }
+
+    fn observe_json(&mut self, chunk: &[u8]) -> bool {
+        let limit = crate::traffic::MAX_STREAM_CAPTURE_FRAME_BYTES;
+        if self.pending.len().saturating_add(chunk.len()) > limit {
+            self.pending.clear();
+            self.finished = true;
+            return false;
+        }
+        self.pending.extend_from_slice(chunk);
+        if json_has_auth_failure(&self.pending) {
+            self.detected = true;
+            return true;
+        }
+        false
+    }
+
+    fn observe_sse(&mut self, chunk: &[u8]) -> bool {
+        for byte in chunk {
+            self.pending.push(*byte);
+            if let Some(separator_len) = boundary_suffix_len(&self.pending) {
+                if !self.discarding_oversized_sse_frame && sse_has_auth_failure(&self.pending) {
+                    self.detected = true;
+                    return true;
+                }
+                self.pending.clear();
+                self.discarding_oversized_sse_frame = false;
+                debug_assert!(separator_len <= 4);
+            } else if self.discarding_oversized_sse_frame {
+                retain_sse_boundary_prefix(&mut self.pending);
+            } else if self.pending.len() > crate::traffic::MAX_STREAM_CAPTURE_FRAME_BYTES {
+                self.discarding_oversized_sse_frame = true;
+                retain_sse_boundary_prefix(&mut self.pending);
+            }
+        }
+        false
+    }
+}
+
+fn json_has_auth_failure(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|payload| failure_with_status(&payload, 401))
+        .is_some()
+}
+
+fn sse_has_auth_failure(bytes: &[u8]) -> bool {
+    first_failure_with_status(bytes, 401).is_some()
+}
+
+fn boundary_suffix_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.ends_with(b"\r\n\r\n") {
+        Some(4)
+    } else if bytes.ends_with(b"\n\n") || bytes.ends_with(b"\r\r") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn retain_sse_boundary_prefix(bytes: &mut Vec<u8>) {
+    let keep = bytes.len().min(3);
+    if bytes.len() > keep {
+        bytes.drain(..bytes.len() - keep);
+    }
+}
+
 pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> {
     for event in crate::anthropic::sse::parse_sse_events(body) {
         if event.data == "[DONE]" {
@@ -290,5 +439,92 @@ mod tests {
         }))
         .unwrap();
         assert!(!failure.retryable());
+    }
+
+    #[test]
+    fn extracts_explicit_unauthorized_failures_from_payload_and_sse() {
+        let payload = serde_json::json!({
+            "type": "response.failed",
+            "status_code": 401,
+            "response": {
+                "error": {
+                    "status": 401,
+                    "message": "route credential rejected",
+                    "retry_after": 2
+                }
+            }
+        });
+        let failure = failure_with_status(&payload, 401).unwrap();
+        assert_eq!(failure.explicit_status, Some(401));
+        assert_eq!(failure.status, 401);
+        assert_eq!(failure.message, "route credential rejected");
+        assert_eq!(failure.retry_after.as_deref(), Some("2"));
+        assert!(!failure.retryable());
+
+        let body = format!(
+            "data: {{\"type\":\"response.created\"}}\n\ndata: {payload}\n\ndata: [DONE]\n\n"
+        );
+        assert_eq!(
+            first_failure_with_status(body.as_bytes(), 401),
+            Some(failure)
+        );
+        assert!(first_failure_with_status(body.as_bytes(), 403).is_none());
+    }
+
+    #[test]
+    fn unauthorized_requires_an_explicit_401_status() {
+        assert!(
+            failure_with_status(
+                &serde_json::json!({
+                    "type": "response.failed",
+                    "response": {"error": {"message": "unauthorized"}}
+                }),
+                401
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn bounded_auth_detector_handles_split_json_and_sse_frames() {
+        let mut json = BoundedAuthFailureDetector::json();
+        assert!(!json.observe(br#"{"type":"response.failed","status_"#));
+        assert!(
+            json.observe(br#"code":401,"response":{"error":{"status":401,"message":"expired"}}}"#)
+        );
+        assert!(!json.finish());
+
+        let mut sse = BoundedAuthFailureDetector::sse();
+        assert!(!sse.observe(
+            b"event: response.failed\r\ndata: {\"type\":\"response.failed\",\"status_code\":4"
+        ));
+        assert!(!sse.observe(
+            b"01,\"response\":{\"error\":{\"status\":401,\"message\":\"expired\"}}}\r\n\r"
+        ));
+        assert!(sse.observe(b"\n"));
+        assert!(!sse.observe(b"data: duplicate\n\n"));
+    }
+
+    #[test]
+    fn bounded_auth_detector_discards_oversized_frames_and_recovers() {
+        let mut json = BoundedAuthFailureDetector::json();
+        assert!(!json.observe(&vec![
+            b'x';
+            crate::traffic::MAX_STREAM_CAPTURE_FRAME_BYTES + 1
+        ]));
+        assert!(
+            !json
+                .observe(br#"{"type":"response.failed","status_code":401,"error":{"status":401}}"#)
+        );
+
+        let mut sse = BoundedAuthFailureDetector::sse();
+        assert!(!sse.observe(&vec![
+            b'x';
+            crate::traffic::MAX_STREAM_CAPTURE_FRAME_BYTES + 1
+        ]));
+        assert!(!sse.observe(b"\n\n"));
+        assert!(sse.observe(
+            b"data: {\"type\":\"error\",\"status_code\":401,\"error\":{\"status\":401}}\n\n"
+        ));
     }
 }

@@ -4,25 +4,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::request_identity::ConversationIdentity;
 
+use super::state::{CodexBoundRoute, SocketPoolKey};
 use super::translate::request::{ResponsesInputItem, ResponsesRequest};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_STATES: usize = 10_000;
-const MAX_OWNER_TRANSCRIPT_BYTES: u64 = 2_000_000;
-const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
+const MAX_OWNER_RETAINED_BYTES: u64 = 2_000_000;
+const MAX_TOTAL_RETAINED_BYTES: u64 = 20_000_000;
 
 #[derive(Clone)]
 struct ContinuationState {
     response_id: String,
     socket_id: u64,
+    route_key: Option<SocketPoolKey>,
     prompt_signature: String,
     transcript: Vec<ResponsesInputItem>,
-    transcript_bytes: u64,
+    retained_bytes: u64,
     updated_at: u64,
 }
 
 struct OwnerState {
     current_turn: u64,
+    cleanup_epoch: u64,
+    bound_route_key: Option<SocketPoolKey>,
     continuation: Option<ContinuationState>,
     updated_at: u64,
 }
@@ -30,11 +34,11 @@ struct OwnerState {
 #[derive(Default)]
 struct ContinuationRegistry {
     owners: HashMap<ConversationIdentity, OwnerState>,
-    total_transcript_bytes: u64,
+    total_retained_bytes: u64,
 }
 
 static REGISTRY: Mutex<Option<ContinuationRegistry>> = Mutex::new(None);
-static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 static TEST_REGISTRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -64,6 +68,8 @@ pub(crate) struct ContinuationReservation {
     candidate: ContinuationCandidate,
     owner: Option<ConversationIdentity>,
     origin_socket_id: Option<u64>,
+    route_key: Option<SocketPoolKey>,
+    cleanup_epoch: Option<u64>,
 }
 
 impl ContinuationReservation {
@@ -76,6 +82,8 @@ impl ContinuationReservation {
             candidate,
             owner,
             origin_socket_id,
+            route_key: None,
+            cleanup_epoch: None,
         }
     }
 
@@ -116,6 +124,63 @@ impl ContinuationReservation {
         self.origin_socket_id
     }
 
+    pub(crate) fn route_key(&self) -> Option<SocketPoolKey> {
+        self.route_key
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_epoch(&self) -> Option<u64> {
+        self.cleanup_epoch
+    }
+
+    pub(crate) fn bind_route(&self, route: &CodexBoundRoute) -> Self {
+        let mut bound = self.clone();
+        let route_key = route.socket_pool_key();
+        let previous_route_matches = bound.candidate.previous_response_id.is_none()
+            || (route_key.is_some() && bound.route_key == route_key);
+        if !previous_route_matches {
+            bound.candidate.previous_response_id = None;
+            bound.candidate.input_delta = None;
+            bound.candidate.disabled_reason = Some("route_changed".to_string());
+            bound.origin_socket_id = None;
+        }
+        bound.route_key = route_key;
+        bound.cleanup_epoch = None;
+
+        let (Some(owner), Some(turn_id), Some(route_key)) =
+            (bound.owner.as_ref(), bound.candidate.turn_id, route_key)
+        else {
+            return bound;
+        };
+        let mut guard = REGISTRY.lock().unwrap();
+        let Some(owner_state) = guard
+            .as_mut()
+            .and_then(|registry| registry.owners.get_mut(owner))
+        else {
+            return bound;
+        };
+        if owner_state.current_turn != turn_id {
+            bound.candidate.previous_response_id = None;
+            bound.candidate.input_delta = None;
+            bound.candidate.disabled_reason = Some("superseded_turn".to_string());
+            bound.origin_socket_id = None;
+            return bound;
+        }
+        owner_state.cleanup_epoch = owner_state
+            .cleanup_epoch
+            .checked_add(1)
+            .expect("Codex continuation cleanup epoch exhausted");
+        owner_state.bound_route_key = Some(route_key);
+        owner_state.updated_at = now_ms();
+        bound.cleanup_epoch = Some(owner_state.cleanup_epoch);
+        bound
+    }
+
+    fn with_previous_route_key(mut self, route_key: Option<SocketPoolKey>) -> Self {
+        self.route_key = route_key;
+        self
+    }
+
     pub(crate) fn into_candidate(self) -> ContinuationCandidate {
         self.candidate
     }
@@ -125,8 +190,23 @@ impl ContinuationReservation {
         candidate.previous_response_id = None;
         candidate.input_delta = None;
         candidate.disabled_reason = Some("full_context_retry".to_string());
-        Self::new(candidate, self.owner.clone(), None)
+        Self {
+            candidate,
+            owner: self.owner.clone(),
+            origin_socket_id: None,
+            route_key: self.route_key,
+            cleanup_epoch: self.cleanup_epoch,
+        }
     }
+}
+
+fn next_monotonic_nonzero(sequence: &AtomicU64, label: &str) -> u64 {
+    let previous = sequence
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("{label} sequence exhausted"));
+    previous + 1
 }
 
 fn now_ms() -> u64 {
@@ -188,27 +268,30 @@ fn continuation_candidate_inner(
         );
     };
 
-    let turn_id = NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed);
+    let turn_id = next_monotonic_nonzero(&NEXT_TURN_ID, "Codex continuation generation");
     let now = now_ms();
     let (state, superseded_turn) = {
         let mut guard = REGISTRY.lock().unwrap();
         let registry = guard.get_or_insert_with(ContinuationRegistry::default);
         let existing = registry.owners.remove(owner);
         let superseded_turn = existing.is_some();
-        let state = existing.and_then(|owner| owner.continuation);
-        if let Some(state) = &state {
-            registry.total_transcript_bytes = registry
-                .total_transcript_bytes
-                .saturating_sub(state.transcript_bytes);
-        }
-        registry.owners.insert(
-            owner.clone(),
-            OwnerState {
-                current_turn: turn_id,
-                continuation: None,
-                updated_at: now,
-            },
-        );
+        let state = existing.and_then(|owner_state| {
+            registry.total_retained_bytes = registry
+                .total_retained_bytes
+                .saturating_sub(owner_retained_size(owner, &owner_state));
+            owner_state.continuation
+        });
+        let owner_state = OwnerState {
+            current_turn: turn_id,
+            cleanup_epoch: 0,
+            bound_route_key: None,
+            continuation: None,
+            updated_at: now,
+        };
+        registry.total_retained_bytes = registry
+            .total_retained_bytes
+            .saturating_add(owner_retained_size(owner, &owner_state));
+        registry.owners.insert(owner.clone(), owner_state);
         evict_oldest(registry);
         (state, superseded_turn)
     };
@@ -245,6 +328,7 @@ fn continuation_candidate_from_state(
         }
     };
 
+    let previous_route_key = state.route_key;
     let signature = prompt_signature(body);
     if signature != state.prompt_signature {
         return ContinuationReservation::new(
@@ -299,6 +383,7 @@ fn continuation_candidate_from_state(
         Some(owner.clone()),
         Some(state.socket_id),
     )
+    .with_previous_route_key(previous_route_key)
 }
 
 #[deprecated(note = "recording without typed socket provenance is not reusable")]
@@ -349,9 +434,17 @@ pub(crate) fn record_continuation_for_owner(
     transcript.extend_from_slice(output_items);
 
     let transcript_json = serde_json::to_string(&transcript).unwrap_or_default();
-    let transcript_bytes = transcript_json.len() as u64;
+    let prompt_signature = prompt_signature(request_body);
+    let retained_bytes = continuation_retained_size(
+        owner,
+        &response_id,
+        reservation.route_key.as_ref(),
+        &prompt_signature,
+        &transcript,
+        transcript_json.len(),
+    );
 
-    if transcript_bytes > MAX_OWNER_TRANSCRIPT_BYTES {
+    if retained_bytes > MAX_OWNER_RETAINED_BYTES {
         abort_continuation_inner(Some(owner), Some(turn_id));
         return;
     }
@@ -359,9 +452,10 @@ pub(crate) fn record_continuation_for_owner(
     let state = ContinuationState {
         response_id,
         socket_id,
-        prompt_signature: prompt_signature(request_body),
+        route_key: reservation.route_key,
+        prompt_signature,
         transcript,
-        transcript_bytes,
+        retained_bytes,
         updated_at: now_ms(),
     };
 
@@ -372,15 +466,16 @@ pub(crate) fn record_continuation_for_owner(
     let Some(owner_state) = registry.owners.get_mut(owner) else {
         return;
     };
-    if owner_state.current_turn != turn_id {
+    if !reservation_matches_owner_state(reservation, owner_state) {
         return;
     }
-    if let Some(existing) = owner_state.continuation.replace(state) {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(existing.transcript_bytes);
-    }
-    registry.total_transcript_bytes += transcript_bytes;
+    let previous_size = owner_retained_size(owner, owner_state);
+    owner_state.continuation = Some(state);
+    let next_size = owner_retained_size(owner, owner_state);
+    registry.total_retained_bytes = registry
+        .total_retained_bytes
+        .saturating_sub(previous_size)
+        .saturating_add(next_size);
     evict_oldest(registry);
 }
 
@@ -391,7 +486,20 @@ pub fn abort_continuation(session_id: Option<&str>, turn_id: Option<u64>) {
 }
 
 pub(crate) fn abort_continuation_for_owner(reservation: &ContinuationReservation) {
-    abort_continuation_inner(reservation.owner(), reservation.turn_id());
+    let Some(owner) = reservation.owner() else {
+        return;
+    };
+    let mut guard = REGISTRY.lock().unwrap();
+    let Some(registry) = guard.as_mut() else {
+        return;
+    };
+    if registry
+        .owners
+        .get(owner)
+        .is_some_and(|state| reservation_matches_owner_state(reservation, state))
+    {
+        remove_owner(registry, owner);
+    }
 }
 
 fn abort_continuation_inner(owner: Option<&ConversationIdentity>, turn_id: Option<u64>) {
@@ -406,12 +514,8 @@ fn abort_continuation_inner(owner: Option<&ConversationIdentity>, turn_id: Optio
         .owners
         .get(owner)
         .is_some_and(|state| state.current_turn == turn_id)
-        && let Some(state) = registry.owners.remove(owner)
-        && let Some(continuation) = state.continuation
     {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(continuation.transcript_bytes);
+        remove_owner(registry, owner);
     }
 }
 
@@ -429,7 +533,13 @@ pub(crate) fn if_current_turn_for_owner<T>(
     reservation: &ContinuationReservation,
     action: impl FnOnce() -> T,
 ) -> Option<T> {
-    if_current_turn_inner(reservation.owner(), reservation.turn_id(), action)
+    let owner = reservation.owner()?;
+    let guard = REGISTRY.lock().unwrap();
+    let current = guard
+        .as_ref()
+        .and_then(|registry| registry.owners.get(owner))
+        .is_some_and(|state| reservation_matches_owner_state(reservation, state));
+    current.then(action)
 }
 
 fn if_current_turn_inner<T>(
@@ -473,7 +583,14 @@ pub fn is_current_turn(session_id: Option<&str>, turn_id: Option<u64>) -> bool {
 
 #[allow(dead_code)]
 pub(crate) fn is_current_turn_for_owner(reservation: &ContinuationReservation) -> bool {
-    is_current_turn_inner(reservation.owner(), reservation.turn_id())
+    let Some(owner) = reservation.owner() else {
+        return false;
+    };
+    let guard = REGISTRY.lock().unwrap();
+    guard
+        .as_ref()
+        .and_then(|registry| registry.owners.get(owner))
+        .is_some_and(|state| reservation_matches_owner_state(reservation, state))
 }
 
 fn is_current_turn_inner(owner: Option<&ConversationIdentity>, turn_id: Option<u64>) -> bool {
@@ -501,13 +618,7 @@ pub(crate) fn clear_continuation_for_owner(owner: Option<&ConversationIdentity>)
     let Some(registry) = guard.as_mut() else {
         return;
     };
-    if let Some(state) = registry.owners.remove(owner)
-        && let Some(continuation) = state.continuation
-    {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(continuation.transcript_bytes);
-    }
+    remove_owner(registry, owner);
 }
 
 #[deprecated(note = "use the owner-aware test helper for typed conversation ownership")]
@@ -524,9 +635,83 @@ pub(crate) fn has_continuation_for_owner_for_tests(owner: &ConversationIdentity)
         .is_some_and(|state| state.continuation.is_some())
 }
 
+#[cfg(test)]
+pub(crate) fn has_continuation_owner_state_for_tests(owner: &ConversationIdentity) -> bool {
+    REGISTRY
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|registry| registry.owners.contains_key(owner))
+}
+
 pub fn clear_all_continuations_for_tests() {
     let mut guard = REGISTRY.lock().unwrap();
     *guard = None;
+}
+
+fn reservation_matches_owner_state(
+    reservation: &ContinuationReservation,
+    state: &OwnerState,
+) -> bool {
+    if reservation.turn_id() != Some(state.current_turn) {
+        return false;
+    }
+    match (reservation.cleanup_epoch, reservation.route_key) {
+        (Some(epoch), Some(route_key)) => {
+            state.cleanup_epoch == epoch && state.bound_route_key == Some(route_key)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn owner_base_size(owner: &ConversationIdentity) -> u64 {
+    let identity_bytes = match owner {
+        ConversationIdentity::Main(session) => session.len(),
+        ConversationIdentity::Agent(session, agent) => session.len().saturating_add(agent.len()),
+    };
+    std::mem::size_of::<ConversationIdentity>()
+        .saturating_add(std::mem::size_of::<OwnerState>())
+        .saturating_add(3 * std::mem::size_of::<usize>())
+        .saturating_add(identity_bytes) as u64
+}
+
+fn continuation_retained_size(
+    owner: &ConversationIdentity,
+    response_id: &str,
+    route_key: Option<&SocketPoolKey>,
+    prompt_signature: &str,
+    transcript: &[ResponsesInputItem],
+    serialized_transcript_bytes: usize,
+) -> u64 {
+    let route_bytes = route_key.map_or(0, |_| std::mem::size_of::<SocketPoolKey>());
+    owner_base_size(owner).saturating_add(
+        std::mem::size_of::<ContinuationState>()
+            .saturating_add(response_id.len())
+            .saturating_add(route_bytes)
+            .saturating_add(prompt_signature.len())
+            .saturating_add(serialized_transcript_bytes)
+            .saturating_add(
+                transcript
+                    .len()
+                    .saturating_mul(std::mem::size_of::<ResponsesInputItem>()),
+            ) as u64,
+    )
+}
+
+fn owner_retained_size(owner: &ConversationIdentity, state: &OwnerState) -> u64 {
+    state
+        .continuation
+        .as_ref()
+        .map_or_else(|| owner_base_size(owner), |state| state.retained_bytes)
+}
+
+fn remove_owner(registry: &mut ContinuationRegistry, owner: &ConversationIdentity) {
+    if let Some(state) = registry.owners.remove(owner) {
+        registry.total_retained_bytes = registry
+            .total_retained_bytes
+            .saturating_sub(owner_retained_size(owner, &state));
+    }
 }
 
 fn input_suffix_after_prefix(
@@ -552,8 +737,10 @@ fn prompt_signature(body: &ResponsesRequest) -> String {
         Some(o) => o,
         None => return String::new(),
     };
-    let mut entries: Vec<(&String, &serde_json::Value)> =
-        obj.iter().filter(|(k, _)| *k != "input").collect();
+    let mut entries: Vec<(&String, &serde_json::Value)> = obj
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "input" | "prompt_cache_key"))
+        .collect();
     entries.sort_by_key(|(a, _)| *a);
     let mut sig = String::from("{");
     for (i, (key, val)) in entries.iter().enumerate() {
@@ -596,7 +783,7 @@ fn stable_json(value: &serde_json::Value) -> String {
 
 fn evict_oldest(registry: &mut ContinuationRegistry) {
     while registry.owners.len() > MAX_STATES
-        || registry.total_transcript_bytes > MAX_TOTAL_TRANSCRIPT_BYTES
+        || registry.total_retained_bytes > MAX_TOTAL_RETAINED_BYTES
     {
         let owner = registry
             .owners
@@ -606,19 +793,14 @@ fn evict_oldest(registry: &mut ContinuationRegistry) {
         let Some(owner) = owner else {
             break;
         };
-        if let Some(state) = registry.owners.remove(&owner)
-            && let Some(continuation) = state.continuation
-        {
-            registry.total_transcript_bytes = registry
-                .total_transcript_bytes
-                .saturating_sub(continuation.transcript_bytes);
-        }
+        remove_owner(registry, &owner);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request_identity::{LaneDomain, RequestPurpose, RequestScope};
     use serde_json::json;
 
     fn lock_registry() -> tokio::sync::MutexGuard<'static, ()> {
@@ -633,6 +815,26 @@ mod tests {
 
     fn agent_owner(session_id: &str, agent_id: &str) -> ConversationIdentity {
         ConversationIdentity::Agent(session_id.to_string(), agent_id.to_string())
+    }
+
+    fn route(owner: &ConversationIdentity, access: &str) -> CodexBoundRoute {
+        let lane = RequestScope::from_conversation_identity(
+            Some(owner.clone()),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexConversation);
+        CodexBoundRoute::new(
+            super::super::auth::token_store::StoredAuth {
+                access: access.to_string(),
+                refresh: String::new(),
+                expires: u64::MAX,
+                account_id: Some("account-a".to_string()),
+            },
+            "https://example.test/backend-api/codex/responses",
+            super::super::state::ProtocolLane::ResponsesFull,
+            lane,
+        )
+        .unwrap()
     }
 
     fn input(text: &str) -> ResponsesInputItem {
@@ -674,6 +876,19 @@ mod tests {
     ) {
         let reservation = continuation_candidate_for_owner(Some(owner), request, true);
         record_continuation_for_owner(&reservation, request, Some(response_id), Some(1), &[]);
+    }
+
+    #[test]
+    fn prompt_signature_bytes_count_toward_owner_quota() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("oversized-prompt");
+        let request = request_with_input(
+            vec![input("tiny")],
+            Some(json!({"instructions": "x".repeat(MAX_OWNER_RETAINED_BYTES as usize)})),
+        );
+        let reservation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        record_continuation_for_owner(&reservation, &request, Some("resp_oversized"), Some(1), &[]);
+        assert!(!has_continuation_for_owner_for_tests(&owner));
     }
 
     #[test]
@@ -948,6 +1163,86 @@ mod tests {
     }
 
     #[test]
+    fn route_owned_prompt_cache_key_does_not_break_append_only_detection() {
+        let _registry_guard = lock_registry();
+        let owner = agent_owner("session-a", "agent-a");
+        let first = request_with_input(
+            vec![input("one")],
+            Some(json!({"prompt_cache_key": "route-owned-key"})),
+        );
+        start_and_record(&owner, &first, "resp_1");
+
+        let appended = request_with_input(vec![input("one"), input("two")], None);
+        let reservation = continuation_candidate_for_owner(Some(&owner), &appended, true);
+        assert_eq!(
+            reservation.candidate().previous_response_id.as_deref(),
+            Some("resp_1")
+        );
+        assert_eq!(reservation.candidate().input_delta_count, 1);
+    }
+
+    #[test]
+    fn route_rebuild_retains_generation_and_fences_stale_route_cleanup() {
+        let _registry_guard = lock_registry();
+        let owner = agent_owner("route-session", "route-agent");
+        let request = request_with_input(vec![input("one")], None);
+        let route_a = route(&owner, "token-a");
+        let route_b = route(&owner, "token-b");
+
+        let first =
+            continuation_candidate_for_owner(Some(&owner), &request, true).bind_route(&route_a);
+        assert!(first.turn_id().is_some_and(|generation| generation != 0));
+        assert!(first.cleanup_epoch().is_some_and(|epoch| epoch != 0));
+        record_continuation_for_owner(&first, &request, Some("resp_a"), Some(11), &[]);
+
+        let appended = request_with_input(vec![input("one"), input("two")], None);
+        let reserved = continuation_candidate_for_owner(Some(&owner), &appended, true);
+        let generation = reserved.turn_id();
+        let bound_a = reserved.bind_route(&route_a);
+        assert_eq!(bound_a.turn_id(), generation);
+        assert_eq!(
+            bound_a.candidate().previous_response_id.as_deref(),
+            Some("resp_a")
+        );
+        assert_eq!(bound_a.origin_socket_id(), Some(11));
+
+        let bound_b = bound_a.bind_route(&route_b);
+        assert_eq!(bound_b.turn_id(), generation);
+        assert_eq!(bound_b.candidate().previous_response_id, None);
+        assert_eq!(bound_b.origin_socket_id(), None);
+        assert_eq!(
+            bound_b.candidate().disabled_reason.as_deref(),
+            Some("route_changed")
+        );
+        assert!(bound_b.cleanup_epoch() > bound_a.cleanup_epoch());
+        assert_ne!(bound_a.route_key(), bound_b.route_key());
+
+        record_continuation_for_owner(&bound_a, &appended, Some("stale"), Some(11), &[]);
+        abort_continuation_for_owner(&bound_a);
+        assert!(is_current_turn_for_owner(&bound_b));
+        record_continuation_for_owner(&bound_b, &appended, Some("resp_b"), Some(22), &[]);
+        assert!(has_continuation_for_owner_for_tests(&owner));
+    }
+
+    #[test]
+    fn newer_generation_supersedes_older_before_route_binding() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("generation-session");
+        let request = request_with_input(vec![input("one")], None);
+        let stale = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let current = continuation_candidate_for_owner(Some(&owner), &request, true);
+
+        assert!(current.turn_id().unwrap() > stale.turn_id().unwrap());
+        let stale = stale.bind_route(&route(&owner, "token-a"));
+        assert_eq!(
+            stale.candidate().disabled_reason.as_deref(),
+            Some("superseded_turn")
+        );
+        assert!(!is_current_turn_for_owner(&stale));
+        assert!(is_current_turn_for_owner(&current));
+    }
+
+    #[test]
     fn lane_switch_changes_continuation_prompt_signature() {
         let input = vec![ResponsesInputItem::Message {
             role: "user".to_string(),
@@ -970,9 +1265,10 @@ mod tests {
         let state = ContinuationState {
             response_id: "resp_1".to_string(),
             socket_id: 1,
+            route_key: None,
             prompt_signature: prompt_signature(&lite),
             transcript: input,
-            transcript_bytes: 0,
+            retained_bytes: 0,
             updated_at: now_ms(),
         };
 

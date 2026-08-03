@@ -39,7 +39,13 @@ Routing happens per request, not per server process or API surface. Codex IDs, K
 
 ## Session state
 
-Claude Code sends `x-claude-code-session-id`. The proxy uses it for monitor grouping and provider features that need continuity. Cursor conversation IDs, optional Codex `previous_response_id`, and optional Codex server compaction state live in memory. A proxy restart clears that state and portable Claude Code history remains the fallback.
+Claude Code sends `x-claude-code-session-id` and sends `x-claude-code-agent-id` for child Agents. A valid session header by itself selects the Main lane. A valid session plus a direct Agent header selects that child lane; `x-claude-code-parent-agent-id` is optional lineage and does not select the lane. Provider affinity and request sequence, Codex continuation and exact-socket WebSocket reuse, native compaction, Kimi prompt caching, Cursor pending tools, and Codex `Read` corrections are isolated by this canonical lane. Each built-in provider feature derives its own domain-separated opaque token, so raw session and Agent values are neither built-in provider state keys nor built-in upstream conversation identifiers.
+
+Each Codex request also binds an immutable endpoint, known account, credential, and Full/Lite protocol route. Route-bound continuation, socket, prompt-cache, and compaction state rolls over with that route. Proxy-local metadata that explains a corrected Codex `Read` offset deliberately remains on the stable downstream lane across route rollover; the same note is used by buffered non-streaming, buffered streaming, and live output translation, but never by a sibling Agent.
+
+An absent session, a parent without a direct Agent, or duplicated or malformed Claude identity headers makes the request stateless rather than merging it into Main. On the OpenAI-compatible routes, `session_id` and `x-client-request-id` provide a legacy Main-lane fallback only when no Claude identity headers are present. Count-token, detected auto-review classifier, image, transcription, and other auxiliary requests do not publish or consume conversational affinity, sequence, continuation, socket, compaction, Kimi, Cursor, or `Read` state. Public Rust APIs that accept string session IDs remain compatibility adapters; built-in ingress uses the strict parsed scope.
+
+Conversational state is memory-only and bounded. Idle session, continuation, WebSocket, and compaction entries expire after 30 minutes; session, continuation, and WebSocket registries each cap at 10,000 entries. Continuation transcripts cap at 2 MB per owner and 20 MB total. Native compaction caps at 1,000 entries, 4 MiB per entry, and 20,000,000 bytes total. Codex `Read` corrections keep at most 4,096 notes. A proxy restart or eviction clears provider state, while portable Claude Code history remains the fallback.
 
 ## Count tokens
 

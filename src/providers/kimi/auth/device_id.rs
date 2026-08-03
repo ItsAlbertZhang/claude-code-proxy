@@ -42,13 +42,13 @@ pub fn get_device_id() -> Result<String, anyhow::Error> {
     Ok(id)
 }
 
-fn set_mode(path: &std::path::Path, mode: u32) {
+fn set_mode(_path: &std::path::Path, _mode: u32) {
     #[cfg(unix)]
     {
-        if let Ok(meta) = fs::metadata(path) {
+        if let Ok(meta) = fs::metadata(_path) {
             let mut permissions = meta.permissions();
-            permissions.set_mode(mode);
-            let _ = fs::set_permissions(path, permissions);
+            permissions.set_mode(_mode);
+            let _ = fs::set_permissions(_path, permissions);
         }
     }
 }

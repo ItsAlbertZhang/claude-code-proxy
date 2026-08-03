@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 
 use crate::anthropic::sse::encode_sse_event;
+use crate::request_identity::OpaqueLane;
 use crate::traffic::TrafficCapture;
 
 use super::reducer::{
     ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic, reduce_upstream_bytes,
+    reduce_upstream_bytes_scoped,
 };
 use super::web_search_compat::build_web_search_compat_blocks;
 
@@ -257,6 +259,12 @@ pub fn translate_stream_bytes(
     translate_stream_bytes_with_traffic(upstream, message_id, model, 0, None)
 }
 
+#[derive(Clone, Copy)]
+enum ReadLane {
+    Legacy,
+    Stable(Option<OpaqueLane>),
+}
+
 pub fn translate_stream_bytes_with_traffic(
     upstream: &[u8],
     message_id: &str,
@@ -264,7 +272,47 @@ pub fn translate_stream_bytes_with_traffic(
     estimated_input_tokens: u64,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let events = match reduce_upstream_bytes(upstream) {
+    translate_stream_bytes_with_lane(
+        upstream,
+        message_id,
+        model,
+        estimated_input_tokens,
+        traffic,
+        ReadLane::Legacy,
+    )
+}
+
+pub(crate) fn translate_stream_bytes_scoped(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    estimated_input_tokens: u64,
+    traffic: Option<&TrafficCapture>,
+    read_lane: Option<OpaqueLane>,
+) -> Result<Vec<u8>, anyhow::Error> {
+    translate_stream_bytes_with_lane(
+        upstream,
+        message_id,
+        model,
+        estimated_input_tokens,
+        traffic,
+        ReadLane::Stable(read_lane),
+    )
+}
+
+fn translate_stream_bytes_with_lane(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    estimated_input_tokens: u64,
+    traffic: Option<&TrafficCapture>,
+    read_lane: ReadLane,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let reduced = match read_lane {
+        ReadLane::Legacy => reduce_upstream_bytes(upstream),
+        ReadLane::Stable(lane) => reduce_upstream_bytes_scoped(upstream, lane),
+    };
+    let events = match reduced {
         Ok(events) => events,
         Err(err) => {
             write_reducer_error_capture(traffic, &err);
@@ -477,6 +525,20 @@ fn write_reducer_error_capture(traffic: Option<&TrafficCapture>, err: &UpstreamS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::codex::translate::read_rewrite::read_offset_rewrite_scoped;
+    use crate::request_identity::{ConversationIdentity, LaneDomain, RequestPurpose, RequestScope};
+
+    fn read_lane(agent: &str) -> OpaqueLane {
+        RequestScope::from_conversation_identity(
+            Some(ConversationIdentity::Agent(
+                "read-scope-session".to_string(),
+                agent.to_string(),
+            )),
+            RequestPurpose::Conversation,
+        )
+        .provider_lane(LaneDomain::CodexReadRewrite)
+        .unwrap()
+    }
 
     fn sse_event(type_name: &str, payload: serde_json::Value) -> String {
         let mut obj = if let serde_json::Value::Object(m) = payload {
@@ -532,6 +594,55 @@ mod tests {
         assert!(out.contains(r#""input_tokens":5"#));
         assert!(out.contains(r#""output_tokens":1"#));
         assert!(out.contains("message_stop"));
+    }
+
+    #[test]
+    fn streaming_read_rewrite_records_only_its_stable_lane() {
+        let _lock = crate::providers::codex::translate::read_rewrite::READ_REWRITE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_lane = read_lane("streaming-one");
+        let second_lane = read_lane("streaming-two");
+        let call_id = "call_streaming_stable_lane";
+        let upstream = format!(
+            "{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":call_id,"name":"Read"}
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "call_id":call_id,
+                        "name":"Read",
+                        "arguments":"{\"file_path\":\"/tmp/a\",\"offset\":1300000}"
+                    }
+                })
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+
+        let output = translate_stream_bytes_scoped(
+            upstream.as_bytes(),
+            "msg_1",
+            "gpt-5.5",
+            0,
+            None,
+            Some(first_lane),
+        )
+        .unwrap();
+        assert!(!String::from_utf8(output).unwrap().contains("1300000"));
+        assert!(read_offset_rewrite_scoped(Some(first_lane), call_id).is_some());
+        assert!(read_offset_rewrite_scoped(Some(second_lane), call_id).is_none());
     }
 
     #[test]

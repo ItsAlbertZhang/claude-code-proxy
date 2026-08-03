@@ -7,6 +7,7 @@ use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_block_to_url, image_source_to_url, normalize_content,
     read_effort,
 };
+use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
 
 // ---------------------------------------------------------------------------
 // Kimi OpenAI-compatible chat-completions types
@@ -130,6 +131,24 @@ pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<KimiChatRequest, anyhow::Error> {
+    let prompt_cache_key =
+        RequestScope::legacy(opts.session_id.as_deref(), RequestPurpose::Conversation)
+            .provider_lane(LaneDomain::KimiPromptCache)
+            .map(|lane| lane.encode());
+    translate_request_with_prompt_cache(req, prompt_cache_key)
+}
+
+pub(crate) fn translate_request_scoped(
+    req: &MessagesRequest,
+    lane: Option<OpaqueLane>,
+) -> Result<KimiChatRequest, anyhow::Error> {
+    translate_request_with_prompt_cache(req, lane.map(|lane| lane.encode()))
+}
+
+fn translate_request_with_prompt_cache(
+    req: &MessagesRequest,
+    prompt_cache_key: Option<String>,
+) -> Result<KimiChatRequest, anyhow::Error> {
     let model = req.model.as_deref().unwrap_or(KIMI_DEFAULT_MODEL);
     let resolved = resolve_model(model);
     assert_allowed_model(&resolved).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -153,7 +172,7 @@ pub fn translate_request(
         }),
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
-        prompt_cache_key: opts.session_id,
+        prompt_cache_key,
     };
 
     // Collapse auto tool_choice to None (default behavior)
@@ -562,15 +581,11 @@ fn push_assistant_message(out: &mut Vec<KimiMessage>, blocks: &[ContentBlock]) {
 
     for block in blocks {
         match block {
-            ContentBlock::Text { text } => {
-                if !text.is_empty() {
-                    text_parts.push(text.clone());
-                }
+            ContentBlock::Text { text } if !text.is_empty() => {
+                text_parts.push(text.clone());
             }
-            ContentBlock::Thinking { thinking, .. } => {
-                if !thinking.is_empty() {
-                    thinking_parts.push(thinking.clone());
-                }
+            ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                thinking_parts.push(thinking.clone());
             }
             ContentBlock::ToolUse { id, name, input } => {
                 let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
@@ -648,8 +663,64 @@ mod tests {
         .unwrap();
         assert_eq!(translated.model, "kimi-for-coding");
         assert_eq!(translated.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(translated.prompt_cache_key.as_deref(), Some("sid"));
+        let expected_lane = RequestScope::legacy(Some("sid"), RequestPurpose::Conversation)
+            .provider_lane(LaneDomain::KimiPromptCache)
+            .unwrap()
+            .encode();
+        assert_eq!(
+            translated.prompt_cache_key.as_deref(),
+            Some(expected_lane.as_str())
+        );
+        assert!(!expected_lane.contains("sid"));
         assert_eq!(translated.max_tokens, 10);
+    }
+
+    #[test]
+    fn scoped_prompt_cache_keys_isolate_main_and_sibling_agents() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k2",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let lane = |identity| {
+            RequestScope::from_conversation_identity(Some(identity), RequestPurpose::Conversation)
+                .provider_lane(LaneDomain::KimiPromptCache)
+                .unwrap()
+        };
+        let main = lane(crate::request_identity::ConversationIdentity::Main(
+            "shared-session".to_string(),
+        ));
+        let first = lane(crate::request_identity::ConversationIdentity::Agent(
+            "shared-session".to_string(),
+            "agent-one".to_string(),
+        ));
+        let second = lane(crate::request_identity::ConversationIdentity::Agent(
+            "shared-session".to_string(),
+            "agent-two".to_string(),
+        ));
+
+        let main_key = translate_request_scoped(&req, Some(main))
+            .unwrap()
+            .prompt_cache_key
+            .unwrap();
+        let first_key = translate_request_scoped(&req, Some(first))
+            .unwrap()
+            .prompt_cache_key
+            .unwrap();
+        let second_key = translate_request_scoped(&req, Some(second))
+            .unwrap()
+            .prompt_cache_key
+            .unwrap();
+        assert_ne!(main_key, first_key);
+        assert_ne!(first_key, second_key);
+        assert!(!main_key.contains("shared-session"));
+        assert!(!first_key.contains("agent-one"));
+        assert!(
+            translate_request_scoped(&req, None)
+                .unwrap()
+                .prompt_cache_key
+                .is_none()
+        );
     }
 
     #[test]
