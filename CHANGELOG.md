@@ -12,8 +12,9 @@ description: Release notes for claude-code-proxy.
 
 ## v0.1.31 (2026-08-02)
 
-- OpenCode Go subscriptions can power Claude Code with supported OpenAI, Google,
-  and Anthropic models through the new OpenCode Go provider.
+- OpenCode Go subscriptions can power Claude Code with the supported GPT, Grok,
+  GLM, Kimi, DeepSeek, MiMo, MiniMax, Qwen, and HY model catalog through the new
+  OpenCode Go provider.
 - Codex HTTP responses stream as they arrive, remain active during quiet periods,
   and recover safely from temporary failures before model output begins.
   ([#51](https://github.com/raine/claude-code-proxy/pull/51))

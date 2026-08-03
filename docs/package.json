@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "astro dev",
     "start": "astro dev",
-    "build": "astro build && cp dist/llms-full.txt dist/llms.txt",
+    "sync:changelog": "node scripts/sync-changelog.mjs",
+    "build": "bun run sync:changelog && astro build && cp dist/llms-full.txt dist/llms.txt",
     "preview": "astro preview",
     "astro": "astro"
   },
