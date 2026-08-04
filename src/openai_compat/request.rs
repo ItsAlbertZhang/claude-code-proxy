@@ -114,11 +114,12 @@ pub fn parse_request(
         ));
     }
     validate_single_choice(object)?;
-    validate_parallel_tools(object)?;
+    let parallel_tool_calls = optional_bool(object, "parallel_tool_calls")?;
     validate_store(surface, object)?;
     let max_tokens = parse_max_tokens(surface, object)?;
     let tools = parse_tools(object.get("tools"), surface)?;
-    let tool_choice = parse_tool_choice(object.get("tool_choice"), &tools, surface)?;
+    let mut tool_choice = parse_tool_choice(object.get("tool_choice"), &tools, surface)?;
+    apply_parallel_tool_calls(&mut tool_choice, parallel_tool_calls);
     let response_metadata = if surface == OpenAiSurface::Responses {
         OpenAiResponseMetadata {
             tools: object
@@ -241,15 +242,18 @@ fn validate_single_choice(object: &Map<String, Value>) -> Result<(), OpenAiError
     }
 }
 
-fn validate_parallel_tools(object: &Map<String, Value>) -> Result<(), OpenAiError> {
-    match object.get("parallel_tool_calls") {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(()),
-        Some(Value::Bool(true)) => Err(OpenAiError::unsupported("parallel_tool_calls")),
-        Some(_) => Err(OpenAiError::invalid(
-            "'parallel_tool_calls' must be a boolean",
-            Some("parallel_tool_calls"),
-        )),
-    }
+fn apply_parallel_tool_calls(tool_choice: &mut Option<Value>, parallel_tool_calls: Option<bool>) {
+    let Some(parallel_tool_calls) = parallel_tool_calls else {
+        return;
+    };
+    let choice = tool_choice.get_or_insert_with(|| json!({"type":"auto"}));
+    choice
+        .as_object_mut()
+        .expect("translated tool choice is an object")
+        .insert(
+            "disable_parallel_tool_use".to_string(),
+            Value::Bool(!parallel_tool_calls),
+        );
 }
 
 fn parse_max_tokens(
@@ -1134,6 +1138,78 @@ mod tests {
             "tool_result"
         );
         assert_eq!(parsed.messages.extra["tool_choice"]["name"], "lookup");
+    }
+
+    #[test]
+    fn parallel_tool_calls_sets_anthropic_tool_choice_policy() {
+        let cases = [
+            (None, "auto"),
+            (Some(json!("auto")), "auto"),
+            (Some(json!("none")), "none"),
+            (Some(json!("required")), "any"),
+            (
+                Some(json!({"type":"function","function":{"name":"lookup"}})),
+                "tool",
+            ),
+        ];
+        for parallel in [false, true] {
+            for (choice, expected_type) in &cases {
+                let mut body = json!({
+                    "model":"kimi-k2.6",
+                    "messages":[{"role":"user","content":"look up x"}],
+                    "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                    "parallel_tool_calls":parallel,
+                });
+                if let Some(choice) = choice {
+                    body["tool_choice"] = choice.clone();
+                }
+                let parsed = parse_request(
+                    OpenAiSurface::ChatCompletions,
+                    body,
+                    "kimi",
+                    Some("session"),
+                )
+                .unwrap();
+                let translated = &parsed.messages.extra["tool_choice"];
+                assert_eq!(translated["type"], *expected_type);
+                assert_eq!(translated["disable_parallel_tool_use"], !parallel);
+            }
+        }
+    }
+
+    #[test]
+    fn responses_parallel_tool_calls_supports_named_choice() {
+        let parsed = parse_request(
+            OpenAiSurface::Responses,
+            json!({
+                "model":"grok-4.5",
+                "input":"look up x",
+                "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+                "tool_choice":{"type":"function","name":"lookup"},
+                "parallel_tool_calls":false,
+            }),
+            "grok",
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed.messages.extra["tool_choice"]["type"], "tool");
+        assert_eq!(
+            parsed.messages.extra["tool_choice"]["disable_parallel_tool_use"],
+            true
+        );
+    }
+
+    #[test]
+    fn parallel_tool_calls_must_be_boolean() {
+        let error = parse_request(
+            OpenAiSurface::Responses,
+            json!({"model":"grok-4.5","input":"hello","parallel_tool_calls":"false"}),
+            "grok",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.param.as_deref(), Some("parallel_tool_calls"));
+        assert!(error.code.is_none());
     }
 
     #[test]

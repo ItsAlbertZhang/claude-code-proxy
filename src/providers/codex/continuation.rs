@@ -190,13 +190,10 @@ impl ContinuationReservation {
         candidate.previous_response_id = None;
         candidate.input_delta = None;
         candidate.disabled_reason = Some("full_context_retry".to_string());
-        Self {
-            candidate,
-            owner: self.owner.clone(),
-            origin_socket_id: None,
-            route_key: self.route_key,
-            cleanup_epoch: self.cleanup_epoch,
-        }
+        let mut retry = Self::new(candidate, self.owner.clone(), None);
+        retry.route_key = self.route_key;
+        retry.cleanup_epoch = self.cleanup_epoch;
+        retry
     }
 }
 

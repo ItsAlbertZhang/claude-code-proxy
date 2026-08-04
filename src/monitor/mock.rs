@@ -5,7 +5,8 @@ use std::{
 };
 
 use super::{
-    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, RequestStatus, session_summaries,
+    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, RequestStatus, SessionUsage,
+    session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -348,7 +349,26 @@ fn mock_state_for_tick(
     recent.push_back(no_status);
 
     add_simulated_requests(now, instant_now, tick, &mut active, &mut recent);
-    let sessions = session_summaries(&active, &recent, output_buckets);
+    let mut session_usage = HashMap::<Option<String>, SessionUsage>::new();
+    for request in &recent {
+        let usage = session_usage.entry(request.session_id.clone()).or_default();
+        usage.input_tokens = usage
+            .input_tokens
+            .saturating_add(request.input_tokens.unwrap_or(0));
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(request.output_tokens.unwrap_or(0));
+    }
+    for request in &active {
+        let usage = session_usage.entry(request.session_id.clone()).or_default();
+        usage.input_tokens = usage
+            .input_tokens
+            .saturating_add(request.input_tokens.unwrap_or(0));
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(request.output_tokens.unwrap_or(0));
+    }
+    let sessions = session_summaries(&active, &recent, &session_usage, output_buckets);
     MonitorState {
         started_at,
         sessions,

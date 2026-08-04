@@ -79,7 +79,6 @@ fn baseline_compaction_error_forms(error: CompactionError) {
         }
     }
 }
-
 #[test]
 fn baseline_codex_public_api_forms_compile() {
     let (_tx, receiver) = tokio::sync::mpsc::channel::<Result<serde_json::Value, CodexError>>(1);

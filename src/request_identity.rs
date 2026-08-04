@@ -200,6 +200,7 @@ pub(crate) enum LaneDomain {
     CodexReadRewrite,
     KimiPromptCache,
     CursorToolBridge,
+    OpenCodeResponses,
 }
 
 impl LaneDomain {
@@ -209,6 +210,7 @@ impl LaneDomain {
             Self::CodexReadRewrite => b"codex-read-rewrite",
             Self::KimiPromptCache => b"kimi-prompt-cache",
             Self::CursorToolBridge => b"cursor-tool-bridge",
+            Self::OpenCodeResponses => b"opencode-responses",
         }
     }
 }
@@ -402,17 +404,88 @@ mod tests {
     }
 
     #[test]
-    fn malformed_identity_headers_are_stateless() {
-        let malformed = ["", "   ", "two values", "two\tvalues"];
-        // http::HeaderValue rejects DEL before ingress; keep the validator
-        // characterization explicit for legacy string adapters.
-        assert!(!valid_identity_text("x\u{7f}"));
+    fn parent_is_validation_only_and_never_changes_the_owner() {
+        let direct = ConversationIdentity::from_headers(&headers(&[
+            (CLAUDE_SESSION_HEADER, "session-a"),
+            (CLAUDE_AGENT_HEADER, "agent-child"),
+        ]));
+        let nested = ConversationIdentity::from_headers(&headers(&[
+            (CLAUDE_SESSION_HEADER, "session-a"),
+            (CLAUDE_AGENT_HEADER, "agent-child"),
+            (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+        ]));
+        let reparented = ConversationIdentity::from_headers(&headers(&[
+            (CLAUDE_SESSION_HEADER, "session-a"),
+            (CLAUDE_AGENT_HEADER, "agent-child"),
+            (CLAUDE_PARENT_AGENT_HEADER, "another-parent"),
+        ]));
+
+        assert_eq!(direct, nested);
+        assert_eq!(nested, reparented);
+    }
+
+    #[test]
+    fn ambiguous_or_absent_tuples_are_stateless() {
+        let cases = [
+            ("all missing", vec![]),
+            (
+                "agent without session",
+                vec![(CLAUDE_AGENT_HEADER, "agent-a")],
+            ),
+            (
+                "parent without direct agent",
+                vec![
+                    (CLAUDE_SESSION_HEADER, "session-a"),
+                    (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+                ],
+            ),
+            (
+                "parent alone",
+                vec![(CLAUDE_PARENT_AGENT_HEADER, "agent-parent")],
+            ),
+            (
+                "agent and parent without session",
+                vec![
+                    (CLAUDE_AGENT_HEADER, "agent-a"),
+                    (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+                ],
+            ),
+        ];
+
+        for (name, values) in cases {
+            assert_eq!(
+                ConversationIdentity::from_headers(&headers(&values)),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_text_in_every_identity_field() {
+        let malformed = [
+            ("empty", ""),
+            ("spaces only", "   "),
+            ("tabs only", "\t\t"),
+            ("internal space", "two values"),
+            ("internal tab", "two\tvalues"),
+            ("leading comma", ",value"),
+            ("trailing comma", "value,"),
+            ("coalesced", "first, second"),
+            ("oversize", "oversize-placeholder"),
+        ];
+
         for field in [
             CLAUDE_SESSION_HEADER,
             CLAUDE_AGENT_HEADER,
             CLAUDE_PARENT_AGENT_HEADER,
         ] {
-            for value in malformed {
+            for (shape, placeholder) in malformed {
+                let value = if shape == "oversize" {
+                    "x".repeat(MAX_IDENTITY_LEN + 1)
+                } else {
+                    placeholder.to_string()
+                };
                 let mut values = vec![
                     (CLAUDE_SESSION_HEADER, "session-a"),
                     (CLAUDE_AGENT_HEADER, "agent-a"),
@@ -422,12 +495,11 @@ mod tests {
                     .iter_mut()
                     .find(|(name, _)| *name == field)
                     .unwrap()
-                    .1 = value;
-                assert!(
-                    RequestScope::from_headers(&headers(&values), RequestPurpose::Conversation)
-                        .conversational_lane()
-                        .is_none(),
-                    "field={field} value={value:?}"
+                    .1 = &value;
+                assert_eq!(
+                    ConversationIdentity::from_headers(&headers(&values)),
+                    None,
+                    "field={field} shape={shape}"
                 );
             }
         }
@@ -493,6 +565,7 @@ mod tests {
             LaneDomain::CodexReadRewrite,
             LaneDomain::KimiPromptCache,
             LaneDomain::CursorToolBridge,
+            LaneDomain::OpenCodeResponses,
         ];
         let lanes = domains.map(|domain| scope.provider_lane(domain).unwrap());
         assert_eq!(
@@ -625,6 +698,17 @@ mod tests {
                     .identity()
                     .is_none()
             );
+        }
+    }
+
+    #[test]
+    fn malformed_agent_cannot_downgrade_a_valid_session_to_main() {
+        for malformed_agent in ["", "agent one", "agent-a,agent-b"] {
+            let identity = ConversationIdentity::from_headers(&headers(&[
+                (CLAUDE_SESSION_HEADER, "session-a"),
+                (CLAUDE_AGENT_HEADER, malformed_agent),
+            ]));
+            assert_eq!(identity, None, "agent={malformed_agent:?}");
         }
     }
 }

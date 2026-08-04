@@ -96,6 +96,99 @@ impl Provider for FakeProvider {
     }
 }
 
+struct TranslatingProvider {
+    name: &'static str,
+    model: &'static str,
+    captured: Arc<Mutex<Option<Value>>>,
+}
+
+#[async_trait]
+impl Provider for TranslatingProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec![self.model.to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn generate_anthropic_stream(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> Result<Generation, ProviderError> {
+        let translated = match self.name {
+            "kimi" => serde_json::to_value(
+                claude_code_proxy::providers::kimi::translate::request::translate_request(
+                    &body,
+                    claude_code_proxy::providers::kimi::translate::request::TranslateOptions {
+                        session_id: None,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            "grok" => serde_json::to_value(
+                claude_code_proxy::providers::grok::translate::request::translate_request(
+                    &body,
+                    self.model.to_string(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        };
+        *self.captured.lock().unwrap() = Some(translated);
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake\",\"model\":\"test\",\"usage\":{\"input_tokens\":1}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        Ok(Generation {
+            body: GenerationBody::BufferedSse(sse.into()),
+            resolved_model: self.model.to_string(),
+        })
+    }
+}
+
+fn translating_registry(
+    name: &'static str,
+    model: &'static str,
+    captured: Arc<Mutex<Option<Value>>>,
+) -> Arc<Registry> {
+    Arc::new(Registry::from_providers(
+        AliasProvider::Kimi,
+        vec![Arc::new(TranslatingProvider {
+            name,
+            model,
+            captured,
+        }) as Arc<dyn Provider>],
+    ))
+}
+
 type CapturedIdentity = (Option<ConversationIdentity>, Option<String>);
 
 struct IdentityCaptureProvider {
@@ -1080,6 +1173,59 @@ async fn openai_routes_select_non_codex_providers_and_aliases() {
             value["choices"][0]["message"]["content"].as_str()
         };
         assert_eq!(text, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn openai_routes_preserve_serial_tool_calls_upstream() {
+    for (provider, model, uri, body, expected_choice) in [
+        (
+            "kimi",
+            "kimi-k2.6",
+            "/v1/chat/completions",
+            json!({
+                "model":"kimi-k2.6",
+                "messages":[{"role":"user","content":"look up x"}],
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                "tool_choice":{"type":"function","function":{"name":"lookup"}},
+                "parallel_tool_calls":false
+            }),
+            json!({"type":"function","function":{"name":"lookup"}}),
+        ),
+        (
+            "grok",
+            "grok-4.5",
+            "/v1/responses",
+            json!({
+                "model":"grok-4.5",
+                "input":"look up x",
+                "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+                "tool_choice":"none",
+                "parallel_tool_calls":false
+            }),
+            json!("none"),
+        ),
+    ] {
+        let captured = Arc::new(Mutex::new(None));
+        let response = app_with_options(
+            translating_registry(provider, model, captured.clone()),
+            None,
+            true,
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body_string(&body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let translated = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(translated["parallel_tool_calls"], false);
+        assert_eq!(translated["tool_choice"], expected_choice);
     }
 }
 

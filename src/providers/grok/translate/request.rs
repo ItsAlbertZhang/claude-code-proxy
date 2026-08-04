@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::config::GrokToolImageMode;
-use crate::providers::translate_shared::{ImageSource, image_source_to_url};
+use crate::providers::translate_shared::{ImageSource, image_source_to_url, parallel_tool_calls};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -17,6 +17,8 @@ pub struct GrokResponsesRequest {
     pub tools: Option<Vec<GrokTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<GrokToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     pub store: bool,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,6 +185,7 @@ pub fn translate_request_with_mode(
         input,
         tools,
         tool_choice,
+        parallel_tool_calls: parallel_tool_calls(req),
         store: false,
         stream: true,
         max_output_tokens: req.max_tokens,
@@ -479,11 +482,29 @@ fn parse_tool_choice(
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("tool_choice type is invalid"))?;
+    let valid_policy = obj
+        .get("disable_parallel_tool_use")
+        .is_none_or(Value::is_boolean);
     match kind {
-        "auto" if obj.len() == 1 => Ok(Some(GrokToolChoice::Auto("auto".into()))),
-        "any" if obj.len() == 1 => Ok(Some(GrokToolChoice::Required("required".into()))),
-        "none" if obj.len() == 1 => Ok(Some(GrokToolChoice::None("none".into()))),
-        "tool" if obj.len() == 2 => {
+        "auto" | "any" | "none"
+            if valid_policy
+                && obj
+                    .keys()
+                    .all(|key| ["type", "disable_parallel_tool_use"].contains(&key.as_str())) =>
+        {
+            Ok(Some(match kind {
+                "auto" => GrokToolChoice::Auto("auto".into()),
+                "any" => GrokToolChoice::Required("required".into()),
+                "none" => GrokToolChoice::None("none".into()),
+                _ => unreachable!(),
+            }))
+        }
+        "tool"
+            if valid_policy
+                && obj.keys().all(|key| {
+                    ["type", "name", "disable_parallel_tool_use"].contains(&key.as_str())
+                }) =>
+        {
             let name = obj
                 .get("name")
                 .and_then(Value::as_str)
