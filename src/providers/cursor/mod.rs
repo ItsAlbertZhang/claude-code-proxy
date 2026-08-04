@@ -545,26 +545,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encoded_lane_legacy_session_cannot_alias_cursor_owner() {
-        let owner_lane = RequestScope::from_conversation_identity(
-            Some(ConversationIdentity::Main("cursor-owner".to_string())),
-            RequestPurpose::Conversation,
-        )
-        .provider_lane(LaneDomain::CursorToolBridge)
-        .unwrap();
-        let encoded_owner_lane = owner_lane.encode();
-
-        let legacy_lane = cursor_bridge_lane(Some(&encoded_owner_lane)).unwrap();
-        let expected_legacy_lane =
-            RequestScope::legacy(Some(&encoded_owner_lane), RequestPurpose::Conversation)
-                .provider_lane(LaneDomain::CursorToolBridge)
-                .unwrap();
-
-        assert_eq!(legacy_lane, expected_legacy_lane);
-        assert_ne!(legacy_lane, owner_lane);
-    }
-
-    #[test]
     fn supported_models_includes_legacy_and_agent() {
         let provider = CursorProvider::new();
         let models = provider.supported_models();

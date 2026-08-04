@@ -3,6 +3,31 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.32 (2026-08-03)
+
+- Kimi subagents and multimodal messages with mixed text and images work instead
+  of failing with an invalid content-part error.
+  ([#98](https://github.com/raine/claude-code-proxy/issues/98),
+  [#99](https://github.com/raine/claude-code-proxy/pull/99))
+
+## v0.1.31 (2026-08-02)
+
+- OpenCode Go subscriptions can power Claude Code with the supported GPT, Grok,
+  GLM, Kimi, DeepSeek, MiMo, MiniMax, Qwen, and HY model catalog through the new
+  OpenCode Go provider.
+- Codex HTTP responses stream as they arrive, remain active during quiet periods,
+  and recover safely from temporary failures before model output begins.
+  ([#51](https://github.com/raine/claude-code-proxy/pull/51))
+- OpenAI-compatible requests preserve the caller's parallel tool-call setting
+  across Codex, Kimi, and Grok routes.
+- Claude Code agents sharing a session keep independent Codex continuation state,
+  preventing one agent from consuming or replacing another agent's context.
+  ([#96](https://github.com/raine/claude-code-proxy/pull/96))
+- Overlapping Codex compaction requests preserve the correct conversation history
+  and summary. ([#94](https://github.com/raine/claude-code-proxy/pull/94))
+- Monitor session token totals remain accurate as older requests leave the recent
+  request list or receive stale usage updates.
+
 ## v0.1.30 (2026-07-31)
 
 - OpenAI-compatible clients can use Kimi, Grok, Cursor, or Codex through the

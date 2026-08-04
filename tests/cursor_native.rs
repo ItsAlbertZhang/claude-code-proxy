@@ -17,6 +17,36 @@ use std::sync::Mutex;
 
 static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvGuard {
+    fn set(values: &[(&'static str, &str)]) -> Self {
+        let saved = values
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        unsafe {
+            for (name, value) in values {
+                std::env::set_var(name, value);
+            }
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.0.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prost roundtrip
 // ---------------------------------------------------------------------------
@@ -241,7 +271,7 @@ fn selected_images_count_matches_base64_images() {
 fn cursor_client_constructs_correct_url() {
     use claude_code_proxy::providers::cursor::client::CursorHttpClient;
 
-    let client = CursorHttpClient::new();
+    let client = CursorHttpClient::new_for_test();
     // Just ensure construction doesn't panic
     let _ = client;
 }
@@ -258,7 +288,7 @@ fn cursor_error_display_works() {
 
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)]
-async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
+async fn cursor_loopback_mock_ignores_ambient_proxy_and_sends_connect_request() {
     use axum::{Router, routing::post};
     use claude_code_proxy::providers::cursor::client::CursorHttpClient;
     use claude_code_proxy::providers::cursor::connect::{
@@ -337,10 +367,13 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     let addr = listener.local_addr().unwrap();
     let mock_url = format!("http://{}", addr);
 
-    unsafe {
-        std::env::set_var("CCP_CURSOR_BASE_URL", &mock_url);
-        std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "test-client-version");
-    }
+    let _env = EnvGuard::set(&[
+        ("CCP_CURSOR_BASE_URL", &mock_url),
+        ("CCP_CURSOR_CLIENT_VERSION", "test-client-version"),
+        ("HTTP_PROXY", "http://127.0.0.1:9"),
+        ("HTTPS_PROXY", "http://127.0.0.1:9"),
+        ("NO_PROXY", ""),
+    ]);
 
     let _handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -348,7 +381,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let client = CursorHttpClient::new();
+    let client = CursorHttpClient::new_for_test();
     let upstream = client
         .run_agent(
             "wire-token",
@@ -762,7 +795,7 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
     use claude_code_proxy::providers::cursor::client::CursorHttpClient;
 
     let token = load_cursor_token().unwrap();
-    let client = CursorHttpClient::new();
+    let client = CursorHttpClient::new_for_test();
     let upstream = client
         .run_agent(&token, "test prompt", "cursor:gpt-5.5", &[])
         .await
@@ -996,6 +1029,13 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
     let upstream_url = format!("http://{}", upstream_addr);
+    let _env_guard = EnvGuard::set(&[
+        ("CCP_CURSOR_BASE_URL", &upstream_url),
+        ("CCP_CURSOR_AUTH_TOKEN", "proxy-token"),
+        ("CCP_CURSOR_CLIENT_VERSION", "proxy-test-version"),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ]);
     let _upstream_handle = tokio::spawn(async move {
         axum::serve(upstream_listener, upstream_app).await.unwrap();
     });
@@ -1011,15 +1051,9 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
         .unwrap();
     });
 
-    unsafe {
-        std::env::set_var("CCP_CURSOR_BASE_URL", &upstream_url);
-        std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "proxy-token");
-        std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "proxy-test-version");
-    }
-
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let resp = client
         .post(format!("http://{proxy_addr}/v1/messages"))
         .header("authorization", "Bearer ignored")
@@ -1059,11 +1093,6 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
     );
 
     let _ = shutdown_tx.send(());
-    unsafe {
-        std::env::remove_var("CCP_CURSOR_BASE_URL");
-        std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
-        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -43,6 +43,16 @@ impl Default for CursorHttpClient {
 
 impl CursorHttpClient {
     pub fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// Build a client that ignores ambient proxy variables for loopback mocks.
+    #[doc(hidden)]
+    pub fn new_for_test() -> Self {
+        Self::build(true)
+    }
+
+    fn build(disable_proxies: bool) -> Self {
         // Use HTTP/2 prior knowledge for cleartext URLs (mock testing) and
         // standard TLS for https URLs.
         let base_url = config::cursor_base_url();
@@ -54,6 +64,9 @@ impl CursorHttpClient {
 
         if is_cleartext {
             builder = builder.http2_prior_knowledge();
+        }
+        if disable_proxies {
+            builder = builder.no_proxy();
         }
 
         let client = builder.build().expect("CursorHttpClient: reqwest client");

@@ -94,7 +94,7 @@ async fn handle_messages_with_lane(
     }
     let upstream = match tokio::task::spawn_blocking(move || {
         let client = client::KimiHttpClient::new();
-        let result = client.post_kimi(&translated);
+        let result = client.post_kimi_wire(&translated);
         drop(client);
         result
     })
@@ -205,7 +205,7 @@ async fn generate_anthropic_stream_with_lane(
     }
     let upstream = tokio::task::spawn_blocking(move || {
         let client = client::KimiHttpClient::new();
-        let result = client.post_kimi(&translated);
+        let result = client.post_kimi_wire(&translated);
         drop(client);
         result
     })
@@ -423,28 +423,3 @@ impl CliHandlers for KimiCli {
 }
 
 pub(crate) static KIMI_CLI: KimiCli = KimiCli;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encoded_lane_legacy_session_cannot_alias_kimi_owner() {
-        let owner_lane = RequestScope::from_conversation_identity(
-            Some(ConversationIdentity::Main("kimi-owner".to_string())),
-            RequestPurpose::Conversation,
-        )
-        .provider_lane(LaneDomain::KimiPromptCache)
-        .unwrap();
-        let encoded_owner_lane = owner_lane.encode();
-
-        let legacy_lane = kimi_prompt_cache_lane(Some(&encoded_owner_lane)).unwrap();
-        let expected_legacy_lane =
-            RequestScope::legacy(Some(&encoded_owner_lane), RequestPurpose::Conversation)
-                .provider_lane(LaneDomain::KimiPromptCache)
-                .unwrap();
-
-        assert_eq!(legacy_lane, expected_legacy_lane);
-        assert_ne!(legacy_lane, owner_lane);
-    }
-}

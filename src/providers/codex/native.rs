@@ -1281,6 +1281,19 @@ mod tests {
     }
 
     #[test]
+    fn native_request_preserves_parallel_tool_calls() {
+        for parallel in [false, true] {
+            let mut body = request(json!({
+                "model":"gpt-5.4",
+                "input":[],
+                "parallel_tool_calls":parallel
+            }));
+            shape_native_request(&mut body).unwrap();
+            assert_eq!(body["parallel_tool_calls"], parallel);
+        }
+    }
+
+    #[test]
     fn explicit_service_tier_is_preserved() {
         let mut body = request(json!({
             "model":"gpt-5.4-fast",

@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::config::GrokToolImageMode;
-use crate::providers::translate_shared::{ImageSource, image_source_to_url};
+use crate::providers::translate_shared::{ImageSource, image_source_to_url, parallel_tool_calls};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -21,6 +21,22 @@ pub struct GrokResponsesRequest {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct GrokResponsesWireRequest {
+    #[serde(flatten)]
+    request: GrokResponsesRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+}
+
+impl std::ops::Deref for GrokResponsesWireRequest {
+    type Target = GrokResponsesRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +143,16 @@ pub fn translate_request(
     model: String,
 ) -> anyhow::Result<GrokResponsesRequest> {
     translate_request_with_mode(req, model, crate::config::grok_tool_image_mode())
+}
+
+pub(crate) fn translate_wire_request(
+    req: &MessagesRequest,
+    model: String,
+) -> anyhow::Result<GrokResponsesWireRequest> {
+    Ok(GrokResponsesWireRequest {
+        request: translate_request_with_mode(req, model, crate::config::grok_tool_image_mode())?,
+        parallel_tool_calls: parallel_tool_calls(req),
+    })
 }
 
 pub fn translate_request_with_mode(
@@ -336,6 +362,7 @@ fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
             "system",
             "tools",
             "tool_choice",
+            "parallel_tool_calls",
             "context_management",
             "diagnostics",
             "metadata",
@@ -479,11 +506,29 @@ fn parse_tool_choice(
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("tool_choice type is invalid"))?;
+    let valid_policy = obj
+        .get("disable_parallel_tool_use")
+        .is_none_or(Value::is_boolean);
     match kind {
-        "auto" if obj.len() == 1 => Ok(Some(GrokToolChoice::Auto("auto".into()))),
-        "any" if obj.len() == 1 => Ok(Some(GrokToolChoice::Required("required".into()))),
-        "none" if obj.len() == 1 => Ok(Some(GrokToolChoice::None("none".into()))),
-        "tool" if obj.len() == 2 => {
+        "auto" | "any" | "none"
+            if valid_policy
+                && obj
+                    .keys()
+                    .all(|key| ["type", "disable_parallel_tool_use"].contains(&key.as_str())) =>
+        {
+            Ok(Some(match kind {
+                "auto" => GrokToolChoice::Auto("auto".into()),
+                "any" => GrokToolChoice::Required("required".into()),
+                "none" => GrokToolChoice::None("none".into()),
+                _ => unreachable!(),
+            }))
+        }
+        "tool"
+            if valid_policy
+                && obj.keys().all(|key| {
+                    ["type", "name", "disable_parallel_tool_use"].contains(&key.as_str())
+                }) =>
+        {
             let name = obj
                 .get("name")
                 .and_then(Value::as_str)
@@ -1122,6 +1167,22 @@ mod tests {
             item["role"] == "assistant" && item["content"][0]["text"] == "Found it"
         }));
         assert!(!value.to_string().contains("srvtoolu_1"));
+    }
+
+    #[test]
+    fn tool_free_parallel_policy_is_preserved_for_grok() {
+        for parallel in [false, true] {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"user","content":"hello"}],
+                "parallel_tool_calls":parallel
+            }))
+            .unwrap();
+            let translated = translate_wire_request(&request, "grok-4.5".into()).unwrap();
+            let wire = serde_json::to_value(&translated).unwrap();
+            assert_eq!(wire["parallel_tool_calls"], parallel);
+            assert!(translated.tool_choice.is_none());
+        }
     }
 
     #[test]

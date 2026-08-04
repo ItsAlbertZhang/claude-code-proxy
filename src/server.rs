@@ -3,9 +3,9 @@ use crate::{
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     openai_compat::{
-        MAX_OPENAI_REQUEST_BYTES, OpenAiError, OpenAiSurface,
+        DEFAULT_PARALLEL_TOOL_CALLS, MAX_OPENAI_REQUEST_BYTES, OpenAiError, OpenAiSurface,
         request::{extract_model, parse_request},
-        stream::openai_response as render_openai_response,
+        stream::openai_response_with_parallel_policy as render_openai_response,
     },
     project,
     provider::{RequestContext, ScopedRequestContext},
@@ -1030,6 +1030,12 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         monitor: state.monitor.clone(),
     };
     let response = if let Some(parsed) = parsed {
+        let parallel_tool_calls = parsed
+            .messages
+            .extra
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .unwrap_or(DEFAULT_PARALLEL_TOOL_CALLS);
         match provider
             .generate_anthropic_stream_with_conversation_identity(
                 parsed.messages,
@@ -1051,6 +1057,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
                     parsed.stream,
                     parsed.include_usage,
                     parsed.response_metadata,
+                    parallel_tool_calls,
                     traffic.clone(),
                 )
                 .await
@@ -1301,6 +1308,12 @@ async fn handler_chat_completions(
         }
     } else {
         let parsed = parsed.expect("non-Codex request was parsed");
+        let parallel_tool_calls = parsed
+            .messages
+            .extra
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .unwrap_or(DEFAULT_PARALLEL_TOOL_CALLS);
         match provider
             .generate_anthropic_stream_with_conversation_identity(
                 parsed.messages,
@@ -1322,6 +1335,7 @@ async fn handler_chat_completions(
                     parsed.stream,
                     parsed.include_usage,
                     parsed.response_metadata,
+                    parallel_tool_calls,
                     traffic.clone(),
                 )
                 .await
@@ -1602,13 +1616,13 @@ async fn dispatch_request(
 
     let mut normalized_model = normalize_incoming_model(model);
     body.model = Some(normalized_model.clone());
-    if !count_tokens && is_claude_auto_review_request(&body) {
-        request_scope = request_scope.with_purpose(RequestPurpose::AutoReview);
-    }
     let session_state = session::existing_conversation(request_scope.conversational_lane(), now);
     let session_affinity = session_state
         .as_ref()
         .and_then(|state| state.affinity_provider.as_ref());
+    if !count_tokens && is_claude_auto_review_request(&body) {
+        request_scope = request_scope.with_purpose(RequestPurpose::AutoReview);
+    }
     let original_provider = state
         .registry
         .provider_for_model(&normalized_model, session_affinity);

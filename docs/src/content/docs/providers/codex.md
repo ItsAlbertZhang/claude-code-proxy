@@ -72,6 +72,8 @@ Every conversational Codex request binds one immutable endpoint, known account, 
 
 After any semantic output is published, the proxy never replays the request. The Anthropic live adapter preserves already-published content and terminates with a sanitized Anthropic authentication error rather than forwarding a raw Codex failure frame. A native `/v1/responses` request carrying caller-supplied `previous_response_id` is also never replayed after a header 401 because the proxy cannot reconstruct that upstream state. Native JSON or SSE unauthorized failures discovered in an HTTP 200 body preserve the original status, bytes, and framing; they may refresh credentials for the next request only, with no current-request replay.
 
+HTTP transport decodes fragmented LF or CRLF SSE incrementally, publishes translated output as soon as semantic events arrive, and emits Anthropic heartbeat pings only while the HTTP body is silent. Bounded transient, overload, rate-limit, EOF, UTF-8, and JSON retries stay on the immutable route and are allowed only before semantic output. HTTP always sends full context and never publishes a reusable continuation or WebSocket pool entry. Dropping the downstream body cancels active reads, backoff, continuation reservations, and compaction leases.
+
 Detected auto-review classifier subrequests are intentionally stateless even when valid session and Agent headers are present. They neither consume nor publish continuation, WebSocket, affinity, sequence, compaction, Kimi, Cursor, or `Read` state.
 
 ## Server compaction
@@ -120,7 +122,7 @@ While the native request is active, the monitor shows `compacting`. Structured l
 
 ## OpenAI-compatible APIs
 
-`CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, and Cursor models.
+`CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, OpenCode Go, and Cursor models.
 
 The Responses route preserves native JSON or SSE response bodies for registered Codex models. Caller-supplied native `previous_response_id` passes through, but makes a header-401 attempt non-replayable because the proxy does not own that upstream chain. Unauthorized errors encoded inside an HTTP 200 JSON body or SSE stream also are not replayed: their status, bytes, and framing are returned unchanged, and refreshed credentials apply only to a later request. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. Its omitted reasoning effort defaults to `medium`; the proxy-wide Codex effort override still takes precedence.
 

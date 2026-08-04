@@ -303,6 +303,26 @@ pub fn buffered_response(
     created: u64,
     response_metadata: &OpenAiResponseMetadata,
 ) -> Result<Value, OpenAiError> {
+    buffered_response_with_parallel_policy(
+        surface,
+        events,
+        response_id,
+        model,
+        created,
+        response_metadata,
+        false,
+    )
+}
+
+pub(crate) fn buffered_response_with_parallel_policy(
+    surface: OpenAiSurface,
+    events: &[SseEvent],
+    response_id: &str,
+    model: &str,
+    created: u64,
+    response_metadata: &OpenAiResponseMetadata,
+    parallel_tool_calls: bool,
+) -> Result<Value, OpenAiError> {
     let mut state = AnthropicAccumulator::default();
     for event in events {
         state.apply(event)?;
@@ -315,12 +335,13 @@ pub fn buffered_response(
     }
     match surface {
         OpenAiSurface::ChatCompletions => Ok(chat_response(&state, response_id, model, created)),
-        OpenAiSurface::Responses => Ok(responses_response(
+        OpenAiSurface::Responses => Ok(responses_response_with_parallel_policy(
             &state,
             response_id,
             model,
             created,
             response_metadata,
+            parallel_tool_calls,
         )),
     }
 }
@@ -409,6 +430,24 @@ pub fn responses_response(
     created: u64,
     response_metadata: &OpenAiResponseMetadata,
 ) -> Value {
+    responses_response_with_parallel_policy(
+        state,
+        response_id,
+        model,
+        created,
+        response_metadata,
+        false,
+    )
+}
+
+pub(crate) fn responses_response_with_parallel_policy(
+    state: &AnthropicAccumulator,
+    response_id: &str,
+    model: &str,
+    created: u64,
+    response_metadata: &OpenAiResponseMetadata,
+    parallel_tool_calls: bool,
+) -> Value {
     let mut output = Vec::new();
     for block in state
         .blocks
@@ -462,7 +501,7 @@ pub fn responses_response(
         "status":if incomplete { "incomplete" } else { "completed" },
         "model":model,
         "output":output,
-        "parallel_tool_calls":false,
+        "parallel_tool_calls":parallel_tool_calls,
         "tool_choice":response_metadata.tool_choice,
         "tools":response_metadata.tools,
         "error":null,
@@ -694,19 +733,21 @@ mod tests {
     }
 
     #[test]
-    fn renders_responses_function_items() {
-        let response = buffered_response(
+    fn buffered_responses_preserves_effective_parallel_policy() {
+        let response = buffered_response_with_parallel_policy(
             OpenAiSurface::Responses,
             &events(),
             "resp_test",
             "kimi-k2.6",
             1,
             &OpenAiResponseMetadata::default(),
+            true,
         )
         .unwrap();
         assert_eq!(response["object"], "response");
         assert_eq!(response["output"][0]["type"], "message");
         assert_eq!(response["output"][1]["type"], "function_call");
+        assert_eq!(response["parallel_tool_calls"], true);
         assert_eq!(response["usage"]["total_tokens"], 10);
     }
 }

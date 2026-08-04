@@ -5,7 +5,7 @@ use super::model_allowlist::{KIMI_DEFAULT_MODEL, assert_allowed_model, is_k3, re
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_block_to_url, image_source_to_url, normalize_content,
-    read_effort,
+    parallel_tool_calls, read_effort,
 };
 use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
 
@@ -30,6 +30,22 @@ pub struct KimiChatRequest {
     pub thinking: Option<KimiThinking>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct KimiChatWireRequest {
+    #[serde(flatten)]
+    request: KimiChatRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+}
+
+impl std::ops::Deref for KimiChatWireRequest {
+    type Target = KimiChatRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,8 +157,11 @@ pub fn translate_request(
 pub(crate) fn translate_request_scoped(
     req: &MessagesRequest,
     lane: Option<OpaqueLane>,
-) -> Result<KimiChatRequest, anyhow::Error> {
-    translate_request_with_prompt_cache(req, lane.map(|lane| lane.encode()))
+) -> Result<KimiChatWireRequest, anyhow::Error> {
+    Ok(KimiChatWireRequest {
+        request: translate_request_with_prompt_cache(req, lane.map(|lane| lane.encode()))?,
+        parallel_tool_calls: parallel_tool_calls(req),
+    })
 }
 
 fn translate_request_with_prompt_cache(
@@ -504,7 +523,7 @@ fn push_user_messages(out: &mut Vec<KimiMessage>, blocks: &[ContentBlock]) {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum KimiUserContentPart {
     Text { text: String },
     ImageUrl { image_url: KimiImageUrl },
@@ -568,7 +587,7 @@ fn tool_result_content(content: &Value, is_error: Option<bool>) -> Value {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum KimiToolResultPart {
     Text { text: String },
     ImageUrl { image_url: KimiImageUrl },
@@ -676,6 +695,23 @@ mod tests {
     }
 
     #[test]
+    fn tool_free_parallel_policy_is_preserved_for_kimi() {
+        for parallel in [false, true] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"kimi-k2.6",
+                "messages":[{"role":"user","content":"hello"}],
+                "parallel_tool_calls":parallel
+            }))
+            .unwrap();
+            let translated = translate_request_scoped(&req, None).unwrap();
+            let wire = serde_json::to_value(&translated).unwrap();
+            assert_eq!(wire["parallel_tool_calls"], parallel);
+            assert!(translated.tool_choice.is_none());
+            assert!(translated.tools.is_none());
+        }
+    }
+
+    #[test]
     fn scoped_prompt_cache_keys_isolate_main_and_sibling_agents() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "kimi-k2",
@@ -702,14 +738,17 @@ mod tests {
         let main_key = translate_request_scoped(&req, Some(main))
             .unwrap()
             .prompt_cache_key
+            .clone()
             .unwrap();
         let first_key = translate_request_scoped(&req, Some(first))
             .unwrap()
             .prompt_cache_key
+            .clone()
             .unwrap();
         let second_key = translate_request_scoped(&req, Some(second))
             .unwrap()
             .prompt_cache_key
+            .clone()
             .unwrap();
         assert_ne!(main_key, first_key);
         assert_ne!(first_key, second_key);
@@ -906,6 +945,64 @@ mod tests {
                 assert!(parts[1].get("image_url").is_some());
             }
             _ => panic!("expected User message"),
+        }
+    }
+
+    #[test]
+    fn user_content_parts_carry_a_type_discriminant() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-for-coding",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "xyz"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        match &translated.messages[0] {
+            KimiMessage::User { content, .. } => {
+                let parts = content.as_array().unwrap();
+                assert_eq!(parts[0].get("type").and_then(|v| v.as_str()), Some("text"));
+                assert_eq!(
+                    parts[1].get("type").and_then(|v| v.as_str()),
+                    Some("image_url")
+                );
+            }
+            _ => panic!("expected User message"),
+        }
+    }
+
+    #[test]
+    fn tool_result_parts_carry_a_type_discriminant() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-for-coding",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "text", "text": "caption"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+                    ]
+                }]
+            }]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        match &translated.messages[0] {
+            KimiMessage::Tool { content, .. } => {
+                let parts = content.as_array().unwrap();
+                assert_eq!(parts[0].get("type").and_then(|v| v.as_str()), Some("text"));
+                assert_eq!(
+                    parts[1].get("type").and_then(|v| v.as_str()),
+                    Some("image_url")
+                );
+            }
+            _ => panic!("expected Tool message"),
         }
     }
 

@@ -20,9 +20,9 @@ use super::{
     MAX_PROVIDER_STREAM_BYTES, MAX_SSE_EVENT_BYTES, OpenAiError, OpenAiResponseMetadata,
     OpenAiSurface,
     response::{
-        AnthropicAccumulator, BlockKind, SseEvent, buffered_response, chat_citation,
-        chat_finish_reason, hosted_search_action, normalized_arguments, responses_citation,
-        responses_response,
+        AnthropicAccumulator, BlockKind, SseEvent, buffered_response_with_parallel_policy,
+        chat_citation, chat_finish_reason, hosted_search_action, normalized_arguments,
+        responses_citation, responses_response_with_parallel_policy,
     },
 };
 
@@ -78,6 +78,27 @@ pub async fn openai_response(
     response_metadata: OpenAiResponseMetadata,
     traffic: Option<Arc<TrafficCapture>>,
 ) -> Result<Response, OpenAiError> {
+    openai_response_with_parallel_policy(
+        surface,
+        generation,
+        stream,
+        include_usage,
+        response_metadata,
+        false,
+        traffic,
+    )
+    .await
+}
+
+pub(crate) async fn openai_response_with_parallel_policy(
+    surface: OpenAiSurface,
+    generation: Generation,
+    stream: bool,
+    include_usage: bool,
+    response_metadata: OpenAiResponseMetadata,
+    parallel_tool_calls: bool,
+    traffic: Option<Arc<TrafficCapture>>,
+) -> Result<Response, OpenAiError> {
     let model = generation.resolved_model.clone();
     let response_id = match surface {
         OpenAiSurface::ChatCompletions => format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
@@ -94,19 +115,21 @@ pub async fn openai_response(
                 model,
                 created,
                 response_metadata,
+                parallel_tool_calls,
             ),
             traffic,
         ));
     }
     let bytes = collect_generation(generation.body).await?;
     let events = decode_all(&bytes)?;
-    let value = buffered_response(
+    let value = buffered_response_with_parallel_policy(
         surface,
         &events,
         &response_id,
         &model,
         created,
         &response_metadata,
+        parallel_tool_calls,
     )?;
     if let Some(capture) = traffic.as_ref() {
         capture.write_json("071-openai-downstream-response", &value);
@@ -330,6 +353,7 @@ struct Renderer {
     sequence: u64,
     state: AnthropicAccumulator,
     response_metadata: OpenAiResponseMetadata,
+    parallel_tool_calls: bool,
 }
 
 impl Renderer {
@@ -340,6 +364,7 @@ impl Renderer {
         model: String,
         created: u64,
         response_metadata: OpenAiResponseMetadata,
+        parallel_tool_calls: bool,
     ) -> Self {
         Self {
             surface,
@@ -350,6 +375,7 @@ impl Renderer {
             sequence: 0,
             state: AnthropicAccumulator::default(),
             response_metadata,
+            parallel_tool_calls,
         }
     }
 
@@ -454,6 +480,7 @@ impl Renderer {
                     self.created,
                     "in_progress",
                     &self.response_metadata,
+                    self.parallel_tool_calls,
                 );
                 out.push(self.responses_event("response.created", json!({"response":response})));
                 out.push(
@@ -616,12 +643,13 @@ impl Renderer {
                 }
             }
             "message_stop" => {
-                let response = responses_response(
+                let response = responses_response_with_parallel_policy(
                     &self.state,
                     &self.response_id,
                     &self.model,
                     self.created,
                     &self.response_metadata,
+                    self.parallel_tool_calls,
                 );
                 let kind = if self.state.stop_reason.as_deref() == Some("max_tokens") {
                     "response.incomplete"
@@ -650,6 +678,7 @@ impl Renderer {
                     self.created,
                     "failed",
                     &self.response_metadata,
+                    self.parallel_tool_calls,
                 );
                 response["error"] = json!({"code":error.code,"message":error.message});
                 vec![self.responses_event("response.failed", json!({"response":response}))]
@@ -712,6 +741,7 @@ fn response_shell(
     created: u64,
     status: &str,
     response_metadata: &OpenAiResponseMetadata,
+    parallel_tool_calls: bool,
 ) -> Value {
     json!({
         "id":id,
@@ -720,7 +750,7 @@ fn response_shell(
         "status":status,
         "model":model,
         "output":[],
-        "parallel_tool_calls":false,
+        "parallel_tool_calls":parallel_tool_calls,
         "tool_choice":response_metadata.tool_choice,
         "tools":response_metadata.tools,
         "error":null,
@@ -830,6 +860,7 @@ mod tests {
                 "kimi-k2.6".into(),
                 1,
                 OpenAiResponseMetadata::default(),
+                false,
             ),
             None,
         );
@@ -860,6 +891,7 @@ mod tests {
                 "grok-4.5".into(),
                 1,
                 OpenAiResponseMetadata::default(),
+                true,
             ),
             None,
         );
@@ -868,6 +900,7 @@ mod tests {
         assert!(text.contains("event: response.created"));
         assert!(text.contains("event: response.output_text.delta"));
         assert!(text.contains("event: response.completed"));
+        assert!(text.contains("\"parallel_tool_calls\":true"));
         assert!(text.contains("\"sequence_number\":0"));
     }
 }

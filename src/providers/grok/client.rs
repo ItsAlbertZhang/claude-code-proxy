@@ -3,10 +3,11 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use http::StatusCode;
+use serde::Serialize;
 
 use super::auth::manager::GrokAuthManager;
 use super::auth::token_store::{StoredAuth, file_store};
-use super::translate::request::GrokResponsesRequest;
+use super::translate::request::{GrokResponsesRequest, GrokResponsesWireRequest};
 use crate::traffic::TrafficCapture;
 
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
@@ -103,6 +104,22 @@ impl GrokClient {
         body: &GrokResponsesRequest,
         traffic: Option<Arc<TrafficCapture>>,
     ) -> Result<GrokResponse, GrokError> {
+        self.post_serialized(body, traffic).await
+    }
+
+    pub(crate) async fn post_wire(
+        &self,
+        body: &GrokResponsesWireRequest,
+        traffic: Option<Arc<TrafficCapture>>,
+    ) -> Result<GrokResponse, GrokError> {
+        self.post_serialized(body, traffic).await
+    }
+
+    async fn post_serialized<T: Serialize + ?Sized>(
+        &self,
+        body: &T,
+        traffic: Option<Arc<TrafficCapture>>,
+    ) -> Result<GrokResponse, GrokError> {
         if let Some(capture) = traffic.as_ref() {
             let body_value = serde_json::to_value(body).unwrap_or(serde_json::Value::Null);
             capture.write_json("020-upstream-request", &body_value);
@@ -156,10 +173,10 @@ impl GrokClient {
         GrokResponse { response }
     }
 
-    async fn attempt(
+    async fn attempt<T: Serialize + ?Sized>(
         &self,
         access: &str,
-        body: &GrokResponsesRequest,
+        body: &T,
         attempt: u8,
         traffic: Option<&TrafficCapture>,
     ) -> Result<reqwest::Response, GrokError> {

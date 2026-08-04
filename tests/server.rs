@@ -96,6 +96,114 @@ impl Provider for FakeProvider {
     }
 }
 
+struct TranslatingProvider {
+    name: &'static str,
+    model: &'static str,
+    captured: Arc<Mutex<Option<Value>>>,
+}
+
+#[async_trait]
+impl Provider for TranslatingProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec![self.model.to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn generate_anthropic_stream(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> Result<Generation, ProviderError> {
+        let mut translated = match self.name {
+            "kimi" => serde_json::to_value(
+                claude_code_proxy::providers::kimi::translate::request::translate_request(
+                    &body,
+                    claude_code_proxy::providers::kimi::translate::request::TranslateOptions {
+                        session_id: None,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            "grok" => serde_json::to_value(
+                claude_code_proxy::providers::grok::translate::request::translate_request(
+                    &body,
+                    self.model.to_string(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            "opencode" => serde_json::to_value(
+                claude_code_proxy::providers::opencode::chat::prepare_request(&body, self.model)
+                    .unwrap(),
+            )
+            .unwrap(),
+            "cursor" => serde_json::json!({
+                "parallel_tool_calls": body.extra.get("parallel_tool_calls"),
+                "tool_choice": body.extra.get("tool_choice"),
+                "rendered": claude_code_proxy::providers::cursor::request::render_cursor_prompt(&body),
+            }),
+            _ => unreachable!(),
+        };
+        if translated.get("parallel_tool_calls").is_none()
+            && let Some(parallel_tool_calls) = body.extra.get("parallel_tool_calls")
+        {
+            translated["parallel_tool_calls"] = parallel_tool_calls.clone();
+        }
+        *self.captured.lock().unwrap() = Some(translated);
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake\",\"model\":\"test\",\"usage\":{\"input_tokens\":1}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        Ok(Generation {
+            body: GenerationBody::BufferedSse(sse.into()),
+            resolved_model: self.model.to_string(),
+        })
+    }
+}
+
+fn translating_registry(
+    name: &'static str,
+    model: &'static str,
+    captured: Arc<Mutex<Option<Value>>>,
+) -> Arc<Registry> {
+    Arc::new(Registry::from_providers(
+        AliasProvider::Kimi,
+        vec![Arc::new(TranslatingProvider {
+            name,
+            model,
+            captured,
+        }) as Arc<dyn Provider>],
+    ))
+}
+
 type CapturedIdentity = (Option<ConversationIdentity>, Option<String>);
 
 struct IdentityCaptureProvider {
@@ -1080,6 +1188,151 @@ async fn openai_routes_select_non_codex_providers_and_aliases() {
             value["choices"][0]["message"]["content"].as_str()
         };
         assert_eq!(text, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn responses_omitted_parallel_policy_reports_existing_default() {
+    let request = |stream| {
+        json!({
+            "model":"sonnet",
+            "input":"look up x",
+            "stream":stream,
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
+        })
+    };
+
+    let buffered = app_with_options(routed_registry(), None, true)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(body_string(&request(false).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(buffered.status(), StatusCode::OK);
+    let buffered: Value = serde_json::from_slice(
+        &axum::body::to_bytes(buffered.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(buffered["parallel_tool_calls"], true);
+
+    let streaming = app_with_options(routed_registry(), None, true)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(body_string(&request(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(streaming.status(), StatusCode::OK);
+    let streaming = String::from_utf8(
+        axum::body::to_bytes(streaming.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(streaming.contains("\"parallel_tool_calls\":true"));
+    assert!(!streaming.contains("\"parallel_tool_calls\":false"));
+}
+
+#[tokio::test]
+async fn openai_routes_preserve_serial_tool_calls_upstream() {
+    for (provider, model, uri, body, expected_choice) in [
+        (
+            "kimi",
+            "kimi-k2.6",
+            "/v1/chat/completions",
+            json!({
+                "model":"kimi-k2.6",
+                "messages":[{"role":"user","content":"look up x"}],
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                "tool_choice":{"type":"function","function":{"name":"lookup"}},
+                "parallel_tool_calls":false
+            }),
+            json!({"type":"function","function":{"name":"lookup"}}),
+        ),
+        (
+            "grok",
+            "grok-4.5",
+            "/v1/responses",
+            json!({
+                "model":"grok-4.5",
+                "input":"look up x",
+                "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+                "tool_choice":"none",
+                "parallel_tool_calls":false
+            }),
+            json!("none"),
+        ),
+    ] {
+        let captured = Arc::new(Mutex::new(None));
+        let response = app_with_options(
+            translating_registry(provider, model, captured.clone()),
+            None,
+            true,
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body_string(&body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let translated = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(translated["parallel_tool_calls"], false);
+        assert_eq!(translated["tool_choice"], expected_choice);
+    }
+}
+
+#[tokio::test]
+async fn tool_free_parallel_policy_reaches_all_openai_backends_without_synthetic_choice() {
+    for (provider, model) in [
+        ("kimi", "kimi-k2.6"),
+        ("grok", "grok-4.5"),
+        ("cursor", "cursor:gpt-5.5"),
+        ("opencode", "glm-5.2"),
+    ] {
+        for parallel in [false, true] {
+            let captured = Arc::new(Mutex::new(None));
+            let body = json!({
+                "model":model,
+                "input":"hello",
+                "parallel_tool_calls":parallel
+            });
+            let response = app_with_options(
+                translating_registry(provider, model, captured.clone()),
+                None,
+                true,
+            )
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(body_string(&body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{provider}");
+            let translated = captured.lock().unwrap().clone().unwrap();
+            assert_eq!(translated["parallel_tool_calls"], parallel, "{provider}");
+            assert!(translated["tool_choice"].is_null(), "{provider}");
+        }
     }
 }
 

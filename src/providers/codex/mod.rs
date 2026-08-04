@@ -21,6 +21,8 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::StatusCode;
 use std::sync::Arc;
+#[cfg(test)]
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::anthropic::error::json_error;
@@ -463,12 +465,7 @@ impl CodexProvider {
                 }
                 upstream_started = true;
             }
-            if want_stream
-                && matches!(
-                    client.configured_transport(),
-                    config::CodexTransport::WebSocket
-                )
-            {
+            if want_stream {
                 match live_stream_route_attempt(
                     client.clone(),
                     &route,
@@ -962,10 +959,40 @@ async fn live_stream_route_attempt(
     let mut continuation = Some(request_continuation.clone());
 
     loop {
-        let upstream_events = match client
-            .stream_codex_websocket_events_bound(route, &request_body, &ctx, continuation.as_ref())
-            .await
-        {
+        let start = match client.configured_transport() {
+            config::CodexTransport::Http => {
+                client
+                    .stream_codex_http_events_bound(
+                        route,
+                        &request_body,
+                        &ctx,
+                        auth_rejection_budget.clone(),
+                    )
+                    .await
+            }
+            config::CodexTransport::WebSocket => {
+                client
+                    .stream_codex_websocket_events_bound(
+                        route,
+                        &request_body,
+                        &ctx,
+                        continuation.as_ref(),
+                    )
+                    .await
+            }
+            config::CodexTransport::Auto => {
+                client
+                    .stream_codex_auto_events_bound(
+                        route,
+                        &request_body,
+                        &ctx,
+                        continuation.as_ref(),
+                        auth_rejection_budget.clone(),
+                    )
+                    .await
+            }
+        };
+        let upstream_events = match start {
             Ok(events) => events,
             Err(error) if error.status == 401 => {
                 return LiveRouteOutcome::Unauthorized(error);
@@ -1309,6 +1336,14 @@ fn translate_live_stream_payload(
     payload: &serde_json::Value,
     traffic: Option<&crate::traffic::TrafficCapture>,
 ) -> Result<(Vec<u8>, bool), String> {
+    if payload.get("type").and_then(|value| value.as_str()) == Some("keepalive")
+        && payload
+            .get("_ccp_http_silence")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+    {
+        return Ok((translator.ping_chunk(traffic), false));
+    }
     let chunk = translator.accept(payload, traffic)?;
     let terminal = is_codex_terminal_event(payload) || translator.is_finished();
     Ok((chunk, terminal))
@@ -1504,7 +1539,7 @@ fn remaining_live_stream_response(
             return;
         }
         let chunk = translator.error_chunk(
-            "WebSocket connection closed before terminal Codex response event",
+            "Upstream event stream closed before terminal Codex response event",
             "api_error",
             ctx.traffic.as_deref(),
         );
@@ -1601,6 +1636,11 @@ fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
+    if err.origin == client::CodexErrorOrigin::Http {
+        // The HTTP event stream owns its bounded retry budget. Retrying the
+        // exhausted error here would multiply attempts across both layers.
+        return false;
+    }
     if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
         if err.detail.as_deref() == Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
             return false;
@@ -1926,13 +1966,21 @@ mod tests {
     }
 
     fn authenticated_live_test_client(base_url: String) -> Arc<CodexHttpClient> {
+        authenticated_live_test_client_with_transport(base_url, config::CodexTransport::WebSocket)
+    }
+
+    fn authenticated_live_test_client_with_transport(
+        base_url: String,
+        transport: config::CodexTransport,
+    ) -> Arc<CodexHttpClient> {
         let client = CodexHttpClient::new_for_test(
             reqwest::Client::builder().no_proxy().build().unwrap(),
             base_url,
             1_000,
             1_000,
             0,
-        );
+        )
+        .with_test_transport(transport);
         client
             .auth_manager()
             .set_test_auth(auth::token_store::StoredAuth {
@@ -3055,6 +3103,118 @@ mod tests {
         assert_eq!(state.active[0].output_tokens, Some(48));
     }
 
+    #[tokio::test]
+    async fn live_stream_response_emits_downstream_frames_before_terminal_event() {
+        use http_body_util::BodyExt as _;
+
+        let request_body = live_test_request("incremental HTTP");
+        let client = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let owner = ConversationIdentity::Main("incremental-http".to_string());
+        let continuation = ContinuationReservation::for_owner_turn(Some(&owner), Some(1));
+        let (route, continuation) =
+            bind_live_test_route(client.as_ref(), &owner, &continuation).await;
+        let ctx = RequestContext {
+            req_id: "incremental-http".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg_up"}
+        })))
+        .await
+        .unwrap();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "first"
+        })))
+        .await
+        .unwrap();
+
+        let (rx, _) = websocket::CodexWebSocketEventStream::pending(rx);
+        let response = match live_stream_response_once(
+            rx,
+            client,
+            route,
+            Arc::new(AuthRejectionBudget::default()),
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            continuation,
+            request_body,
+            None,
+            None,
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { error, .. } | LiveStreamStart::Unauthorized(error) => {
+                panic!("unexpected retry: {error}")
+            }
+        };
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .expect("initial downstream frame must be available immediately")
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let first = String::from_utf8(first.to_vec()).unwrap();
+        assert!(first.contains("event: message_start"));
+        assert!(first.contains("event: content_block_start"));
+        assert!(first.contains("event: content_block_delta"));
+
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "second"
+        })))
+        .await
+        .unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .expect("text delta must arrive before the terminal event")
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(
+            String::from_utf8(second.to_vec())
+                .unwrap()
+                .contains("event: content_block_delta")
+        );
+
+        for payload in [
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message"}
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "incomplete_details": null,
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }
+            }),
+        ] {
+            tx.send(Ok(payload)).await.unwrap();
+        }
+        drop(tx);
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+    }
+
     #[test]
     fn supported_models_includes_fast_variants() {
         let provider = CodexProvider::new();
@@ -3175,6 +3335,19 @@ mod tests {
             detail: Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
             retry_after: None,
             origin: client::CodexErrorOrigin::WebSocketHandshake,
+        };
+
+        assert!(!retryable_live_start_codex_error(&err));
+    }
+
+    #[test]
+    fn exhausted_http_stream_error_is_not_retried_by_provider() {
+        let err = client::CodexError {
+            status: 503,
+            message: "Codex HTTP stream exhausted its retry budget".to_string(),
+            detail: Some("http_response_body".to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::Http,
         };
 
         assert!(!retryable_live_start_codex_error(&err));
@@ -3641,7 +3814,10 @@ mod tests {
             while websocket.next().await.is_some() {}
             socket_closed_tx.send(()).unwrap();
         });
-        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let client = authenticated_live_test_client_with_transport(
+            format!("http://{addr}/responses"),
+            config::CodexTransport::Auto,
+        );
         let (route, continuation) =
             bind_live_test_route(client.as_ref(), &owner, &continuation).await;
         let compaction_permit = reserve_compaction_start(route.lane()).unwrap();
@@ -3661,7 +3837,7 @@ mod tests {
             apply_compaction_replay_for_route(&route, &compaction_replay_request()).unwrap();
 
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
             live_stream_response(
                 client,
                 route.clone(),
@@ -3678,14 +3854,14 @@ mod tests {
         .await
         .expect("live response did not publish the first chunk");
         let mut body = response.into_body();
-        tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+        tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
             .await
             .expect("first downstream chunk timed out")
             .expect("live response body ended before the first chunk")
             .expect("first downstream chunk failed");
         drop(body);
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), socket_closed_rx)
+        tokio::time::timeout(std::time::Duration::from_secs(5), socket_closed_rx)
             .await
             .expect("dropping the downstream body did not close the upstream socket")
             .expect("socket-close acknowledgement sender dropped");

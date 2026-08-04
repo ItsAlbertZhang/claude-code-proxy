@@ -281,8 +281,15 @@ struct MonitorStore {
     started_at: SystemTime,
     active: HashMap<String, ActiveRequest>,
     recent: VecDeque<CompletedRequest>,
+    session_usage: HashMap<Option<String>, SessionUsage>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     recent_limit: usize,
+}
+
+#[derive(Debug, Default)]
+struct SessionUsage {
+    input_tokens: u64,
+    output_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +310,7 @@ impl MonitorHandle {
                 started_at: SystemTime::now(),
                 active: HashMap::new(),
                 recent: VecDeque::new(),
+                session_usage: HashMap::new(),
                 session_output_buckets: HashMap::new(),
                 recent_limit,
             })),
@@ -575,6 +583,7 @@ impl MonitorStore {
                 input_tokens,
                 output_tokens,
             } => {
+                let mut usage_update = None;
                 let mut history_update = None;
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.status = RequestStatus::Streaming;
@@ -591,35 +600,36 @@ impl MonitorStore {
                     }
                     active.streamed_bytes = active.streamed_bytes.saturating_add(bytes);
                     active.stream_chunks = active.stream_chunks.saturating_add(chunks);
-                    active.input_tokens = input_tokens.or(active.input_tokens);
-                    active.output_tokens = output_tokens.or(active.output_tokens);
+                    let input_delta = update_token_count(&mut active.input_tokens, input_tokens);
+                    let output_delta = update_token_count(&mut active.output_tokens, output_tokens);
+                    usage_update = Some((active.session_id.clone(), input_delta, output_delta));
                 } else if let Some(completed) = self
                     .recent
                     .iter_mut()
                     .find(|request| request.request_id == request_id)
                 {
-                    let previous_output_tokens = completed.output_tokens.unwrap_or(0);
                     if let Some(started) = completed.generation_started_instant {
                         completed.generation_finished_at = Some(SystemTime::now());
                         completed.generation_duration = Some(started.elapsed());
                     }
                     completed.streamed_bytes = completed.streamed_bytes.saturating_add(bytes);
                     completed.stream_chunks = completed.stream_chunks.saturating_add(chunks);
-                    completed.input_tokens = input_tokens.or(completed.input_tokens);
-                    completed.output_tokens = output_tokens.or(completed.output_tokens);
-                    let added_tokens = completed
-                        .output_tokens
-                        .unwrap_or(0)
-                        .saturating_sub(previous_output_tokens);
-                    if added_tokens > 0 {
+                    let input_delta = update_token_count(&mut completed.input_tokens, input_tokens);
+                    let output_delta =
+                        update_token_count(&mut completed.output_tokens, output_tokens);
+                    usage_update = Some((completed.session_id.clone(), input_delta, output_delta));
+                    if output_delta > 0 {
                         history_update = Some((
                             completed.session_id.clone(),
                             completed
                                 .generation_finished_at
                                 .unwrap_or(completed.finished_at),
-                            added_tokens,
+                            output_delta,
                         ));
                     }
+                }
+                if let Some((session_id, input_delta, output_delta)) = usage_update {
+                    self.record_session_usage(session_id, input_delta, output_delta);
                 }
                 if let Some((session_id, timestamp, tokens)) = history_update {
                     self.record_session_output(session_id, timestamp, tokens);
@@ -630,6 +640,7 @@ impl MonitorStore {
                 input_tokens,
                 output_tokens,
             } => {
+                let mut usage_update = None;
                 let mut history_update = None;
                 if let Some(active) = self.active.get_mut(&request_id) {
                     if output_tokens.is_some()
@@ -638,35 +649,36 @@ impl MonitorStore {
                         active.generation_finished_at = Some(SystemTime::now());
                         active.generation_duration = Some(started.elapsed());
                     }
-                    active.input_tokens = input_tokens.or(active.input_tokens);
-                    active.output_tokens = output_tokens.or(active.output_tokens);
+                    let input_delta = update_token_count(&mut active.input_tokens, input_tokens);
+                    let output_delta = update_token_count(&mut active.output_tokens, output_tokens);
+                    usage_update = Some((active.session_id.clone(), input_delta, output_delta));
                 } else if let Some(completed) = self
                     .recent
                     .iter_mut()
                     .find(|request| request.request_id == request_id)
                 {
-                    let previous_output_tokens = completed.output_tokens.unwrap_or(0);
                     if output_tokens.is_some()
                         && let Some(started) = completed.generation_started_instant
                     {
                         completed.generation_finished_at = Some(SystemTime::now());
                         completed.generation_duration = Some(started.elapsed());
                     }
-                    completed.input_tokens = input_tokens.or(completed.input_tokens);
-                    completed.output_tokens = output_tokens.or(completed.output_tokens);
-                    let added_tokens = completed
-                        .output_tokens
-                        .unwrap_or(0)
-                        .saturating_sub(previous_output_tokens);
-                    if added_tokens > 0 {
+                    let input_delta = update_token_count(&mut completed.input_tokens, input_tokens);
+                    let output_delta =
+                        update_token_count(&mut completed.output_tokens, output_tokens);
+                    usage_update = Some((completed.session_id.clone(), input_delta, output_delta));
+                    if output_delta > 0 {
                         history_update = Some((
                             completed.session_id.clone(),
                             completed
                                 .generation_finished_at
                                 .unwrap_or(completed.finished_at),
-                            added_tokens,
+                            output_delta,
                         ));
                     }
+                }
+                if let Some((session_id, input_delta, output_delta)) = usage_update {
+                    self.record_session_usage(session_id, input_delta, output_delta);
                 }
                 if let Some((session_id, timestamp, tokens)) = history_update {
                     self.record_session_output(session_id, timestamp, tokens);
@@ -777,6 +789,9 @@ impl MonitorStore {
             active.generation_finished_at = Some(SystemTime::now());
             active.generation_duration = Some(started.elapsed());
         }
+        let input_delta = update_token_count(&mut active.input_tokens, input_tokens);
+        let output_delta = update_token_count(&mut active.output_tokens, output_tokens);
+        self.record_session_usage(active.session_id.clone(), input_delta, output_delta);
         let completed = CompletedRequest {
             request_id: active.request_id,
             session_id: active.session_id,
@@ -798,8 +813,8 @@ impl MonitorStore {
             latency: active.started_instant.elapsed(),
             streamed_bytes: active.streamed_bytes,
             stream_chunks: active.stream_chunks,
-            input_tokens: input_tokens.or(active.input_tokens),
-            output_tokens: output_tokens.or(active.output_tokens),
+            input_tokens: active.input_tokens,
+            output_tokens: active.output_tokens,
             error: error.or(active.error),
             traffic_capture_path: active.traffic_capture_path,
         };
@@ -816,6 +831,17 @@ impl MonitorStore {
         while self.recent.len() > self.recent_limit {
             self.recent.pop_back();
         }
+    }
+
+    fn record_session_usage(
+        &mut self,
+        session_id: Option<String>,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        let usage = self.session_usage.entry(session_id).or_default();
+        usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
     }
 
     fn record_session_output(
@@ -835,7 +861,12 @@ impl MonitorStore {
     fn snapshot(&self) -> MonitorState {
         let mut active: Vec<_> = self.active.values().cloned().collect();
         active.sort_by_key(|request| request.started_at);
-        let sessions = session_summaries(&active, &self.recent, &self.session_output_buckets);
+        let sessions = session_summaries(
+            &active,
+            &self.recent,
+            &self.session_usage,
+            &self.session_output_buckets,
+        );
         MonitorState {
             started_at: self.started_at,
             sessions,
@@ -848,6 +879,7 @@ impl MonitorStore {
 fn session_summaries(
     active: &[ActiveRequest],
     recent: &VecDeque<CompletedRequest>,
+    session_usage: &HashMap<Option<String>, SessionUsage>,
     session_output_buckets: &HashMap<Option<String>, Vec<(u64, u64)>>,
 ) -> Vec<SessionSummary> {
     let mut sessions: HashMap<Option<String>, SessionSummary> = HashMap::new();
@@ -880,12 +912,6 @@ fn session_summaries(
         entry.model = request.model.clone().or(entry.model.clone());
         entry.effort = request.effort.clone().or(entry.effort.clone());
         entry.last_seen = max_system_time(entry.last_seen, request.finished_at);
-        entry.input_tokens = entry
-            .input_tokens
-            .saturating_add(request.input_tokens.unwrap_or(0));
-        entry.output_tokens = entry
-            .output_tokens
-            .saturating_add(request.output_tokens.unwrap_or(0));
         if let (Some(tokens), Some(duration)) = (
             request
                 .output_tokens
@@ -928,12 +954,6 @@ fn session_summaries(
         entry.model = request.model.clone().or(entry.model.clone());
         entry.effort = request.effort.clone().or(entry.effort.clone());
         entry.last_seen = max_system_time(entry.last_seen, request.started_at);
-        entry.input_tokens = entry
-            .input_tokens
-            .saturating_add(request.input_tokens.unwrap_or(0));
-        entry.output_tokens = entry
-            .output_tokens
-            .saturating_add(request.output_tokens.unwrap_or(0));
         if let (Some(tokens), Some(duration)) = (
             request
                 .output_tokens
@@ -950,6 +970,10 @@ fn session_summaries(
     }
 
     for (session_id, session) in &mut sessions {
+        if let Some(usage) = session_usage.get(session_id) {
+            session.input_tokens = usage.input_tokens;
+            session.output_tokens = usage.output_tokens;
+        }
         if let Some(buckets) = session_output_buckets.get(session_id) {
             session.output_token_samples = buckets
                 .iter()
@@ -973,6 +997,17 @@ fn session_token_bucket(timestamp: SystemTime) -> u64 {
 
 fn session_token_bucket_start(bucket: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(bucket.saturating_mul(SESSION_TOKEN_BUCKET_SECS))
+}
+
+fn update_token_count(current: &mut Option<u64>, incoming: Option<u64>) -> u64 {
+    let Some(incoming) = incoming else {
+        return 0;
+    };
+    let previous = current.unwrap_or(0);
+    if incoming > previous || current.is_none() {
+        *current = Some(incoming);
+    }
+    incoming.saturating_sub(previous)
 }
 
 fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
@@ -1285,6 +1320,20 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         }
     }
 
+    fn session_summaries_for_requests(recent: &VecDeque<CompletedRequest>) -> Vec<SessionSummary> {
+        let mut usage = HashMap::<Option<String>, SessionUsage>::new();
+        for request in recent {
+            let entry = usage.entry(request.session_id.clone()).or_default();
+            entry.input_tokens = entry
+                .input_tokens
+                .saturating_add(request.input_tokens.unwrap_or(0));
+            entry.output_tokens = entry
+                .output_tokens
+                .saturating_add(request.output_tokens.unwrap_or(0));
+        }
+        session_summaries(&[], recent, &usage, &HashMap::new())
+    }
+
     #[test]
     fn completed_request_rate_uses_stream_interval_instead_of_request_latency() {
         let request = completed_request(
@@ -1331,7 +1380,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             ),
         ]);
 
-        let sessions = session_summaries(&[], &recent, &HashMap::new());
+        let sessions = session_summaries_for_requests(&recent);
 
         assert_eq!(sessions[0].output_tokens, 150);
         assert_eq!(sessions[0].generation_duration, Duration::from_secs(5));
@@ -1345,7 +1394,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 
         assert_eq!(request.rate(), Throughput::None);
         assert_eq!(
-            session_summaries(&[], &recent, &HashMap::new())[0].rate(),
+            session_summaries_for_requests(&recent)[0].rate(),
             Throughput::None
         );
     }
@@ -1372,7 +1421,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         ]);
 
         assert_eq!(
-            session_summaries(&[], &recent, &HashMap::new())[0].rate(),
+            session_summaries_for_requests(&recent)[0].rate(),
             Throughput::TokensPerSecond(25.0)
         );
     }
@@ -1390,7 +1439,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             ),
         ]);
 
-        let session = &session_summaries(&[], &recent, &HashMap::new())[0];
+        let session = &session_summaries_for_requests(&recent)[0];
 
         assert_eq!(session.output_tokens, 1_000);
         assert_eq!(session.rate(), Throughput::TokensPerSecond(25.0));
@@ -1443,12 +1492,14 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 None,
                 EndpointKind::Messages,
             );
-            monitor.request_completed(request_id, 200, None, Some(tokens));
+            monitor.request_completed(request_id, 200, Some(tokens * 10), Some(tokens));
         }
 
         let state = monitor.snapshot();
 
         assert_eq!(state.recent.len(), 1);
+        assert_eq!(state.sessions[0].input_tokens, 1_000);
+        assert_eq!(state.sessions[0].output_tokens, 100);
         assert_eq!(
             state.sessions[0]
                 .output_token_samples
@@ -1457,6 +1508,83 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 .sum::<u64>(),
             100
         );
+    }
+
+    #[test]
+    fn session_usage_ignores_decreasing_request_observations() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r1",
+            Some("s1".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.usage_updated("r1", Some(100), Some(20));
+        monitor.usage_updated("r1", Some(90), Some(15));
+        monitor.usage_updated("r1", Some(120), Some(25));
+
+        let active = monitor.snapshot();
+        assert_eq!(active.active[0].input_tokens, Some(120));
+        assert_eq!(active.active[0].output_tokens, Some(25));
+        assert_eq!(active.sessions[0].input_tokens, 120);
+        assert_eq!(active.sessions[0].output_tokens, 25);
+
+        monitor.request_completed("r1", 200, Some(80), Some(10));
+        let completed = monitor.snapshot();
+        assert_eq!(completed.recent[0].input_tokens, Some(120));
+        assert_eq!(completed.recent[0].output_tokens, Some(25));
+        assert_eq!(completed.sessions[0].input_tokens, 120);
+        assert_eq!(completed.sessions[0].output_tokens, 25);
+    }
+
+    #[test]
+    fn compaction_preserves_cumulative_session_usage() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "before",
+            Some("s1".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.request_completed("before", 200, Some(100), Some(20));
+        monitor.request_started(
+            "compact",
+            Some("s1".to_string()),
+            Some(2),
+            EndpointKind::Messages,
+        );
+        monitor.compaction_started("compact");
+        monitor.request_completed("compact", 200, Some(40), Some(10));
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].input_tokens, 140);
+        assert_eq!(state.sessions[0].output_tokens, 30);
+    }
+
+    #[test]
+    fn session_sequence_restart_preserves_cumulative_usage() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "before",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.session_sequence_resolved("before", 7);
+        monitor.request_completed("before", 200, Some(100), Some(20));
+
+        monitor.request_started(
+            "after",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.session_sequence_resolved("after", 1);
+        monitor.request_completed("after", 200, Some(25), Some(5));
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].input_tokens, 125);
+        assert_eq!(state.sessions[0].output_tokens, 25);
     }
 
     #[test]
