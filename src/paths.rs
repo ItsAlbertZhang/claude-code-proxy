@@ -76,6 +76,28 @@ pub fn state_dir() -> PathBuf {
     resolve_state_dir(&DirResolverEnv::default())
 }
 
+pub fn claude_config_dir() -> PathBuf {
+    resolve_claude_config_dir(&DirResolverEnv::default())
+}
+
+pub fn resolve_claude_config_dir(deps: &DirResolverEnv) -> PathBuf {
+    if let Some(override_dir) = deps.env.get("CLAUDE_CONFIG_DIR")
+        && !override_dir.trim().is_empty()
+    {
+        return Path::new(override_dir).to_path_buf();
+    }
+
+    let home = if matches!(deps.platform.as_str(), "win32" | "windows") {
+        deps.env
+            .get("USERPROFILE")
+            .map(String::as_str)
+            .unwrap_or(&deps.home)
+    } else {
+        &deps.home
+    };
+    Path::new(home).join(".claude")
+}
+
 pub fn codex_auth_file(deps: &DirResolverEnv) -> PathBuf {
     resolve_config_dir(deps).join("codex").join("auth.json")
 }
@@ -141,4 +163,52 @@ pub fn resolve_state_dir_for_env(
         env: env.clone(),
         home: home.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_config_dir_honors_override() {
+        let deps = DirResolverEnv {
+            platform: "windows".to_string(),
+            env: HashMap::from([
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "D:/claude-home".to_string(),
+                ),
+                ("USERPROFILE".to_string(), "C:/Users/example".to_string()),
+            ]),
+            home: "C:/git-bash-home".to_string(),
+        };
+
+        assert_eq!(
+            resolve_claude_config_dir(&deps),
+            PathBuf::from("D:/claude-home")
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_uses_native_home_convention() {
+        let windows = DirResolverEnv {
+            platform: "windows".to_string(),
+            env: HashMap::from([("USERPROFILE".to_string(), "C:/Users/example".to_string())]),
+            home: "C:/git-bash-home".to_string(),
+        };
+        let linux = DirResolverEnv {
+            platform: "linux".to_string(),
+            env: HashMap::new(),
+            home: "/home/example".to_string(),
+        };
+
+        assert_eq!(
+            resolve_claude_config_dir(&windows),
+            PathBuf::from("C:/Users/example/.claude")
+        );
+        assert_eq!(
+            resolve_claude_config_dir(&linux),
+            PathBuf::from("/home/example/.claude")
+        );
+    }
 }

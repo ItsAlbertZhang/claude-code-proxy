@@ -3,6 +3,7 @@ pub mod auth;
 pub mod chat_completions;
 pub mod client;
 pub mod compaction;
+pub(crate) mod compaction_checkpoint;
 pub mod continuation;
 pub mod count_tokens;
 pub(crate) mod events;
@@ -47,10 +48,13 @@ use self::auth::device::DeviceAuthClient;
 use self::auth::manager::CodexAuthManager;
 use self::auth::token_store::file_store;
 use self::client::{AuthRejectionBudget, BufferedRetryState, CodexHttpClient};
+#[cfg(test)]
+use self::compaction::begin_compaction_for_route;
 use self::compaction::{
     CompactionLease, CompactionStartPermit, abort_compaction_for_route,
-    activate_compaction_for_route, apply_compaction_replay_for_route, begin_compaction_for_route,
-    prepare_compaction_request, request_compaction_bound_result, reserve_compaction_start,
+    activate_compaction_for_route, apply_compaction_replay_for_route,
+    begin_compaction_for_route_with_owner, prepare_compaction_request,
+    request_compaction_bound_result, reserve_compaction_start, restore_compaction_for_route,
     store_compaction_for_route,
 };
 #[cfg(test)]
@@ -103,14 +107,7 @@ use self::translate::stream::translate_stream_bytes_scoped;
 pub(crate) fn clear_conversation_state(identity: &ConversationIdentity) {
     continuation::clear_continuation_for_owner(Some(identity));
     websocket::invalidate_codex_websocket_pool_owner(identity);
-    let lane = RequestScope::from_conversation_identity(
-        Some(identity.clone()),
-        RequestPurpose::Conversation,
-    )
-    .provider_lane(LaneDomain::CodexConversation);
-    if let Some(lane) = lane {
-        compaction::clear_compactions_for_lane(lane);
-    }
+    compaction::clear_compactions_for_owner(identity);
 }
 
 pub struct CodexProvider {
@@ -352,8 +349,8 @@ impl CodexProvider {
 
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = self.server_compaction_enabled();
-        if !server_compaction_enabled && let Some(lane) = codex_lane {
-            compaction::clear_compactions_for_lane(lane);
+        if !server_compaction_enabled && let Some(identity) = conversation_identity.as_ref() {
+            compaction::clear_compactions_for_owner(identity);
         }
 
         let client = self.client.clone();
@@ -428,9 +425,12 @@ impl CodexProvider {
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     monitor.compaction_started(&ctx.req_id);
                 }
-                let Some(build_lease) =
-                    begin_compaction_for_route(permit, &route, &translated.model)
-                else {
+                let Some(build_lease) = begin_compaction_for_route_with_owner(
+                    permit,
+                    &route,
+                    &translated.model,
+                    conversation_identity.as_ref(),
+                ) else {
                     abort_continuation_for_owner(&hidden_continuation);
                     log_compaction_event(
                         "server_compaction_failed",
@@ -542,6 +542,11 @@ impl CodexProvider {
             let mut translated = bind_messages_request_to_route(&original_translated, &route);
 
             if server_compaction_enabled && !compact_boundary {
+                restore_compaction_for_route(
+                    conversation_identity.as_ref(),
+                    &route,
+                    &translated.model,
+                );
                 if let Some(replay) = apply_compaction_replay_for_route(&route, &translated) {
                     translated = replay.request;
                     cleanup.replace_compaction_lease(Some(replay.lease));

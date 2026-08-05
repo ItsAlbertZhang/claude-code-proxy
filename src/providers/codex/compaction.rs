@@ -1,15 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use once_cell::sync::Lazy;
 
 use crate::anthropic::sse::parse_sse_events;
 use crate::provider::RequestContext;
 use crate::providers::codex::client::{
     ActualTransport, BufferedRetryState, CodexError, CodexHttpClient,
 };
-use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
+use crate::request_identity::{
+    ConversationIdentity, LaneDomain, OpaqueLane, RequestPurpose, RequestScope,
+};
 
+use super::compaction_checkpoint::{self, CheckpointError, CompactionCheckpoint};
 use super::continuation::ContinuationReservation;
 use super::state::{CodexBoundRoute, CodexConversationKey};
 
@@ -135,6 +140,12 @@ enum BoundPhase {
     },
 }
 
+struct AnchoredCompactionSnapshot {
+    model: String,
+    native_history: Vec<ResponsesInputItem>,
+    portable_summary: String,
+}
+
 #[derive(Debug)]
 struct BoundCompactionState {
     lane: OpaqueLane,
@@ -166,6 +177,10 @@ struct BoundRegistry {
 }
 
 static BOUND_REGISTRY: Mutex<Option<BoundRegistry>> = Mutex::new(None);
+
+const CHECKPOINT_LOCK_STRIPES: usize = 64;
+static CHECKPOINT_LOCKS: Lazy<[Mutex<()>; CHECKPOINT_LOCK_STRIPES]> =
+    Lazy::new(|| std::array::from_fn(|_| Mutex::new(())));
 
 #[cfg(test)]
 static TEST_REGISTRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -227,16 +242,22 @@ impl Drop for BoundLeaseCleanup {
 #[derive(Debug, Clone)]
 pub(crate) struct CompactionLease {
     cleanup: Arc<BoundLeaseCleanup>,
+    owner: Option<ConversationIdentity>,
 }
 
 impl CompactionLease {
-    fn new(stamp: BoundLeaseStamp, kind: BoundLeaseKind) -> Self {
+    fn new(
+        stamp: BoundLeaseStamp,
+        kind: BoundLeaseKind,
+        owner: Option<ConversationIdentity>,
+    ) -> Self {
         Self {
             cleanup: Arc::new(BoundLeaseCleanup {
                 stamp,
                 kind,
                 armed: AtomicBool::new(true),
             }),
+            owner,
         }
     }
 
@@ -246,6 +267,10 @@ impl CompactionLease {
 
     fn kind(&self) -> BoundLeaseKind {
         self.cleanup.kind
+    }
+
+    fn owner(&self) -> Option<&ConversationIdentity> {
+        self.owner.as_ref()
     }
 
     fn disarm(&self) -> bool {
@@ -279,12 +304,24 @@ pub(crate) fn reserve_compaction_start(lane: Option<OpaqueLane>) -> Option<Compa
     })
 }
 
+#[cfg(test)]
 pub(crate) fn begin_compaction_for_route(
     permit: &CompactionStartPermit,
     route: &CodexBoundRoute,
     model: &str,
 ) -> Option<CompactionLease> {
-    if route.lane() != Some(permit.lane) {
+    begin_compaction_for_route_with_owner(permit, route, model, None)
+}
+
+pub(crate) fn begin_compaction_for_route_with_owner(
+    permit: &CompactionStartPermit,
+    route: &CodexBoundRoute,
+    model: &str,
+    owner: Option<&ConversationIdentity>,
+) -> Option<CompactionLease> {
+    if route.lane() != Some(permit.lane)
+        || owner.is_some_and(|owner| conversation_lane(owner) != Some(permit.lane))
+    {
         return None;
     }
     let route_key = route.conversation_key()?;
@@ -331,6 +368,7 @@ pub(crate) fn begin_compaction_for_route(
             revision,
         },
         BoundLeaseKind::Build,
+        owner.cloned(),
     ))
 }
 
@@ -475,6 +513,7 @@ pub(crate) fn apply_compaction_replay_for_route(
                 revision,
             },
             BoundLeaseKind::Replay { replay_id },
+            None,
         ),
     })
 }
@@ -483,6 +522,11 @@ pub(crate) fn activate_compaction_for_route(
     lease: &CompactionLease,
     output: &[ResponsesInputItem],
 ) -> bool {
+    let owner = lease.owner().cloned();
+    let _checkpoint_guard = owner
+        .as_ref()
+        .and_then(conversation_lane)
+        .map(lock_checkpoint_lane);
     if !lease.disarm() {
         return false;
     }
@@ -491,10 +535,29 @@ pub(crate) fn activate_compaction_for_route(
     let Some(registry) = guard.as_mut() else {
         return false;
     };
-    match lease.kind() {
-        BoundLeaseKind::Build => activate_bound_build(registry, stamp, output),
-        BoundLeaseKind::Replay { replay_id } => activate_bound_replay(registry, stamp, replay_id),
+    let checkpoint = match lease.kind() {
+        BoundLeaseKind::Build => activate_bound_build(registry, stamp, output).map(Some),
+        BoundLeaseKind::Replay { replay_id } => {
+            activate_bound_replay(registry, stamp, replay_id).then_some(None)
+        }
+    };
+    drop(guard);
+
+    let Some(checkpoint) = checkpoint else {
+        return false;
+    };
+    if let (Some(owner), Some(checkpoint)) = (owner.as_ref(), checkpoint) {
+        let checkpoint = CompactionCheckpoint::new(
+            owner,
+            checkpoint.model,
+            checkpoint.native_history,
+            checkpoint.portable_summary,
+        );
+        if let Err(error) = compaction_checkpoint::save(owner, &checkpoint) {
+            tracing::warn!(%error, "failed to persist Codex compaction checkpoint");
+        }
     }
+    true
 }
 
 pub(crate) fn abort_compaction_for_route(lease: &CompactionLease) {
@@ -510,6 +573,152 @@ pub(crate) fn clear_compactions_for_lane(lane: OpaqueLane) {
     };
     remove_owned_lane_states(registry, lane);
     registry.lanes.remove(&lane);
+}
+
+pub(crate) fn clear_compactions_for_owner(identity: &ConversationIdentity) {
+    // Provider and feature switches clear route-bound runtime state only. The
+    // caller keeps S plus every later turn, so the durable session checkpoint
+    // remains a valid replay anchor when Codex compaction is used again.
+    let lane = conversation_lane(identity);
+    let _checkpoint_guard = lane.map(lock_checkpoint_lane);
+    if let Some(lane) = lane {
+        clear_compactions_for_lane(lane);
+    }
+}
+
+pub(crate) fn restore_compaction_for_route(
+    identity: Option<&ConversationIdentity>,
+    route: &CodexBoundRoute,
+    model: &str,
+) -> bool {
+    let Some(identity) = identity else {
+        return false;
+    };
+    let Some(lane) = conversation_lane(identity) else {
+        return false;
+    };
+    if route.lane() != Some(lane) {
+        return false;
+    }
+    let Some(route_key) = route.conversation_key() else {
+        return false;
+    };
+    let _checkpoint_guard = lock_checkpoint_lane(lane);
+    let now = now_ms();
+    {
+        let mut guard = BOUND_REGISTRY.lock().unwrap();
+        if let Some(registry) = guard.as_mut()
+            && !prepare_lane_for_checkpoint_install(registry, lane, route_key, now)
+        {
+            return false;
+        }
+    }
+
+    let checkpoint = match compaction_checkpoint::load(identity) {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load Codex compaction checkpoint");
+            if matches!(error, CheckpointError::Json(_) | CheckpointError::TooLarge)
+                && let Err(delete_error) = compaction_checkpoint::delete(identity)
+            {
+                tracing::warn!(%delete_error, "failed to remove invalid Codex compaction checkpoint");
+            }
+            return false;
+        }
+    };
+    install_compaction_checkpoint_for_route(route, model, checkpoint)
+}
+
+fn install_compaction_checkpoint_for_route(
+    route: &CodexBoundRoute,
+    model: &str,
+    checkpoint: CompactionCheckpoint,
+) -> bool {
+    let Some(lane) = route.lane() else {
+        return false;
+    };
+    let Some(route_key) = route.conversation_key() else {
+        return false;
+    };
+    if checkpoint.model != model
+        || checkpoint.portable_summary.len() < MIN_PORTABLE_SUMMARY_BYTES
+        || checkpoint
+            .native_history
+            .last()
+            .is_none_or(|item| !matches!(item, ResponsesInputItem::Compaction { .. }))
+        || checkpoint
+            .native_history
+            .iter()
+            .filter(|item| matches!(item, ResponsesInputItem::Compaction { .. }))
+            .count()
+            != 1
+    {
+        return false;
+    }
+    let candidate_size = bound_state_size_parts(
+        &route_key,
+        lane,
+        &checkpoint.model,
+        &checkpoint.native_history,
+        Some(&checkpoint.portable_summary),
+        0,
+    );
+    if candidate_size > MAX_STATE_BYTES {
+        return false;
+    }
+
+    let now = now_ms();
+    let mut guard = BOUND_REGISTRY.lock().unwrap();
+    let registry = guard.get_or_insert_with(BoundRegistry::default);
+    if !prepare_lane_for_checkpoint_install(registry, lane, route_key, now)
+        || !make_bound_retained_room(registry, route_key, candidate_size, now)
+    {
+        return false;
+    }
+
+    let generation =
+        next_checked_nonzero(&mut registry.next_generation, "Codex compaction generation");
+    let revision = next_checked_nonzero(&mut registry.next_revision, "Codex compaction revision");
+    let activity = next_checked_nonzero(&mut registry.next_activity, "Codex compaction activity");
+    let lane_state = registry.lanes.entry(lane).or_insert_with(|| LaneState {
+        cleanup_epoch: generation,
+        latest_generation: generation,
+        pending_generations: HashSet::new(),
+        owned_route_keys: HashSet::new(),
+    });
+    lane_state.latest_generation = generation;
+    lane_state.owned_route_keys.insert(route_key);
+    registry.bound_states.insert(
+        route_key,
+        BoundCompactionState {
+            lane,
+            cleanup_epoch: lane_state.cleanup_epoch,
+            generation,
+            revision,
+            model: checkpoint.model,
+            phase: BoundPhase::Anchored {
+                native_history: checkpoint.native_history,
+                portable_summary: checkpoint.portable_summary,
+                active_replays: HashSet::new(),
+            },
+            updated_at: now,
+            activity,
+        },
+    );
+    true
+}
+
+fn conversation_lane(identity: &ConversationIdentity) -> Option<OpaqueLane> {
+    RequestScope::from_conversation_identity(Some(identity.clone()), RequestPurpose::Conversation)
+        .provider_lane(LaneDomain::CodexConversation)
+}
+
+fn lock_checkpoint_lane(lane: OpaqueLane) -> MutexGuard<'static, ()> {
+    let mut prefix = [0_u8; std::mem::size_of::<usize>()];
+    prefix.copy_from_slice(&lane.as_bytes()[..std::mem::size_of::<usize>()]);
+    let stripe = usize::from_ne_bytes(prefix) % CHECKPOINT_LOCK_STRIPES;
+    CHECKPOINT_LOCKS[stripe].lock().unwrap()
 }
 
 #[cfg(test)]
@@ -537,18 +746,16 @@ fn activate_bound_build(
     registry: &mut BoundRegistry,
     stamp: BoundLeaseStamp,
     output: &[ResponsesInputItem],
-) -> bool {
-    let Some(state) = registry.bound_states.get(&stamp.route_key) else {
-        return false;
-    };
+) -> Option<AnchoredCompactionSnapshot> {
+    let state = registry.bound_states.get(&stamp.route_key)?;
     if !bound_state_matches(state, stamp)
         || !matches!(state.phase, BoundPhase::PendingAnchor { .. })
     {
-        return false;
+        return None;
     }
     let Some(portable_summary) = portable_summary_text(output) else {
         remove_bound_state_if_matches(registry, stamp, BoundExpectedPhase::Build);
-        return false;
+        return None;
     };
     let BoundPhase::PendingAnchor { native_history } = &state.phase else {
         unreachable!("validated pending anchor phase");
@@ -566,21 +773,24 @@ fn activate_bound_build(
         || !make_bound_retained_room(registry, stamp.route_key, candidate_size, now)
     {
         remove_bound_state_if_matches(registry, stamp, BoundExpectedPhase::Build);
-        return false;
+        return None;
     }
 
     let revision = next_checked_nonzero(&mut registry.next_revision, "Codex compaction revision");
     let activity = next_checked_nonzero(&mut registry.next_activity, "Codex compaction activity");
-    let Some(state) = registry.bound_states.get_mut(&stamp.route_key) else {
-        return false;
-    };
+    let state = registry.bound_states.get_mut(&stamp.route_key)?;
     if !bound_state_matches(state, stamp) {
-        return false;
+        return None;
     }
     let BoundPhase::PendingAnchor { native_history } =
         std::mem::replace(&mut state.phase, BoundPhase::PendingRemote)
     else {
-        return false;
+        return None;
+    };
+    let checkpoint = AnchoredCompactionSnapshot {
+        model: state.model.clone(),
+        native_history: native_history.clone(),
+        portable_summary: portable_summary.clone(),
     };
     state.phase = BoundPhase::Anchored {
         native_history,
@@ -590,7 +800,7 @@ fn activate_bound_build(
     state.revision = revision;
     state.updated_at = now;
     state.activity = activity;
-    true
+    Some(checkpoint)
 }
 
 fn activate_bound_replay(
@@ -714,6 +924,58 @@ fn remove_owned_lane_states(registry: &mut BoundRegistry, lane: OpaqueLane) {
     for route_key in route_keys {
         remove_bound_state(registry, route_key);
     }
+}
+
+fn remove_expired_inactive_lane_states(registry: &mut BoundRegistry, lane: OpaqueLane, now: u64) {
+    let expired = registry
+        .bound_states
+        .iter()
+        .filter_map(|(route_key, state)| {
+            (state.lane == lane
+                && bound_state_is_inactive(state)
+                && now.saturating_sub(state.updated_at) > STATE_TTL_MS)
+                .then_some(*route_key)
+        })
+        .collect::<Vec<_>>();
+    for route_key in expired {
+        remove_bound_state(registry, route_key);
+    }
+}
+
+fn prepare_lane_for_checkpoint_install(
+    registry: &mut BoundRegistry,
+    lane: OpaqueLane,
+    route_key: CodexConversationKey,
+    now: u64,
+) -> bool {
+    remove_expired_inactive_lane_states(registry, lane, now);
+    if registry.bound_states.contains_key(&route_key)
+        || registry
+            .lanes
+            .get(&lane)
+            .is_some_and(|state| !state.pending_generations.is_empty())
+    {
+        return false;
+    }
+
+    let obsolete = registry
+        .bound_states
+        .iter()
+        .filter_map(|(owned_route_key, state)| {
+            (state.lane == lane && bound_state_is_inactive(state)).then_some(*owned_route_key)
+        })
+        .collect::<Vec<_>>();
+    for owned_route_key in obsolete {
+        remove_bound_state(registry, owned_route_key);
+    }
+
+    !registry
+        .bound_states
+        .values()
+        .any(|state| state.lane == lane)
+        && registry.lanes.get(&lane).is_none_or(|state| {
+            state.pending_generations.is_empty() && state.owned_route_keys.is_empty()
+        })
 }
 
 fn remove_bound_state(registry: &mut BoundRegistry, route_key: CodexConversationKey) {
@@ -2470,6 +2732,75 @@ mod tests {
         let replay = apply_compaction_replay_for_route(&route_a, &replay_request()).unwrap();
         assert!(activate_compaction_for_route(&replay.lease, &[]));
         drop(permit);
+    }
+
+    #[test]
+    fn checkpoint_restores_owner_history_into_the_current_route() {
+        let _guard = lock_compaction_registry_for_tests();
+        clear_all_compactions_for_tests();
+        let identity = ConversationIdentity::Agent(
+            "restored-session".to_string(),
+            "restored-agent".to_string(),
+        );
+        let route = bound_route(conversation_lane(identity.clone()), "current-token");
+        let opaque = "opaque+/=\\\"\nsecond-line";
+        let checkpoint = CompactionCheckpoint::new(
+            &identity,
+            "gpt-5.6-sol".to_string(),
+            native_history(opaque),
+            SUMMARY.to_string(),
+        );
+
+        assert!(install_compaction_checkpoint_for_route(
+            &route,
+            "gpt-5.6-sol",
+            checkpoint
+        ));
+        let replay = apply_compaction_replay_for_route(&route, &replay_request()).unwrap();
+        assert!(matches!(
+            replay.request.input.first(),
+            Some(ResponsesInputItem::Compaction { encrypted_content })
+                if encrypted_content == opaque
+        ));
+        assert_eq!(
+            message_text(replay.request.input.last().unwrap()).as_deref(),
+            Some("continue")
+        );
+        assert!(activate_compaction_for_route(&replay.lease, &[]));
+    }
+
+    #[test]
+    fn prior_route_state_does_not_block_checkpoint_install_on_current_route() {
+        let _guard = lock_compaction_registry_for_tests();
+        clear_all_compactions_for_tests();
+        let identity = ConversationIdentity::Main("route-portable-restore".to_string());
+        let lane = conversation_lane(identity.clone());
+        let old_route = bound_route(lane, "old-token");
+        let current_route = bound_route(lane, "current-token");
+        let (permit, build) = stage_bound(&old_route, "old-route");
+        anchor_bound(&build);
+        drop(permit);
+
+        let checkpoint = CompactionCheckpoint::new(
+            &identity,
+            "gpt-5.6-sol".to_string(),
+            native_history("restored-on-current-route"),
+            SUMMARY.to_string(),
+        );
+        assert!(install_compaction_checkpoint_for_route(
+            &current_route,
+            "gpt-5.6-sol",
+            checkpoint
+        ));
+        assert!(!has_bound_state(&old_route));
+
+        let replay = apply_compaction_replay_for_route(&current_route, &replay_request()).unwrap();
+        assert!(matches!(
+            replay.request.input.first(),
+            Some(ResponsesInputItem::Compaction { encrypted_content })
+                if encrypted_content == "restored-on-current-route"
+        ));
+        assert!(activate_compaction_for_route(&replay.lease, &[]));
     }
 
     #[test]

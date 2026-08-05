@@ -48,6 +48,9 @@ crossterm = "0.28"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 tiktoken-rs = { version = "0.12", default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3.14"
