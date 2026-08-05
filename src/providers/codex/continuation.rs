@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::Deserialize;
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+
 use crate::monitor::{
     CodexAppendOnlyDiagnostics, CodexAppendOnlyOutcome, CodexPoolResolution,
     CodexPreviousIdOutcome, CodexRecoveryCause, CodexSocketValidationFailure, MonitorHandle,
@@ -15,6 +18,8 @@ const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_STATES: usize = 10_000;
 const MAX_OWNER_RETAINED_BYTES: u64 = 2_000_000;
 const MAX_TOTAL_RETAINED_BYTES: u64 = 20_000_000;
+const MAX_COMPARABLE_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_COMPARABLE_ARGUMENT_NODES: usize = 16 * 1024;
 
 #[derive(Clone)]
 struct ContinuationState {
@@ -1027,6 +1032,182 @@ fn bounded_item_count(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ComparableJson {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    String(String),
+    Array(Vec<ComparableJson>),
+    Object(HashMap<String, ComparableJson>),
+}
+
+struct ComparableJsonVisitor<'a> {
+    remaining_nodes: &'a mut usize,
+}
+
+struct ComparableJsonSeed<'a> {
+    remaining_nodes: &'a mut usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ComparableJsonSeed<'_> {
+    type Value = ComparableJson;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if *self.remaining_nodes == 0 {
+            return Err(de::Error::custom("JSON comparison node budget exceeded"));
+        }
+        *self.remaining_nodes -= 1;
+        deserializer.deserialize_any(ComparableJsonVisitor {
+            remaining_nodes: self.remaining_nodes,
+        })
+    }
+}
+
+impl<'de> Visitor<'de> for ComparableJsonVisitor<'_> {
+    type Value = ComparableJson;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate keys or lossy numbers")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(ComparableJson::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(ComparableJson::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(ComparableJson::I64(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(ComparableJson::U64(value))
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom("lossy JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(ComparableJson::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(ComparableJson::String(value))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let remaining_nodes = self.remaining_nodes;
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(ComparableJsonSeed {
+            remaining_nodes: &mut *remaining_nodes,
+        })? {
+            values.push(value);
+        }
+        Ok(ComparableJson::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let remaining_nodes = self.remaining_nodes;
+        let mut values = HashMap::new();
+        while let Some(key) = map.next_key()? {
+            let value = map.next_value_seed(ComparableJsonSeed {
+                remaining_nodes: &mut *remaining_nodes,
+            })?;
+            if values.insert(key, value).is_some() {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+        }
+        Ok(ComparableJson::Object(values))
+    }
+}
+
+struct ComparableArguments(ComparableJson);
+
+impl<'de> Deserialize<'de> for ComparableArguments {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut remaining_nodes = MAX_COMPARABLE_ARGUMENT_NODES;
+        ComparableJsonSeed {
+            remaining_nodes: &mut remaining_nodes,
+        }
+        .deserialize(deserializer)
+        .map(Self)
+    }
+}
+
+fn comparable_function_call_arguments(arguments: &str) -> Option<HashMap<String, ComparableJson>> {
+    if arguments.len() > MAX_COMPARABLE_ARGUMENT_BYTES {
+        return None;
+    }
+    match serde_json::from_str::<ComparableArguments>(arguments)
+        .ok()?
+        .0
+    {
+        ComparableJson::Object(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn function_call_arguments_match(incoming: &str, retained: &str) -> bool {
+    if incoming == retained {
+        return true;
+    }
+    let Some(incoming) = comparable_function_call_arguments(incoming) else {
+        return false;
+    };
+    let Some(retained) = comparable_function_call_arguments(retained) else {
+        return false;
+    };
+    incoming == retained
+}
+
+fn input_items_match(incoming: &ResponsesInputItem, retained: &ResponsesInputItem) -> bool {
+    match (incoming, retained) {
+        (
+            ResponsesInputItem::FunctionCall {
+                call_id: incoming_call_id,
+                name: incoming_name,
+                arguments: incoming_arguments,
+            },
+            ResponsesInputItem::FunctionCall {
+                call_id: retained_call_id,
+                name: retained_name,
+                arguments: retained_arguments,
+            },
+        ) => {
+            incoming_call_id == retained_call_id
+                && incoming_name == retained_name
+                && function_call_arguments_match(incoming_arguments, retained_arguments)
+        }
+        _ => match (
+            serde_json::to_value(incoming),
+            serde_json::to_value(retained),
+        ) {
+            (Ok(incoming), Ok(retained)) => incoming == retained,
+            _ => false,
+        },
+    }
+}
+
 fn input_suffix_after_prefix(
     input: &[ResponsesInputItem],
     prefix: &[ResponsesInputItem],
@@ -1045,9 +1226,7 @@ fn input_suffix_after_prefix(
         };
     }
     for i in 0..prefix.len() {
-        let a = serde_json::to_value(&input[i]).unwrap_or_default();
-        let b = serde_json::to_value(&prefix[i]).unwrap_or_default();
-        if a != b {
+        if !input_items_match(&input[i], &prefix[i]) {
             return InputPrefixComparison::FirstMismatch {
                 diagnostics: CodexAppendOnlyDiagnostics {
                     outcome: CodexAppendOnlyOutcome::FirstMismatch,
@@ -1199,6 +1378,14 @@ mod tests {
         }
     }
 
+    fn function_call(call_id: &str, name: &str, arguments: &str) -> ResponsesInputItem {
+        ResponsesInputItem::FunctionCall {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        }
+    }
+
     fn request_with_input(
         input: Vec<ResponsesInputItem>,
         extra: Option<serde_json::Value>,
@@ -1324,6 +1511,188 @@ mod tests {
             }
             _ => panic!("rewritten history should report its first mismatch"),
         }
+    }
+
+    #[test]
+    fn function_call_arguments_compare_as_json_objects() {
+        let retained = vec![function_call(
+            "call-1",
+            "Lookup",
+            r#"{ "path": "C:\\tmp", "enabled": true, "offset": 3, "nested": {"tag":"\u0061"}, "values": [null, false, 2] }"#,
+        )];
+        let incoming = vec![function_call(
+            "call-1",
+            "Lookup",
+            r#"{"values":[null,false,2],"nested":{"tag":"a"},"offset":3,"enabled":true,"path":"C:\\tmp"}"#,
+        )];
+
+        match input_suffix_after_prefix(&incoming, &retained) {
+            InputPrefixComparison::NoDelta { diagnostics } => {
+                assert_eq!(diagnostics.outcome, CodexAppendOnlyOutcome::NoDelta);
+                assert_eq!(diagnostics.first_mismatch_index, None);
+            }
+            _ => panic!("equivalent function arguments should compare equal"),
+        }
+    }
+
+    #[test]
+    fn function_call_identity_and_argument_semantics_remain_exact() {
+        let retained = vec![function_call("call-1", "Lookup", r#"{"city":"Paris"}"#)];
+        let mismatches = [
+            function_call("call-2", "Lookup", r#"{"city":"Paris"}"#),
+            function_call("call-1", "Search", r#"{"city":"Paris"}"#),
+            function_call("call-1", "Lookup", r#"{"city":"London"}"#),
+        ];
+
+        for incoming in mismatches {
+            match input_suffix_after_prefix(&[incoming], &retained) {
+                InputPrefixComparison::FirstMismatch { diagnostics } => {
+                    assert_eq!(diagnostics.outcome, CodexAppendOnlyOutcome::FirstMismatch);
+                    assert_eq!(diagnostics.first_mismatch_index, Some(0));
+                }
+                _ => panic!("function call identity and semantics must remain exact"),
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_function_call_history_reuses_previous_id() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("normalized-function-call");
+        let first_request = request_with_input(vec![input("one")], None);
+        let first = continuation_candidate_for_owner(Some(&owner), &first_request, true);
+        record_continuation_for_owner(
+            &first,
+            &first_request,
+            Some("resp_1"),
+            Some(7),
+            &[function_call(
+                "call-1",
+                "Lookup",
+                r#"{ "city": "Paris", "offset": 3 }"#,
+            )],
+        );
+
+        let next_request = request_with_input(
+            vec![
+                input("one"),
+                function_call("call-1", "Lookup", r#"{"offset":3,"city":"Paris"}"#),
+                input("two"),
+            ],
+            None,
+        );
+        let next = continuation_candidate_for_owner(Some(&owner), &next_request, true);
+
+        assert_eq!(
+            next.candidate().previous_response_id.as_deref(),
+            Some("resp_1")
+        );
+        assert_eq!(next.origin_socket_id(), Some(7));
+        assert_eq!(next.candidate().input_delta_count, 1);
+        assert_eq!(
+            serde_json::to_value(next.candidate().input_delta.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&next_request.input[2..]).unwrap()
+        );
+    }
+
+    #[test]
+    fn ambiguous_function_call_arguments_fall_back_to_raw_text() {
+        let identical_invalid = vec![function_call("call-1", "Lookup", "{invalid")];
+        assert!(matches!(
+            input_suffix_after_prefix(&identical_invalid, &identical_invalid),
+            InputPrefixComparison::NoDelta { .. }
+        ));
+
+        let ambiguous_pairs = [
+            ("{invalid", "{ invalid"),
+            (r#"{"key":1,"key":2}"#, r#"{"key":2}"#),
+            (r#"{"nested":{"key":1,"key":2}}"#, r#"{"nested":{"key":2}}"#),
+            (r#"{"ratio":1.0}"#, r#"{"ratio":1.00}"#),
+            (
+                r#"{"n":18446744073709551616}"#,
+                r#"{"n":18446744073709551617}"#,
+            ),
+            (r#"["one", "two"]"#, r#"["one","two"]"#),
+        ];
+
+        for (retained, incoming) in ambiguous_pairs {
+            let retained = vec![function_call("call-1", "Lookup", retained)];
+            let incoming = vec![function_call("call-1", "Lookup", incoming)];
+            match input_suffix_after_prefix(&incoming, &retained) {
+                InputPrefixComparison::FirstMismatch { diagnostics } => {
+                    assert_eq!(diagnostics.first_mismatch_index, Some(0));
+                }
+                _ => panic!("ambiguous arguments must compare by their raw text"),
+            }
+        }
+    }
+
+    #[test]
+    fn normalization_budget_falls_back_to_raw_text() {
+        let oversized_value = "x".repeat(MAX_COMPARABLE_ARGUMENT_BYTES + 1);
+        let oversized_retained = format!(r#"{{"value":"{oversized_value}"}}"#);
+        let oversized_incoming = format!(r#"{{ "value": "{oversized_value}" }}"#);
+
+        let wide_values = vec!["0"; MAX_COMPARABLE_ARGUMENT_NODES + 1].join(",");
+        let wide_retained = format!(r#"{{"values":[{wide_values}]}}"#);
+        let wide_incoming = format!(r#"{{ "values": [ {wide_values} ] }}"#);
+        assert!(wide_retained.len() <= MAX_COMPARABLE_ARGUMENT_BYTES);
+        assert!(wide_incoming.len() <= MAX_COMPARABLE_ARGUMENT_BYTES);
+
+        for (retained, incoming) in [
+            (&oversized_retained, &oversized_incoming),
+            (&wide_retained, &wide_incoming),
+        ] {
+            let retained = vec![function_call("call-1", "Lookup", retained)];
+            let incoming = vec![function_call("call-1", "Lookup", incoming)];
+            assert!(matches!(
+                input_suffix_after_prefix(&incoming, &retained),
+                InputPrefixComparison::FirstMismatch { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn normalized_comparison_preserves_original_inputs_and_suffix() {
+        let retained = vec![function_call(
+            "call-1",
+            "Lookup",
+            r#"{ "city": "Paris", "offset": 3 }"#,
+        )];
+        let suffix_arguments = r#"{ "ratio": 1.0, "note": "keep spacing" }"#;
+        let incoming = vec![
+            function_call("call-1", "Lookup", r#"{"offset":3,"city":"Paris"}"#),
+            function_call("call-2", "Report", suffix_arguments),
+        ];
+        let retained_before = serde_json::to_value(&retained).unwrap();
+        let incoming_before = serde_json::to_value(&incoming).unwrap();
+
+        match input_suffix_after_prefix(&incoming, &retained) {
+            InputPrefixComparison::Appended {
+                suffix,
+                diagnostics,
+            } => {
+                assert_eq!(diagnostics.outcome, CodexAppendOnlyOutcome::Appended);
+                assert_eq!(diagnostics.incoming_items, 2);
+                assert_eq!(diagnostics.retained_items, 1);
+                assert_eq!(diagnostics.delta_items, 1);
+                assert_eq!(diagnostics.first_mismatch_index, None);
+                assert_eq!(
+                    serde_json::to_value(&suffix).unwrap(),
+                    serde_json::to_value(&incoming[1..]).unwrap()
+                );
+                match &suffix[0] {
+                    ResponsesInputItem::FunctionCall { arguments, .. } => {
+                        assert_eq!(arguments, suffix_arguments);
+                    }
+                    _ => panic!("the original incoming suffix must be preserved"),
+                }
+            }
+            _ => panic!("normalized prefix should preserve and return the original suffix"),
+        }
+
+        assert_eq!(serde_json::to_value(&retained).unwrap(), retained_before);
+        assert_eq!(serde_json::to_value(&incoming).unwrap(), incoming_before);
     }
 
     #[test]
