@@ -299,7 +299,7 @@ fn read_identity_header<'a>(headers: &'a HeaderMap, name: &str) -> ParsedHeader<
     ParsedHeader::Valid(value)
 }
 
-fn trim_ows(value: &str) -> &str {
+pub(crate) fn trim_ows(value: &str) -> &str {
     value.trim_matches(|character| matches!(character, ' ' | '\t'))
 }
 

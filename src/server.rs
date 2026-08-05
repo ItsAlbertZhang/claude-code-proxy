@@ -27,7 +27,7 @@ use crate::{
     registry::{Registry, normalize_incoming_model},
     request_identity::{
         CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, CLAUDE_SESSION_HEADER, RequestPurpose,
-        RequestScope,
+        RequestScope, trim_ows,
     },
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
@@ -54,7 +54,46 @@ use uuid::Uuid;
 
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
+const CLAUDE_FAST_SPEED_VALUE: &str = "fast";
+const CLAUDE_FAST_BETA: &str = "fast-mode-2026-02-01";
 const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
+
+fn request_has_beta(
+    headers: &http::HeaderMap,
+    body: &crate::anthropic::schema::MessagesRequest,
+    requested_beta: &str,
+) -> bool {
+    if headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            value
+                .split(',')
+                .map(trim_ows)
+                .any(|beta| beta == requested_beta)
+        })
+    {
+        return true;
+    }
+
+    body.extra
+        .get("betas")
+        .and_then(Value::as_array)
+        .is_some_and(|betas| {
+            betas
+                .iter()
+                .any(|beta| beta.as_str() == Some(requested_beta))
+        })
+}
+
+fn is_official_claude_fast_request(
+    headers: &http::HeaderMap,
+    body: &crate::anthropic::schema::MessagesRequest,
+) -> bool {
+    body.extra.get("speed").and_then(Value::as_str) == Some(CLAUDE_FAST_SPEED_VALUE)
+        && request_has_beta(headers, body, CLAUDE_FAST_BETA)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoReviewRoute {
@@ -1558,6 +1597,7 @@ async fn dispatch_request(
             return response;
         }
     };
+    let claude_fast_intent = !count_tokens && is_official_claude_fast_request(&headers, &body);
 
     if let Some(project) = project::name_from_request(
         body.extra.get("system"),
@@ -1795,6 +1835,15 @@ async fn dispatch_request(
 
     let response = if count_tokens {
         provider.handle_count_tokens(body, context).await
+    } else if provider.name() == "codex" {
+        provider
+            .handle_messages_with_claude_fast_intent(
+                body,
+                context,
+                request_scope.conversational_lane().cloned(),
+                claude_fast_intent,
+            )
+            .await
     } else {
         provider
             .handle_messages_with_conversation_identity(
@@ -2219,7 +2268,7 @@ fn _unused(session_state: Option<&SessionState>) {
 mod auto_review_tests {
     use super::{
         apply_auto_review_effort, apply_auto_review_model, headers_to_record,
-        is_claude_auto_review_request,
+        is_claude_auto_review_request, is_official_claude_fast_request,
     };
     use crate::anthropic::schema::MessagesRequest;
     use crate::request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER};
@@ -2236,6 +2285,74 @@ mod auto_review_tests {
             "tools": tools
         }))
         .unwrap()
+    }
+
+    fn fast_request(speed: Value, betas: Option<Value>) -> MessagesRequest {
+        let mut body = request("You are an interactive coding agent.", false, json!([]));
+        body.extra.insert("speed".to_string(), speed);
+        if let Some(betas) = betas {
+            body.extra.insert("betas".to_string(), betas);
+        }
+        body
+    }
+
+    #[test]
+    fn detects_exact_claude_fast_signals_from_header_or_body() {
+        let body_beta = fast_request(
+            json!("fast"),
+            Some(json!(["other-beta", "fast-mode-2026-02-01"])),
+        );
+        assert!(is_official_claude_fast_request(
+            &HeaderMap::new(),
+            &body_beta
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("other-beta,\tfast-mode-2026-02-01 "),
+        );
+        let header_beta = fast_request(json!("fast"), None);
+        assert!(is_official_claude_fast_request(&headers, &header_beta));
+    }
+
+    #[test]
+    fn requires_both_exact_claude_fast_signals() {
+        let cases = [
+            fast_request(json!("fast"), None),
+            fast_request(json!("FAST"), Some(json!(["fast-mode-2026-02-01"]))),
+            fast_request(json!(" fast "), Some(json!(["fast-mode-2026-02-01"]))),
+            fast_request(json!(true), Some(json!(["fast-mode-2026-02-01"]))),
+            fast_request(json!("fast"), Some(json!(["FAST-MODE-2026-02-01"]))),
+            fast_request(json!("fast"), Some(json!(["fast-mode-2026-02-01-extra"]))),
+            fast_request(json!("fast"), Some(json!("fast-mode-2026-02-01"))),
+            fast_request(
+                json!("fast"),
+                Some(json!(["other-beta,fast-mode-2026-02-01"])),
+            ),
+        ];
+        for body in cases {
+            assert!(!is_official_claude_fast_request(&HeaderMap::new(), &body));
+        }
+
+        let beta_only = fast_request(json!("standard"), None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("fast-mode-2026-02-01"),
+        );
+        assert!(!is_official_claude_fast_request(&headers, &beta_only));
+    }
+
+    #[test]
+    fn ignores_invalid_header_values_without_masking_valid_body_beta() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_bytes(b"\xff").expect("opaque header value"),
+        );
+        let body = fast_request(json!("fast"), Some(json!([null, "fast-mode-2026-02-01"])));
+        assert!(is_official_claude_fast_request(&headers, &body));
     }
 
     #[test]

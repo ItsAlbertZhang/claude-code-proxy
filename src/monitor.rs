@@ -373,7 +373,20 @@ impl CodexDispatchSummary {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RequestAcceleration {
+    pub(crate) requested_speed: Option<&'static str>,
+    pub(crate) codex_service_tier: Option<&'static str>,
+}
+
+impl RequestAcceleration {
+    pub(crate) fn is_empty(self) -> bool {
+        self.requested_speed.is_none() && self.codex_service_tier.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CodexRequestDiagnostics {
+    pub(crate) acceleration: RequestAcceleration,
     pub(crate) lane: Option<CodexLane>,
     pub(crate) previous_id: CodexRequestPreviousId,
     pub(crate) recovery: CodexRecoveryDiagnostics,
@@ -735,6 +748,8 @@ fn codex_diagnostics_json(diagnostics: CodexRequestDiagnostics) -> serde_json::V
     });
     serde_json::json!({
         "eventSequence": diagnostics.event_sequence,
+        "requestedSpeed": diagnostics.acceleration.requested_speed,
+        "serviceTier": diagnostics.acceleration.codex_service_tier,
         "lane": diagnostics.lane.map(CodexLane::label),
         "previousId": diagnostics.previous_id.label(),
         "previousIdCause": diagnostics.recovery.previous_id_cause.map(CodexRecoveryCause::label),
@@ -1041,6 +1056,41 @@ impl MonitorHandle {
             http_status,
             error: error.into(),
         });
+    }
+
+    pub(crate) fn codex_acceleration_resolved(
+        &self,
+        request_id: &str,
+        requested_speed: Option<&'static str>,
+        codex_service_tier: Option<&'static str>,
+    ) {
+        let acceleration = RequestAcceleration {
+            requested_speed,
+            codex_service_tier,
+        };
+        if acceleration.is_empty() {
+            return;
+        }
+        let update = match self.store.lock() {
+            Ok(mut store) => store.update_codex_request(request_id, |diagnostics| {
+                diagnostics.acceleration = acceleration;
+            }),
+            Err(_) => None,
+        };
+        if let Some(update) = update {
+            let mut fields = serde_json::Map::new();
+            fields.insert("requestedSpeed".into(), serde_json::json!(requested_speed));
+            fields.insert("serviceTier".into(), serde_json::json!(codex_service_tier));
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_acceleration_resolved",
+                update.diagnostics,
+                update.changed,
+                fields,
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
     }
 
     pub(crate) fn codex_request_lane(&self, request_id: &str, responses_lite: bool) {
@@ -2192,6 +2242,45 @@ mod tests {
                 .previous_id,
             CodexRequestPreviousId::Hit
         );
+    }
+
+    #[test]
+    fn codex_acceleration_follows_request_into_completion_and_diagnostics() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r-fast", None, None, EndpointKind::Messages);
+        monitor.provider_selected("r-fast", "codex", "gpt-5.5", None);
+        monitor.codex_acceleration_resolved("r-fast", Some("fast"), Some("priority"));
+
+        let active = monitor.snapshot();
+        let diagnostics = *active.active[0].codex_diagnostics().unwrap();
+        assert_eq!(
+            diagnostics.acceleration,
+            RequestAcceleration {
+                requested_speed: Some("fast"),
+                codex_service_tier: Some("priority"),
+            }
+        );
+        let json = codex_diagnostics_json(diagnostics);
+        assert_eq!(json["requestedSpeed"], "fast");
+        assert_eq!(json["serviceTier"], "priority");
+
+        monitor.request_completed("r-fast", 200, None, None);
+        assert_eq!(
+            monitor.snapshot().recent[0]
+                .codex_diagnostics()
+                .unwrap()
+                .acceleration,
+            diagnostics.acceleration
+        );
+    }
+
+    #[test]
+    fn ordinary_request_does_not_create_acceleration_diagnostics() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r-standard", None, None, EndpointKind::Messages);
+        monitor.codex_acceleration_resolved("r-standard", None, None);
+
+        assert!(monitor.snapshot().active[0].codex_diagnostics().is_none());
     }
 
     #[test]

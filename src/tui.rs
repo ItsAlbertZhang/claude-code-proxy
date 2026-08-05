@@ -33,7 +33,7 @@ use tokio::sync::oneshot;
 use crate::{
     monitor::{
         ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState,
-        SESSION_TOKEN_BUCKET_SECS, SessionSummary,
+        RequestAcceleration, SESSION_TOKEN_BUCKET_SECS, SessionSummary,
     },
     paths,
     registry::Registry,
@@ -1370,6 +1370,18 @@ fn render_session_detail(
     );
 }
 
+fn format_acceleration(acceleration: RequestAcceleration) -> String {
+    match (
+        acceleration.requested_speed,
+        acceleration.codex_service_tier,
+    ) {
+        (Some(speed), Some(tier)) => format!("Claude {speed} → Codex {tier}"),
+        (Some(speed), None) => format!("Claude {speed}"),
+        (None, Some(tier)) => format!("Codex {tier}"),
+        (None, None) => "-".to_string(),
+    }
+}
+
 fn render_request_detail(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -1415,6 +1427,19 @@ fn render_request_detail(
             detail_line("provider", request.provider.as_deref().unwrap_or("-"), TEAL),
             detail_line("model", request.model.as_deref().unwrap_or("-"), DIM_WHITE),
             detail_line("effort", request.effort.as_deref().unwrap_or("-"), YELLOW),
+        ];
+        if let Some(acceleration) = request
+            .codex_diagnostics()
+            .map(|diagnostics| diagnostics.acceleration)
+            .filter(|acceleration| !acceleration.is_empty())
+        {
+            lines.push(detail_line(
+                "acceleration",
+                format_acceleration(acceleration),
+                YELLOW,
+            ));
+        }
+        lines.extend([
             detail_line("latency", format_duration(request.latency), DIM_WHITE),
             detail_line("rate", request.rate().label(), TEAL),
             detail_line("input tokens", token_value(request.input_tokens), DIM_WHITE),
@@ -1433,7 +1458,7 @@ fn render_request_detail(
                 request.stream_chunks.to_string(),
                 DIM_WHITE,
             ),
-        ];
+        ]);
         if let Some(error) = request.error.as_deref().filter(|error| !error.is_empty()) {
             lines.push(detail_line("detail", error, YELLOW));
         }
@@ -2429,6 +2454,33 @@ mod tests {
         assert!(
             detail_text.contains("upstream unavailable"),
             "{detail_text}"
+        );
+    }
+
+    #[test]
+    fn request_detail_renders_claude_fast_and_effective_codex_tier() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("request-fast", None, None, EndpointKind::Messages);
+        monitor.provider_selected("request-fast", "codex", "gpt-5.5", None);
+        monitor.codex_acceleration_resolved("request-fast", Some("fast"), Some("priority"));
+        monitor.request_completed("request-fast", 200, None, None);
+        let state = monitor.snapshot();
+
+        let detail = draw(120, 22, |frame| {
+            render_request_detail(frame, frame.area(), &state, 0)
+        });
+        let detail_text = buffer_text(&detail);
+
+        assert!(
+            detail_text.contains("Claude fast → Codex priority"),
+            "{detail_text}"
+        );
+        assert_eq!(
+            format_acceleration(RequestAcceleration {
+                requested_speed: None,
+                codex_service_tier: Some("flex"),
+            }),
+            "Codex flex"
         );
     }
 

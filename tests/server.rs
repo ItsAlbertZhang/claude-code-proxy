@@ -254,6 +254,64 @@ impl Provider for IdentityCaptureProvider {
     }
 }
 
+struct FastIntentCaptureProvider {
+    name: &'static str,
+    model: &'static str,
+    captured: Arc<Mutex<Vec<bool>>>,
+}
+
+#[async_trait]
+impl Provider for FastIntentCaptureProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec![self.model.to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, "legacy path").into_response()
+    }
+
+    async fn handle_messages_with_conversation_identity(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+        _conversation_identity: Option<ConversationIdentity>,
+    ) -> axum::response::Response {
+        self.captured.lock().unwrap().push(false);
+        (StatusCode::OK, "captured").into_response()
+    }
+
+    async fn handle_messages_with_claude_fast_intent(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+        _conversation_identity: Option<ConversationIdentity>,
+        claude_fast_intent: bool,
+    ) -> axum::response::Response {
+        self.captured.lock().unwrap().push(claude_fast_intent);
+        (StatusCode::OK, "captured").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::OK, "counted").into_response()
+    }
+}
+
 struct OpenAiIdentityCaptureProvider {
     captured: Arc<Mutex<Vec<CapturedIdentity>>>,
 }
@@ -354,6 +412,90 @@ async fn call_identity_ingress(
         .await
         .unwrap()
         .status()
+}
+
+#[tokio::test]
+async fn claude_fast_intent_is_strict_and_codex_scoped() {
+    let codex_captured = Arc::new(Mutex::new(Vec::new()));
+    let kimi_captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::from_providers(
+        AliasProvider::Codex,
+        vec![
+            Arc::new(FastIntentCaptureProvider {
+                name: "codex",
+                model: "gpt-5.5",
+                captured: codex_captured.clone(),
+            }) as Arc<dyn Provider>,
+            Arc::new(FastIntentCaptureProvider {
+                name: "kimi",
+                model: "kimi-k2.6",
+                captured: kimi_captured.clone(),
+            }) as Arc<dyn Provider>,
+        ],
+    );
+    let app = app(Arc::new(registry));
+    let body = |model: &str| {
+        json!({
+            "model": model,
+            "max_tokens": 32,
+            "speed": "fast",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+    };
+
+    assert_eq!(
+        call_identity_ingress(
+            &app,
+            "/v1/messages",
+            &[("anthropic-beta", "fast-mode-2026-02-01")],
+            body("gpt-5.5"),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_identity_ingress(
+            &app,
+            "/v1/messages",
+            &[("anthropic-beta", "fast-mode-2026-02-01")],
+            body("kimi-k2.6"),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_identity_ingress(
+            &app,
+            "/v1/messages",
+            &[],
+            json!({
+                "model": "gpt-5.5",
+                "max_tokens": 32,
+                "speed": "fast",
+                "betas": ["fast-mode-2026-02-01"],
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_identity_ingress(&app, "/v1/messages", &[], body("gpt-5.5"),).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_identity_ingress(
+            &app,
+            "/v1/messages/count_tokens",
+            &[("anthropic-beta", "fast-mode-2026-02-01")],
+            body("gpt-5.5"),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    assert_eq!(*codex_captured.lock().unwrap(), vec![true, true, false]);
+    assert_eq!(*kimi_captured.lock().unwrap(), vec![false]);
 }
 
 #[tokio::test]

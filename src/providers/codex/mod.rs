@@ -69,12 +69,31 @@ use self::translate::model_allowlist::{
 };
 use self::translate::reducer::finish_metadata_from_upstream_scoped;
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request_scoped,
+    ServiceTier, TranslateOptions, has_hosted_web_search, is_compact_messages_request,
+    translate_request_scoped,
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
+
+fn merge_claude_fast_service_tier(
+    model_tier: Option<ServiceTier>,
+    claude_fast_intent: bool,
+) -> Option<ServiceTier> {
+    if claude_fast_intent {
+        Some(ServiceTier::Priority)
+    } else {
+        model_tier
+    }
+}
+
+fn service_tier_label(service_tier: &ServiceTier) -> &'static str {
+    match service_tier {
+        ServiceTier::Priority => "priority",
+        ServiceTier::Flex => "flex",
+    }
+}
 use self::translate::stream::translate_stream_bytes_scoped;
 
 // ---------------------------------------------------------------------------
@@ -143,6 +162,7 @@ impl CodexProvider {
         &self,
         body: MessagesRequest,
         scoped: ScopedRequestContext,
+        claude_fast_intent: bool,
     ) -> Response {
         let (ctx, scope) = scoped.into_parts();
         let conversation_identity = scope.conversational_lane().cloned();
@@ -288,6 +308,8 @@ impl CodexProvider {
                 ctx.traffic.as_deref(),
             );
         }
+        resolved.service_tier =
+            merge_claude_fast_service_tier(resolved.service_tier, claude_fast_intent);
         let full_lane = config::codex_full_lane();
         let use_responses_lite =
             apply_model_lane_for_request(&mut resolved.model, &body, full_lane);
@@ -317,6 +339,16 @@ impl CodexProvider {
                 );
             }
         };
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.codex_acceleration_resolved(
+                &ctx.req_id,
+                claude_fast_intent.then_some("fast"),
+                original_translated
+                    .service_tier
+                    .as_ref()
+                    .map(service_tier_label),
+            );
+        }
 
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = self.server_compaction_enabled();
@@ -762,7 +794,7 @@ impl Provider for CodexProvider {
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let scope = legacy_scope(&ctx, RequestPurpose::Conversation);
-        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope))
+        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope), false)
             .await
     }
 
@@ -775,8 +807,26 @@ impl Provider for CodexProvider {
         let identity = compatible_explicit_identity(&ctx, conversation_identity);
         let scope =
             RequestScope::from_conversation_identity(identity, RequestPurpose::Conversation);
-        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope))
+        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope), false)
             .await
+    }
+
+    async fn handle_messages_with_claude_fast_intent(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+        claude_fast_intent: bool,
+    ) -> Response {
+        let identity = compatible_explicit_identity(&ctx, conversation_identity);
+        let scope =
+            RequestScope::from_conversation_identity(identity, RequestPurpose::Conversation);
+        self.handle_messages_inner(
+            body,
+            ScopedRequestContext::new(ctx, scope),
+            claude_fast_intent,
+        )
+        .await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -2080,6 +2130,47 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn claude_fast_promotes_only_the_derived_service_tier() {
+        assert_eq!(merge_claude_fast_service_tier(None, false), None);
+        assert_eq!(
+            merge_claude_fast_service_tier(Some(ServiceTier::Flex), false),
+            Some(ServiceTier::Flex)
+        );
+        assert_eq!(
+            merge_claude_fast_service_tier(None, true),
+            Some(ServiceTier::Priority)
+        );
+        assert_eq!(
+            merge_claude_fast_service_tier(Some(ServiceTier::Flex), true),
+            Some(ServiceTier::Priority)
+        );
+        assert_eq!(
+            merge_claude_fast_service_tier(Some(ServiceTier::Priority), true),
+            Some(ServiceTier::Priority)
+        );
+    }
+
+    #[test]
+    fn existing_fast_alias_stays_priority_without_claude_fast() {
+        let resolved = resolve_model_request_with_config_override("gpt-5.5-fast", false);
+        assert_eq!(resolved.model, "gpt-5.5");
+        assert_eq!(
+            merge_claude_fast_service_tier(resolved.service_tier, false),
+            Some(ServiceTier::Priority)
+        );
+    }
+
+    #[test]
+    fn normal_model_uses_priority_when_claude_fast_is_detected() {
+        let resolved = resolve_model_request_with_config_override("gpt-5.5", false);
+        assert_eq!(resolved.model, "gpt-5.5");
+        assert_eq!(
+            merge_claude_fast_service_tier(resolved.service_tier, true),
+            Some(ServiceTier::Priority)
+        );
+    }
+
     fn live_test_request(text: &str) -> translate::request::ResponsesRequest {
         translate::request::ResponsesRequest {
             model: "gpt-5.6-sol".to_string(),
@@ -3048,7 +3139,7 @@ mod tests {
         }))
         .unwrap();
         let response = provider
-            .handle_messages_inner(initial, scope("agent-a", "read-first"))
+            .handle_messages_inner(initial, scope("agent-a", "read-first"), false)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let downstream: serde_json::Value = serde_json::from_slice(
@@ -3092,7 +3183,7 @@ mod tests {
         };
         for (agent, req_id) in [("agent-a", "read-same-lane"), ("agent-b", "read-sibling")] {
             let response = provider
-                .handle_messages_inner(result_request(), scope(agent, req_id))
+                .handle_messages_inner(result_request(), scope(agent, req_id), false)
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
             let _ = axum::body::to_bytes(response.into_body(), usize::MAX)

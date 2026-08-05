@@ -100,6 +100,16 @@ async fn call_messages_body(body: Value) -> Response {
     call_messages_body_for_session(body, "smoke-session").await
 }
 
+async fn call_fast_messages_body_for_session(body: Value, session_id: &str) -> Response {
+    call_messages_body_for_uri_with_headers(
+        body,
+        "/v1/messages",
+        session_id,
+        &[("anthropic-beta", "fast-mode-2026-02-01")],
+    )
+    .await
+}
+
 async fn call_count_tokens_body(body: Value) -> Response {
     call_messages_body_for_uri(body, "/v1/messages/count_tokens", "smoke-session").await
 }
@@ -109,17 +119,26 @@ async fn call_messages_body_for_session(body: Value, session_id: &str) -> Respon
 }
 
 async fn call_messages_body_for_uri(body: Value, uri: &str, session_id: &str) -> Response {
+    call_messages_body_for_uri_with_headers(body, uri, session_id, &[]).await
+}
+
+async fn call_messages_body_for_uri_with_headers(
+    body: Value,
+    uri: &str,
+    session_id: &str,
+    headers: &[(&str, &str)],
+) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", session_id);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     app(Arc::new(Registry::with_default_alias()))
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(uri)
-                .header("content-type", "application/json")
-                .header("x-claude-code-session-id", session_id)
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap()
 }
@@ -1041,6 +1060,85 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
     let sent = captured.lock().unwrap().clone().unwrap();
     assert_eq!(sent["model"], "gpt-5.5");
     assert_eq!(sent["stream"], true);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_claude_fast_maps_to_codex_priority_across_retry_and_config_override() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        let attempts = attempts.clone();
+        move |body: Value| {
+            captured.lock().unwrap().push(body);
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_empty\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n".to_vec()
+            } else {
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fast\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_fast\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"fast ok\"}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fast\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+                )
+                .as_bytes()
+                .to_vec()
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _model_env = EnvGuard::remove("CCP_CODEX_MODEL");
+    let _service_tier_env = EnvGuard::remove("CCP_CODEX_SERVICE_TIER");
+    let body = || {
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "speed": "fast",
+            "messages": [{"role":"user","content":"hello"}]
+        })
+    };
+
+    let response = call_fast_messages_body_for_session(body(), "fast-priority").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response_body["model"], "gpt-5.5");
+
+    {
+        let sent = captured.lock().unwrap();
+        assert_eq!(sent.len(), 2, "empty completion should retry once");
+        for request in sent.iter() {
+            assert_eq!(request["model"], "gpt-5.5");
+            assert_eq!(request["service_tier"], "priority");
+            assert!(request.get("speed").is_none());
+            assert!(request.get("betas").is_none());
+        }
+    }
+
+    std::fs::write(
+        config.path().join("config.json"),
+        serde_json::to_vec(&json!({"codex": {"serviceTier": "flex"}})).unwrap(),
+    )
+    .unwrap();
+    let response = call_fast_messages_body_for_session(body(), "fast-flex").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let sent = captured.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2]["service_tier"], "flex");
 }
 
 #[allow(clippy::await_holding_lock)]

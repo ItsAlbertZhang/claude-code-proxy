@@ -39,6 +39,18 @@ pub trait Provider: Send + Sync {
         self.handle_messages(body, ctx).await
     }
 
+    async fn handle_messages_with_claude_fast_intent(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+        claude_fast_intent: bool,
+    ) -> Response {
+        let _ = claude_fast_intent;
+        self.handle_messages_with_conversation_identity(body, ctx, conversation_identity)
+            .await
+    }
+
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 
     async fn generate_anthropic_stream(
