@@ -184,6 +184,10 @@ impl CodexBoundRoute {
         self.route_identity
     }
 
+    pub(crate) fn route_identity_key(&self) -> [u8; 32] {
+        self.route_identity.0
+    }
+
     pub(crate) fn conversation_key(&self) -> Option<CodexConversationKey> {
         self.conversation_key
     }
@@ -194,6 +198,16 @@ impl CodexBoundRoute {
 
     pub(crate) fn socket_pool_key(&self) -> Option<SocketPoolKey> {
         self.socket_pool_key
+    }
+
+    /// Preserves the bound origin, principal, credentials, and protocol while
+    /// removing all conversation identity for detached auxiliary work.
+    pub(crate) fn auxiliary(&self) -> Self {
+        let mut route = self.clone();
+        route.lane = None;
+        route.conversation_key = None;
+        route.socket_pool_key = None;
+        route
     }
 
     pub(crate) fn validate_responses_request(
@@ -458,6 +472,28 @@ mod tests {
             .socket_pool_key()
             .is_none()
         );
+    }
+
+    #[test]
+    fn auxiliary_route_preserves_origin_and_auth_but_drops_conversation_identity() {
+        let bound = route(
+            "https://example.test/backend-api/codex",
+            Some("account-a"),
+            "token-a",
+            ProtocolLane::ResponsesFull,
+            Some(lane("session-a")),
+        );
+        let auxiliary = bound.auxiliary();
+
+        assert_eq!(auxiliary.canonical_endpoint(), bound.canonical_endpoint());
+        assert_eq!(auxiliary.account_id(), bound.account_id());
+        assert_eq!(auxiliary.auth().access, bound.auth().access);
+        assert_eq!(auxiliary.route_identity(), bound.route_identity());
+        assert_eq!(auxiliary.protocol(), bound.protocol());
+        assert!(auxiliary.lane().is_none());
+        assert!(auxiliary.conversation_key().is_none());
+        assert!(auxiliary.socket_pool_key().is_none());
+        assert!(auxiliary.namespace_prompt_cache_key("caller-key").is_none());
     }
 
     #[test]

@@ -1,7 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use crate::monitor::{
+    CodexAppendOnlyDiagnostics, CodexAppendOnlyOutcome, CodexPoolResolution,
+    CodexPreviousIdOutcome, CodexRecoveryCause, CodexSocketValidationFailure, MonitorHandle,
+};
 use crate::request_identity::ConversationIdentity;
 
 use super::state::{CodexBoundRoute, SocketPoolKey};
@@ -55,12 +59,115 @@ pub(crate) async fn lock_continuation_registry_for_async_tests()
 }
 
 #[derive(Clone)]
+struct ReservationSnapshot {
+    state: Option<ContinuationState>,
+    superseded_turn: bool,
+    reserved_at: u64,
+}
+
+const TURN_OPEN: u8 = 0;
+const TURN_PUBLISHED: u8 = 1;
+const TURN_CANCELLED: u8 = 2;
+
+#[derive(Default)]
+struct TurnOutcomeFence {
+    state: AtomicU8,
+}
+
+impl TurnOutcomeFence {
+    fn claim_publication(&self) -> bool {
+        self.state
+            .compare_exchange(
+                TURN_OPEN,
+                TURN_PUBLISHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn cancel(&self) -> bool {
+        self.state
+            .compare_exchange(
+                TURN_OPEN,
+                TURN_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone)]
 pub struct ContinuationCandidate {
     pub turn_id: Option<u64>,
     pub previous_response_id: Option<String>,
     pub input_delta: Option<Vec<ResponsesInputItem>>,
     pub input_delta_count: usize,
     pub disabled_reason: Option<String>,
+}
+
+struct PreviousIdMetrics {
+    monitor: MonitorHandle,
+    request_id: String,
+    had_candidate_at_attachment: AtomicBool,
+    settled: AtomicBool,
+}
+
+impl PreviousIdMetrics {
+    fn set_had_candidate(&self, had_candidate: bool) {
+        self.had_candidate_at_attachment
+            .store(had_candidate, Ordering::Release);
+    }
+
+    fn settle(&self, outcome: CodexPreviousIdOutcome) {
+        if self
+            .settled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.monitor
+                .codex_previous_id_settled(&self.request_id, outcome);
+        }
+    }
+
+    fn record_previous_id_cause(&self, cause: CodexRecoveryCause) {
+        self.monitor
+            .codex_previous_id_cause(&self.request_id, cause);
+    }
+
+    fn record_socket_cause(&self, cause: CodexRecoveryCause) {
+        self.monitor.codex_socket_cause(&self.request_id, cause);
+    }
+
+    fn record_append_only(&self, diagnostics: CodexAppendOnlyDiagnostics) {
+        self.monitor
+            .codex_append_only(&self.request_id, diagnostics);
+    }
+
+    fn record_pool_resolution(&self, resolution: CodexPoolResolution) {
+        self.monitor
+            .codex_pool_resolution(&self.request_id, resolution);
+    }
+
+    fn record_socket_validation(
+        &self,
+        failure: Option<CodexSocketValidationFailure>,
+        elapsed_ms: u32,
+        required_origin: bool,
+    ) {
+        self.monitor.codex_socket_validation(
+            &self.request_id,
+            failure,
+            elapsed_ms,
+            required_origin,
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -70,6 +177,12 @@ pub(crate) struct ContinuationReservation {
     origin_socket_id: Option<u64>,
     route_key: Option<SocketPoolKey>,
     cleanup_epoch: Option<u64>,
+    candidate_cause: Option<CodexRecoveryCause>,
+    append_only: Option<CodexAppendOnlyDiagnostics>,
+    previous_id_metrics: Option<Arc<PreviousIdMetrics>>,
+    snapshot: Option<ReservationSnapshot>,
+    turn_outcome: Option<Arc<TurnOutcomeFence>>,
+    detached: bool,
 }
 
 impl ContinuationReservation {
@@ -78,13 +191,96 @@ impl ContinuationReservation {
         owner: Option<ConversationIdentity>,
         origin_socket_id: Option<u64>,
     ) -> Self {
+        let turn_outcome = (owner.is_some() && candidate.turn_id.is_some())
+            .then(|| Arc::new(TurnOutcomeFence::default()));
         Self {
             candidate,
             owner,
             origin_socket_id,
             route_key: None,
             cleanup_epoch: None,
+            candidate_cause: None,
+            append_only: None,
+            previous_id_metrics: None,
+            snapshot: None,
+            turn_outcome,
+            detached: false,
         }
+    }
+
+    pub(crate) fn detached(input_count: usize, reason: &str) -> Self {
+        let mut reservation = Self::new(
+            ContinuationCandidate {
+                turn_id: None,
+                previous_response_id: None,
+                input_delta: None,
+                input_delta_count: input_count,
+                disabled_reason: Some(reason.to_string()),
+            },
+            None,
+            None,
+        );
+        reservation.detached = true;
+        reservation
+    }
+
+    fn with_candidate_cause(mut self, cause: CodexRecoveryCause) -> Self {
+        if let Some(metrics) = self.previous_id_metrics.as_ref() {
+            metrics.record_previous_id_cause(cause);
+        }
+        self.candidate_cause = Some(cause);
+        self
+    }
+
+    fn with_append_only(mut self, diagnostics: CodexAppendOnlyDiagnostics) -> Self {
+        if let Some(metrics) = self.previous_id_metrics.as_ref() {
+            metrics.record_append_only(diagnostics);
+        }
+        self.append_only = Some(diagnostics);
+        self
+    }
+
+    pub(crate) fn with_previous_id_metrics(
+        mut self,
+        monitor: Option<MonitorHandle>,
+        request_id: &str,
+    ) -> Self {
+        if self.turn_id().is_some()
+            && let Some(monitor) = monitor
+        {
+            monitor.codex_previous_id_pending(request_id);
+            let metrics = Arc::new(PreviousIdMetrics {
+                monitor,
+                request_id: request_id.to_string(),
+                had_candidate_at_attachment: AtomicBool::new(
+                    self.candidate.previous_response_id.is_some(),
+                ),
+                settled: AtomicBool::new(false),
+            });
+            if let Some(cause) = self.candidate_cause {
+                metrics.record_previous_id_cause(cause);
+            }
+            if let Some(append_only) = self.append_only {
+                metrics.record_append_only(append_only);
+            }
+            self.previous_id_metrics = Some(metrics);
+        }
+        self
+    }
+
+    pub(crate) fn settle_previous_id_completed(&self) {
+        let Some(metrics) = self.previous_id_metrics.as_ref() else {
+            return;
+        };
+        let outcome = match (
+            metrics.had_candidate_at_attachment.load(Ordering::Acquire),
+            self.candidate.previous_response_id.is_some(),
+        ) {
+            (false, _) => CodexPreviousIdOutcome::NoCandidate,
+            (true, true) => CodexPreviousIdOutcome::Hit,
+            (true, false) => CodexPreviousIdOutcome::Fallback,
+        };
+        metrics.settle(outcome);
     }
 
     pub(crate) fn from_public_candidate(candidate: &ContinuationCandidate) -> Self {
@@ -124,6 +320,42 @@ impl ContinuationReservation {
         self.origin_socket_id
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn candidate_cause(&self) -> Option<CodexRecoveryCause> {
+        self.candidate_cause
+    }
+
+    pub(crate) fn record_socket_cause(&self, cause: CodexRecoveryCause) {
+        if let Some(metrics) = self.previous_id_metrics.as_ref() {
+            metrics.record_socket_cause(cause);
+        }
+    }
+
+    pub(crate) fn record_pool_resolution(&self, resolution: CodexPoolResolution) {
+        if let Some(metrics) = self.previous_id_metrics.as_ref() {
+            metrics.record_pool_resolution(resolution);
+        }
+    }
+
+    pub(crate) fn record_socket_validation(
+        &self,
+        failure: Option<CodexSocketValidationFailure>,
+        elapsed_ms: u32,
+        required_origin: bool,
+    ) {
+        if let Some(metrics) = self.previous_id_metrics.as_ref() {
+            metrics.record_socket_validation(failure, elapsed_ms, required_origin);
+        }
+    }
+
+    fn record_previous_id_cause(&self, cause: CodexRecoveryCause) {
+        if self.candidate.previous_response_id.is_some()
+            && let Some(metrics) = self.previous_id_metrics.as_ref()
+        {
+            metrics.record_previous_id_cause(cause);
+        }
+    }
+
     pub(crate) fn route_key(&self) -> Option<SocketPoolKey> {
         self.route_key
     }
@@ -134,11 +366,16 @@ impl ContinuationReservation {
     }
 
     pub(crate) fn bind_route(&self, route: &CodexBoundRoute) -> Self {
+        if self.detached {
+            return self.clone();
+        }
         let mut bound = self.clone();
         let route_key = route.socket_pool_key();
         let previous_route_matches = bound.candidate.previous_response_id.is_none()
             || (route_key.is_some() && bound.route_key == route_key);
         if !previous_route_matches {
+            bound.record_previous_id_cause(CodexRecoveryCause::RouteChanged);
+            bound.candidate_cause = Some(CodexRecoveryCause::RouteChanged);
             bound.candidate.previous_response_id = None;
             bound.candidate.input_delta = None;
             bound.candidate.disabled_reason = Some("route_changed".to_string());
@@ -160,6 +397,8 @@ impl ContinuationReservation {
             return bound;
         };
         if owner_state.current_turn != turn_id {
+            bound.record_previous_id_cause(CodexRecoveryCause::SupersededTurn);
+            bound.candidate_cause = Some(CodexRecoveryCause::SupersededTurn);
             bound.candidate.previous_response_id = None;
             bound.candidate.input_delta = None;
             bound.candidate.disabled_reason = Some("superseded_turn".to_string());
@@ -181,18 +420,47 @@ impl ContinuationReservation {
         self
     }
 
+    pub(crate) fn evaluate(&self, body: &ResponsesRequest) -> Self {
+        let Some(snapshot) = self.snapshot.clone() else {
+            let mut evaluated = self.clone();
+            evaluated.candidate.input_delta_count = body.input.len();
+            return evaluated;
+        };
+        continuation_candidate_from_state(self, body, snapshot, true)
+    }
+
+    pub(crate) fn evaluate_hidden_compaction(&self, body: &ResponsesRequest) -> Self {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return self.evaluate(body);
+        };
+        continuation_candidate_from_state(self, body, snapshot, false)
+    }
+
+    fn claim_publication(&self) -> bool {
+        self.turn_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.claim_publication())
+    }
+
+    fn cancel(&self) -> bool {
+        self.turn_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.cancel())
+    }
+
     pub(crate) fn into_candidate(self) -> ContinuationCandidate {
         self.candidate
     }
 
-    pub(crate) fn full_context_retry(&self) -> Self {
-        let mut candidate = self.candidate.clone();
-        candidate.previous_response_id = None;
-        candidate.input_delta = None;
-        candidate.disabled_reason = Some("full_context_retry".to_string());
-        let mut retry = Self::new(candidate, self.owner.clone(), None);
-        retry.route_key = self.route_key;
-        retry.cleanup_epoch = self.cleanup_epoch;
+    pub(crate) fn full_context_retry(&self, cause: CodexRecoveryCause) -> Self {
+        self.record_previous_id_cause(cause);
+        let mut retry = self.clone();
+        retry.candidate.previous_response_id = None;
+        retry.candidate.input_delta = None;
+        retry.candidate.disabled_reason = Some("full_context_retry".to_string());
+        retry.origin_socket_id = None;
+        retry.snapshot = None;
+        retry.candidate_cause = Some(cause);
         retry
     }
 }
@@ -220,20 +488,29 @@ pub fn continuation_candidate(
     enabled: bool,
 ) -> ContinuationCandidate {
     let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
-    continuation_candidate_inner(owner.as_ref(), body, enabled, "missing_session").into_candidate()
+    reserve_continuation_inner(owner.as_ref(), enabled, "missing_session")
+        .evaluate(body)
+        .into_candidate()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn continuation_candidate_for_owner(
     owner: Option<&ConversationIdentity>,
     body: &ResponsesRequest,
     enabled: bool,
 ) -> ContinuationReservation {
-    continuation_candidate_inner(owner, body, enabled, "missing_identity")
+    reserve_continuation_for_owner(owner, enabled).evaluate(body)
 }
 
-fn continuation_candidate_inner(
+pub(crate) fn reserve_continuation_for_owner(
     owner: Option<&ConversationIdentity>,
-    body: &ResponsesRequest,
+    enabled: bool,
+) -> ContinuationReservation {
+    reserve_continuation_inner(owner, enabled, "missing_identity")
+}
+
+fn reserve_continuation_inner(
+    owner: Option<&ConversationIdentity>,
     enabled: bool,
     missing_owner_reason: &str,
 ) -> ContinuationReservation {
@@ -243,7 +520,7 @@ fn continuation_candidate_inner(
                 turn_id: None,
                 previous_response_id: None,
                 input_delta: None,
-                input_delta_count: body.input.len(),
+                input_delta_count: 0,
                 disabled_reason: Some("disabled".to_string()),
             },
             owner.cloned(),
@@ -257,7 +534,7 @@ fn continuation_candidate_inner(
                 turn_id: None,
                 previous_response_id: None,
                 input_delta: None,
-                input_delta_count: body.input.len(),
+                input_delta_count: 0,
                 disabled_reason: Some(missing_owner_reason.to_string()),
             },
             None,
@@ -293,94 +570,103 @@ fn continuation_candidate_inner(
         (state, superseded_turn)
     };
 
-    continuation_candidate_from_state(owner, turn_id, body, state, superseded_turn, now)
+    let mut reservation = ContinuationReservation::new(
+        ContinuationCandidate {
+            turn_id: Some(turn_id),
+            previous_response_id: None,
+            input_delta: None,
+            input_delta_count: 0,
+            disabled_reason: None,
+        },
+        Some(owner.clone()),
+        None,
+    );
+    reservation.snapshot = Some(ReservationSnapshot {
+        state,
+        superseded_turn,
+        reserved_at: now,
+    });
+    reservation
 }
 
 fn continuation_candidate_from_state(
-    owner: &ConversationIdentity,
-    turn_id: u64,
+    reservation: &ContinuationReservation,
     body: &ResponsesRequest,
-    state: Option<ContinuationState>,
-    superseded_turn: bool,
-    now: u64,
+    snapshot: ReservationSnapshot,
+    require_prompt_signature: bool,
 ) -> ContinuationReservation {
-    let state = match state {
-        Some(state) if now.saturating_sub(state.updated_at) <= TTL_MS => state,
+    debug_assert!(reservation.owner().is_some());
+    let turn_id = reservation
+        .turn_id()
+        .expect("continuation snapshot must retain its generation");
+    let mut evaluated = reservation.clone();
+    evaluated.candidate = ContinuationCandidate {
+        turn_id: Some(turn_id),
+        previous_response_id: None,
+        input_delta: None,
+        input_delta_count: body.input.len(),
+        disabled_reason: None,
+    };
+    evaluated.origin_socket_id = None;
+    evaluated.route_key = None;
+    evaluated.cleanup_epoch = None;
+    evaluated.candidate_cause = None;
+    evaluated.append_only = None;
+
+    let state = match snapshot.state {
+        Some(state) if snapshot.reserved_at.saturating_sub(state.updated_at) <= TTL_MS => state,
         Some(_) | None => {
-            return ContinuationReservation::new(
-                ContinuationCandidate {
-                    turn_id: Some(turn_id),
-                    previous_response_id: None,
-                    input_delta: None,
-                    input_delta_count: body.input.len(),
-                    disabled_reason: Some(if superseded_turn {
-                        "superseded_turn".to_string()
-                    } else {
-                        "missing_state".to_string()
-                    }),
-                },
-                Some(owner.clone()),
-                None,
-            );
+            evaluated.candidate.disabled_reason = Some(if snapshot.superseded_turn {
+                "superseded_turn".to_string()
+            } else {
+                "missing_state".to_string()
+            });
+            return evaluated.with_candidate_cause(if snapshot.superseded_turn {
+                CodexRecoveryCause::SupersededTurn
+            } else {
+                CodexRecoveryCause::MissingState
+            });
         }
     };
 
     let previous_route_key = state.route_key;
     let signature = prompt_signature(body);
-    if signature != state.prompt_signature {
-        return ContinuationReservation::new(
-            ContinuationCandidate {
-                turn_id: Some(turn_id),
-                previous_response_id: None,
-                input_delta: None,
-                input_delta_count: body.input.len(),
-                disabled_reason: Some("prompt_changed".to_string()),
-            },
-            Some(owner.clone()),
-            None,
-        );
+    if require_prompt_signature && signature != state.prompt_signature {
+        evaluated.candidate.disabled_reason = Some("prompt_changed".to_string());
+        return evaluated.with_candidate_cause(CodexRecoveryCause::PromptChanged);
     }
 
-    let Some(suffix) = input_suffix_after_prefix(&body.input, &state.transcript) else {
-        return ContinuationReservation::new(
-            ContinuationCandidate {
-                turn_id: Some(turn_id),
-                previous_response_id: None,
-                input_delta: None,
-                input_delta_count: body.input.len(),
-                disabled_reason: Some("not_append_only".to_string()),
-            },
-            Some(owner.clone()),
-            None,
-        );
+    let (suffix, append_only) = match input_suffix_after_prefix(&body.input, &state.transcript) {
+        InputPrefixComparison::Appended {
+            suffix,
+            diagnostics,
+        } => (suffix, diagnostics),
+        InputPrefixComparison::NoDelta { diagnostics } => {
+            evaluated.candidate.input_delta_count = 0;
+            evaluated.candidate.disabled_reason = Some("empty_delta".to_string());
+            return evaluated
+                .with_candidate_cause(CodexRecoveryCause::EmptyDelta)
+                .with_append_only(diagnostics);
+        }
+        InputPrefixComparison::RetainedLonger { diagnostics }
+        | InputPrefixComparison::FirstMismatch { diagnostics } => {
+            evaluated.candidate.disabled_reason = Some("not_append_only".to_string());
+            return evaluated
+                .with_candidate_cause(CodexRecoveryCause::NotAppendOnly)
+                .with_append_only(diagnostics);
+        }
     };
 
-    if suffix.is_empty() {
-        return ContinuationReservation::new(
-            ContinuationCandidate {
-                turn_id: Some(turn_id),
-                previous_response_id: None,
-                input_delta: None,
-                input_delta_count: 0,
-                disabled_reason: Some("empty_delta".to_string()),
-            },
-            Some(owner.clone()),
-            None,
-        );
+    evaluated.candidate.previous_response_id = Some(state.response_id);
+    evaluated.candidate.input_delta_count = suffix.len();
+    evaluated.candidate.input_delta = Some(suffix);
+    evaluated.origin_socket_id = Some(state.socket_id);
+    if let Some(metrics) = evaluated.previous_id_metrics.as_ref() {
+        metrics.set_had_candidate(true);
     }
-
-    ContinuationReservation::new(
-        ContinuationCandidate {
-            turn_id: Some(turn_id),
-            previous_response_id: Some(state.response_id),
-            input_delta_count: suffix.len(),
-            input_delta: Some(suffix),
-            disabled_reason: None,
-        },
-        Some(owner.clone()),
-        Some(state.socket_id),
-    )
-    .with_previous_route_key(previous_route_key)
+    evaluated
+        .with_previous_route_key(previous_route_key)
+        .with_append_only(append_only)
 }
 
 #[deprecated(note = "recording without typed socket provenance is not reusable")]
@@ -406,16 +692,22 @@ pub fn record_continuation(
     record_continuation_for_owner(&reservation, request_body, response_id, None, output_items);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContinuationPublication {
+    Published,
+    Rejected,
+}
+
 pub(crate) fn record_continuation_for_owner(
     reservation: &ContinuationReservation,
     request_body: &ResponsesRequest,
     response_id: Option<&str>,
     socket_id: Option<u64>,
     output_items: &[ResponsesInputItem],
-) {
-    let (owner, turn_id) = match (reservation.owner(), reservation.turn_id()) {
-        (Some(owner), Some(turn_id)) => (owner, turn_id),
-        _ => return,
+) -> ContinuationPublication {
+    let owner = match (reservation.owner(), reservation.turn_id()) {
+        (Some(owner), Some(_)) => owner,
+        _ => return ContinuationPublication::Rejected,
     };
 
     let (response_id, socket_id) = match (response_id, socket_id) {
@@ -423,8 +715,8 @@ pub(crate) fn record_continuation_for_owner(
             (response_id.to_string(), socket_id)
         }
         _ => {
-            abort_continuation_inner(Some(owner), Some(turn_id));
-            return;
+            abort_continuation_for_owner(reservation);
+            return ContinuationPublication::Rejected;
         }
     };
     let mut transcript: Vec<ResponsesInputItem> = request_body.input.clone();
@@ -442,8 +734,8 @@ pub(crate) fn record_continuation_for_owner(
     );
 
     if retained_bytes > MAX_OWNER_RETAINED_BYTES {
-        abort_continuation_inner(Some(owner), Some(turn_id));
-        return;
+        abort_continuation_for_owner(reservation);
+        return ContinuationPublication::Rejected;
     }
 
     let state = ContinuationState {
@@ -458,13 +750,15 @@ pub(crate) fn record_continuation_for_owner(
 
     let mut guard = REGISTRY.lock().unwrap();
     let Some(registry) = guard.as_mut() else {
-        return;
+        return ContinuationPublication::Rejected;
     };
     let Some(owner_state) = registry.owners.get_mut(owner) else {
-        return;
+        return ContinuationPublication::Rejected;
     };
-    if !reservation_matches_owner_state(reservation, owner_state) {
-        return;
+    if !reservation_matches_owner_state(reservation, owner_state)
+        || !reservation.claim_publication()
+    {
+        return ContinuationPublication::Rejected;
     }
     let previous_size = owner_retained_size(owner, owner_state);
     owner_state.continuation = Some(state);
@@ -474,6 +768,7 @@ pub(crate) fn record_continuation_for_owner(
         .saturating_sub(previous_size)
         .saturating_add(next_size);
     evict_oldest(registry);
+    ContinuationPublication::Published
 }
 
 #[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
@@ -494,6 +789,7 @@ pub(crate) fn abort_continuation_for_owner(reservation: &ContinuationReservation
         .owners
         .get(owner)
         .is_some_and(|state| reservation_matches_owner_state(reservation, state))
+        && reservation.cancel()
     {
         remove_owner(registry, owner);
     }
@@ -711,21 +1007,78 @@ fn remove_owner(registry: &mut ContinuationRegistry, owner: &ConversationIdentit
     }
 }
 
+enum InputPrefixComparison {
+    Appended {
+        suffix: Vec<ResponsesInputItem>,
+        diagnostics: CodexAppendOnlyDiagnostics,
+    },
+    NoDelta {
+        diagnostics: CodexAppendOnlyDiagnostics,
+    },
+    RetainedLonger {
+        diagnostics: CodexAppendOnlyDiagnostics,
+    },
+    FirstMismatch {
+        diagnostics: CodexAppendOnlyDiagnostics,
+    },
+}
+
+fn bounded_item_count(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
 fn input_suffix_after_prefix(
     input: &[ResponsesInputItem],
     prefix: &[ResponsesInputItem],
-) -> Option<Vec<ResponsesInputItem>> {
+) -> InputPrefixComparison {
+    let incoming_items = bounded_item_count(input.len());
+    let retained_items = bounded_item_count(prefix.len());
     if prefix.len() > input.len() {
-        return None;
+        return InputPrefixComparison::RetainedLonger {
+            diagnostics: CodexAppendOnlyDiagnostics {
+                outcome: CodexAppendOnlyOutcome::RetainedLonger,
+                incoming_items,
+                retained_items,
+                delta_items: 0,
+                first_mismatch_index: None,
+            },
+        };
     }
     for i in 0..prefix.len() {
         let a = serde_json::to_value(&input[i]).unwrap_or_default();
         let b = serde_json::to_value(&prefix[i]).unwrap_or_default();
         if a != b {
-            return None;
+            return InputPrefixComparison::FirstMismatch {
+                diagnostics: CodexAppendOnlyDiagnostics {
+                    outcome: CodexAppendOnlyOutcome::FirstMismatch,
+                    incoming_items,
+                    retained_items,
+                    delta_items: bounded_item_count(input.len().saturating_sub(prefix.len())),
+                    first_mismatch_index: Some(bounded_item_count(i)),
+                },
+            };
         }
     }
-    Some(input[prefix.len()..].to_vec())
+    let suffix = input[prefix.len()..].to_vec();
+    let diagnostics = CodexAppendOnlyDiagnostics {
+        outcome: if suffix.is_empty() {
+            CodexAppendOnlyOutcome::NoDelta
+        } else {
+            CodexAppendOnlyOutcome::Appended
+        },
+        incoming_items,
+        retained_items,
+        delta_items: bounded_item_count(suffix.len()),
+        first_mismatch_index: None,
+    };
+    if suffix.is_empty() {
+        InputPrefixComparison::NoDelta { diagnostics }
+    } else {
+        InputPrefixComparison::Appended {
+            suffix,
+            diagnostics,
+        }
+    }
 }
 
 fn prompt_signature(body: &ResponsesRequest) -> String {
@@ -797,6 +1150,7 @@ fn evict_oldest(registry: &mut ContinuationRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::{EndpointKind, MonitorHandle};
     use crate::request_identity::{LaneDomain, RequestPurpose, RequestScope};
     use serde_json::json;
 
@@ -917,6 +1271,172 @@ mod tests {
         assert_eq!(
             legacy_missing.disabled_reason.as_deref(),
             Some("missing_session")
+        );
+    }
+
+    #[test]
+    fn append_only_comparison_preserves_shape_without_content() {
+        let prefix = vec![input("one"), input("two")];
+        let appended = vec![input("one"), input("two"), input("three")];
+        match input_suffix_after_prefix(&appended, &prefix) {
+            InputPrefixComparison::Appended {
+                suffix,
+                diagnostics,
+            } => {
+                assert_eq!(suffix.len(), 1);
+                assert_eq!(
+                    serde_json::to_value(&suffix[0]).unwrap(),
+                    serde_json::to_value(input("three")).unwrap()
+                );
+                assert_eq!(diagnostics.outcome, CodexAppendOnlyOutcome::Appended);
+                assert_eq!(diagnostics.incoming_items, 3);
+                assert_eq!(diagnostics.retained_items, 2);
+                assert_eq!(diagnostics.delta_items, 1);
+                assert_eq!(diagnostics.first_mismatch_index, None);
+            }
+            _ => panic!("append-only extension should produce a suffix"),
+        }
+
+        match input_suffix_after_prefix(&prefix, &prefix) {
+            InputPrefixComparison::NoDelta { diagnostics } => {
+                assert_eq!(diagnostics.outcome, CodexAppendOnlyOutcome::NoDelta);
+                assert_eq!(diagnostics.delta_items, 0);
+            }
+            _ => panic!("equal histories should report no delta"),
+        }
+
+        match input_suffix_after_prefix(&prefix[..1], &prefix) {
+            InputPrefixComparison::RetainedLonger { diagnostics } => {
+                assert_eq!(diagnostics.outcome, CodexAppendOnlyOutcome::RetainedLonger);
+                assert_eq!(diagnostics.incoming_items, 1);
+                assert_eq!(diagnostics.retained_items, 2);
+                assert_eq!(diagnostics.first_mismatch_index, None);
+            }
+            _ => panic!("shorter incoming history should report retained longer"),
+        }
+
+        let mismatch = vec![input("one"), input("changed"), input("three")];
+        match input_suffix_after_prefix(&mismatch, &prefix) {
+            InputPrefixComparison::FirstMismatch { diagnostics } => {
+                assert_eq!(diagnostics.outcome, CodexAppendOnlyOutcome::FirstMismatch);
+                assert_eq!(diagnostics.first_mismatch_index, Some(1));
+                assert_eq!(diagnostics.delta_items, 1);
+            }
+            _ => panic!("rewritten history should report its first mismatch"),
+        }
+    }
+
+    #[test]
+    fn previous_id_metrics_settle_once_across_full_context_retries() {
+        let monitor = MonitorHandle::new(10);
+        let owner = agent_owner("metrics-session", "metrics-agent");
+        let reservation = |turn_id, previous_response_id: Option<&str>| {
+            ContinuationReservation::new(
+                ContinuationCandidate {
+                    turn_id,
+                    previous_response_id: previous_response_id.map(str::to_string),
+                    input_delta: previous_response_id.map(|_| Vec::new()),
+                    input_delta_count: 0,
+                    disabled_reason: None,
+                },
+                Some(owner.clone()),
+                Some(11),
+            )
+            .with_previous_id_metrics(Some(monitor.clone()), "req-metrics")
+        };
+
+        let no_candidate = reservation(Some(1), None);
+        no_candidate.settle_previous_id_completed();
+        no_candidate.settle_previous_id_completed();
+
+        let hit = reservation(Some(2), Some("resp_hit"));
+        let hit_retry = hit.full_context_retry(CodexRecoveryCause::ResponseStartTimeout);
+        hit.settle_previous_id_completed();
+        hit.settle_previous_id_completed();
+        hit_retry.settle_previous_id_completed();
+
+        let fallback = reservation(Some(3), Some("resp_fallback"));
+        let fallback_retry =
+            fallback.full_context_retry(CodexRecoveryCause::PreviousResponseMissing);
+        fallback_retry.settle_previous_id_completed();
+        fallback.settle_previous_id_completed();
+
+        let ineligible = reservation(None, Some("resp_ineligible"));
+        ineligible.settle_previous_id_completed();
+
+        let metrics = monitor.snapshot().codex;
+        assert_eq!(metrics.previous_id_no_candidates, 1);
+        assert_eq!(metrics.previous_id_hits, 1);
+        assert_eq!(metrics.previous_id_fallbacks, 1);
+    }
+
+    #[test]
+    fn recovery_metrics_preserve_first_previous_cause_and_union_socket_causes() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("req-causes", None, None, EndpointKind::Messages);
+        let reservation = ContinuationReservation::new(
+            ContinuationCandidate {
+                turn_id: Some(1),
+                previous_response_id: Some("resp_1".to_string()),
+                input_delta: Some(Vec::new()),
+                input_delta_count: 0,
+                disabled_reason: None,
+            },
+            Some(main_owner("metrics-causes")),
+            Some(11),
+        )
+        .with_previous_id_metrics(Some(monitor.clone()), "req-causes");
+
+        let _ = reservation.full_context_retry(CodexRecoveryCause::PreviousResponseMissing);
+        let _ = reservation.full_context_retry(CodexRecoveryCause::AuthRejection);
+        reservation.record_socket_cause(CodexRecoveryCause::TransportFailure);
+        reservation.record_socket_cause(CodexRecoveryCause::OriginSocketMissing);
+        reservation.record_socket_cause(CodexRecoveryCause::TransportFailure);
+
+        let recovery = monitor.snapshot().active[0]
+            .codex_diagnostics()
+            .unwrap()
+            .recovery;
+        assert_eq!(
+            recovery.previous_id_cause,
+            Some(CodexRecoveryCause::PreviousResponseMissing)
+        );
+        assert_eq!(
+            recovery.socket_causes.iter().collect::<Vec<_>>(),
+            vec![
+                CodexRecoveryCause::OriginSocketMissing,
+                CodexRecoveryCause::TransportFailure,
+            ]
+        );
+
+        monitor.request_started("req-initial-cause", None, None, EndpointKind::Messages);
+        let initial = ContinuationReservation::new(
+            ContinuationCandidate {
+                turn_id: Some(2),
+                previous_response_id: None,
+                input_delta: None,
+                input_delta_count: 0,
+                disabled_reason: Some("missing_state".to_string()),
+            },
+            Some(main_owner("metrics-initial-cause")),
+            None,
+        )
+        .with_candidate_cause(CodexRecoveryCause::MissingState)
+        .with_previous_id_metrics(Some(monitor.clone()), "req-initial-cause");
+        let _ = initial.full_context_retry(CodexRecoveryCause::AuthRejection);
+
+        assert_eq!(
+            monitor
+                .snapshot()
+                .active
+                .iter()
+                .find(|request| request.request_id == "req-initial-cause")
+                .unwrap()
+                .codex_diagnostics()
+                .unwrap()
+                .recovery
+                .previous_id_cause,
+            Some(CodexRecoveryCause::MissingState)
         );
     }
 
@@ -1139,7 +1659,8 @@ mod tests {
         );
         assert_eq!(reservation.candidate().input_delta_count, 1);
 
-        let full_context = reservation.full_context_retry();
+        let full_context =
+            reservation.full_context_retry(CodexRecoveryCause::PreviousResponseMissing);
         assert_eq!(full_context.owner(), Some(&owner));
         assert_eq!(full_context.turn_id(), reservation.turn_id());
         assert_eq!(full_context.candidate().previous_response_id, None);
@@ -1239,6 +1760,140 @@ mod tests {
         assert!(is_current_turn_for_owner(&current));
     }
 
+    #[tokio::test]
+    async fn reservation_fences_owner_before_deferred_canonical_evaluation() {
+        let _registry_guard = lock_continuation_registry_for_async_tests().await;
+        clear_all_continuations_for_tests();
+        let owner = main_owner("deferred-evaluation");
+        let first_request = request_with_input(vec![input("one")], None);
+        start_and_record(&owner, &first_request, "resp_1");
+
+        let reserved = reserve_continuation_for_owner(Some(&owner), true);
+        assert!(reserved.candidate().previous_response_id.is_none());
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let evaluator = tokio::spawn(async move {
+            let canonical = request_rx.await.unwrap();
+            reserved.evaluate(&canonical)
+        });
+
+        let newer = reserve_continuation_for_owner(Some(&owner), true);
+        let canonical = request_with_input(vec![input("one"), input("two")], None);
+        request_tx.send(canonical).unwrap();
+        let stale = evaluator.await.unwrap();
+
+        assert_eq!(
+            stale.candidate().previous_response_id.as_deref(),
+            Some("resp_1")
+        );
+        assert_eq!(stale.candidate().input_delta_count, 1);
+        assert!(!is_current_turn_for_owner(&stale));
+        assert!(is_current_turn_for_owner(&newer));
+    }
+
+    #[test]
+    fn detached_summary_has_no_owner_provenance_or_owner_side_effects() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("detached-summary");
+        let request = request_with_input(vec![input("one")], None);
+        start_and_record(&owner, &request, "resp_1");
+
+        let detached =
+            ContinuationReservation::detached(request.input.len(), "claude_plaintext_summary")
+                .bind_route(&route(&owner, "token-a"));
+        assert_eq!(detached.owner(), None);
+        assert_eq!(detached.turn_id(), None);
+        assert_eq!(detached.route_key(), None);
+        assert_eq!(detached.origin_socket_id(), None);
+        assert_eq!(
+            record_continuation_for_owner(&detached, &request, Some("resp_summary"), Some(99), &[],),
+            ContinuationPublication::Rejected
+        );
+        abort_continuation_for_owner(&detached);
+        assert!(has_continuation_for_owner_for_tests(&owner));
+    }
+
+    #[test]
+    fn turn_publication_is_one_shot_and_late_abort_cannot_clear_it() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("one-shot-publication");
+        let request = request_with_input(vec![input("one")], None);
+        let reservation = continuation_candidate_for_owner(Some(&owner), &request, true);
+
+        assert_eq!(
+            record_continuation_for_owner(&reservation, &request, Some("resp_first"), Some(1), &[],),
+            ContinuationPublication::Published
+        );
+        assert_eq!(
+            record_continuation_for_owner(&reservation, &request, Some("resp_late"), Some(2), &[],),
+            ContinuationPublication::Rejected
+        );
+        abort_continuation_for_owner(&reservation);
+        assert!(has_continuation_for_owner_for_tests(&owner));
+        assert_eq!(
+            reservation.turn_outcome.as_ref().unwrap().state(),
+            TURN_PUBLISHED
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_winning_rejects_late_publication_and_pool_reinsertion() {
+        let _registry_guard = lock_continuation_registry_for_async_tests().await;
+        clear_all_continuations_for_tests();
+        let owner = main_owner("cancel-wins");
+        let request = request_with_input(vec![input("one")], None);
+        let reservation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let late = reservation.clone();
+        let late_request = request.clone();
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let cancellation_done = cancelled.clone();
+        let publisher = tokio::spawn(async move {
+            cancelled.notified().await;
+            record_continuation_for_owner(&late, &late_request, Some("resp_late"), Some(1), &[])
+        });
+
+        abort_continuation_for_owner(&reservation);
+        cancellation_done.notify_one();
+        assert_eq!(publisher.await.unwrap(), ContinuationPublication::Rejected);
+        assert!(
+            if_current_turn_for_owner(&reservation, || ()).is_none(),
+            "a cancelled turn must not reinsert its socket"
+        );
+        assert_eq!(
+            reservation.turn_outcome.as_ref().unwrap().state(),
+            TURN_CANCELLED
+        );
+        assert!(!has_continuation_owner_state_for_tests(&owner));
+    }
+
+    #[test]
+    fn pool_reinsertion_check_does_not_beat_cancellation() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("pool-before-cancel");
+        let request = request_with_input(vec![input("one")], None);
+        let reservation = continuation_candidate_for_owner(Some(&owner), &request, true);
+
+        assert!(
+            if_current_turn_for_owner(&reservation, || ()).is_some(),
+            "the physical completion may reinsert while the turn is current"
+        );
+        abort_continuation_for_owner(&reservation);
+        assert_eq!(
+            record_continuation_for_owner(
+                &reservation,
+                &request,
+                Some("resp_completed"),
+                Some(41),
+                &[],
+            ),
+            ContinuationPublication::Rejected
+        );
+        assert!(!has_continuation_owner_state_for_tests(&owner));
+        assert_eq!(
+            reservation.turn_outcome.as_ref().unwrap().state(),
+            TURN_CANCELLED
+        );
+    }
+
     #[test]
     fn lane_switch_changes_continuation_prompt_signature() {
         let input = vec![ResponsesInputItem::Message {
@@ -1270,8 +1925,17 @@ mod tests {
         };
 
         let owner = main_owner("session-a");
-        let candidate =
-            continuation_candidate_from_state(&owner, 1, &full, Some(state), false, now_ms());
+        let reservation = ContinuationReservation::for_owner_turn(Some(&owner), Some(1));
+        let candidate = continuation_candidate_from_state(
+            &reservation,
+            &full,
+            ReservationSnapshot {
+                state: Some(state),
+                superseded_turn: false,
+                reserved_at: now_ms(),
+            },
+            true,
+        );
 
         let candidate = candidate.candidate();
         assert_eq!(candidate.disabled_reason.as_deref(), Some("prompt_changed"));

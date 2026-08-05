@@ -108,7 +108,7 @@ fn main() -> Result<()> {
                         .block_on(server::serve(ServerConfig {
                             bind_address,
                             port: effective_port,
-                            monitor: None,
+                            monitor: Some(MonitorHandle::default()),
                         }))
                         .map_err(|err| anyhow::anyhow!(err))
                 }

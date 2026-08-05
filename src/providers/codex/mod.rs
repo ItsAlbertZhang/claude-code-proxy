@@ -1,3 +1,4 @@
+pub(crate) mod admission;
 pub mod auth;
 pub mod chat_completions;
 pub mod client;
@@ -30,7 +31,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
-use crate::monitor::usage_from_anthropic_sse;
+use crate::monitor::{CodexRecoveryCause, usage_from_anthropic_sse};
 use crate::provider::{
     CliHandlers, Provider, RequestContext, ScopedRequestContext, compatible_explicit_identity,
     legacy_scope,
@@ -49,11 +50,14 @@ use self::client::{AuthRejectionBudget, BufferedRetryState, CodexHttpClient};
 use self::compaction::{
     CompactionLease, CompactionStartPermit, abort_compaction_for_route,
     activate_compaction_for_route, apply_compaction_replay_for_route, begin_compaction_for_route,
-    request_compaction_bound, reserve_compaction_start, store_compaction_for_route,
+    prepare_compaction_request, request_compaction_bound_result, reserve_compaction_start,
+    store_compaction_for_route,
 };
+#[cfg(test)]
+use self::continuation::continuation_candidate_for_owner;
 use self::continuation::{
-    ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
-    record_continuation_for_owner,
+    ContinuationPublication, ContinuationReservation, abort_continuation_for_owner,
+    record_continuation_for_owner, reserve_continuation_for_owner,
 };
 use self::count_tokens::count_translated_tokens;
 use self::state::{CodexBoundRoute, ProtocolLane};
@@ -171,6 +175,7 @@ impl CodexProvider {
         if search::is_standalone_search_request(&body) {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.model_resolved(&ctx.req_id, &resolved.model);
+                monitor.codex_request_lane(&ctx.req_id, false);
             }
             // Generate the stateless ID once. Stateful requests replace it with the
             // current route's opaque conversation key on every route attempt.
@@ -288,6 +293,7 @@ impl CodexProvider {
             apply_model_lane_for_request(&mut resolved.model, &body, full_lane);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
+            monitor.codex_request_lane(&ctx.req_id, use_responses_lite);
         }
 
         let original_translated = match translate_request_scoped(
@@ -318,23 +324,33 @@ impl CodexProvider {
             compaction::clear_compactions_for_lane(lane);
         }
 
-        // Reserve logical generations synchronously before route/auth resolution can await.
+        let client = self.client.clone();
+        // Only conversational Messages requests that may use a Responses
+        // WebSocket participate in owner admission. Validation, translation,
+        // and the standalone-search fast path have already completed.
+        let mut conversation_admission = match client.configured_transport() {
+            config::CodexTransport::WebSocket | config::CodexTransport::Auto => {
+                admission::admit_messages(&scope).await
+            }
+            config::CodexTransport::Http => None,
+        };
+
+        // Reserve the owner generation before route/auth awaits. Canonical
+        // append-only evaluation is deferred until route binding and any
+        // portable-summary replay have produced the actual upstream request.
         let previous_response_id_enabled = config::codex_previous_response_id();
-        let logical_continuation = continuation_candidate_for_owner(
+        let owner_continuation = reserve_continuation_for_owner(
             conversation_identity.as_ref(),
-            &original_translated,
             previous_response_id_enabled,
-        );
+        )
+        .with_previous_id_metrics(ctx.monitor.clone(), &ctx.req_id);
         let compaction_start_permit = (server_compaction_enabled && compact_boundary)
             .then(|| reserve_compaction_start(codex_lane))
             .flatten();
-        let mut cleanup = LiveRequestStateCleanup::new(
-            logical_continuation.clone(),
-            None,
-            compaction_start_permit,
-        );
+        let mut logical_continuation = owner_continuation.clone();
+        let mut cleanup =
+            LiveRequestStateCleanup::new(owner_continuation.clone(), None, compaction_start_permit);
 
-        let client = self.client.clone();
         let mut route = match client
             .bind_conversation_route(
                 codex_lane,
@@ -355,109 +371,164 @@ impl CodexProvider {
         let mut empty_completion_attempt = 0_u32;
         let mut upstream_started = false;
 
-        'routes: loop {
-            let mut translated = bind_messages_request_to_route(&original_translated, &route);
-            let mut request_continuation = if route_rebuilt {
-                logical_continuation.full_context_retry().bind_route(&route)
-            } else {
-                logical_continuation.bind_route(&route)
-            };
-            cleanup.replace_continuation(request_continuation.clone());
-
-            if let Some(permit) = cleanup.compaction_start_permit() {
+        // A compact boundary first runs one hidden, ownerful CompactionTrigger
+        // turn. The caller-visible Claude plaintext summary is detached work
+        // performed only after that hidden terminal has been published.
+        let hidden_compaction_permit = cleanup.take_compaction_start_permit();
+        if compact_boundary && let Some(permit) = hidden_compaction_permit.as_ref() {
+            'hidden_routes: loop {
+                let translated = bind_messages_request_to_route(&original_translated, &route);
+                let prepared = prepare_compaction_request(&translated);
+                let mut hidden_continuation = owner_continuation
+                    .evaluate_hidden_compaction(prepared.request())
+                    .bind_route(&route);
+                if route_rebuilt {
+                    hidden_continuation =
+                        hidden_continuation.full_context_retry(CodexRecoveryCause::AuthRejection);
+                }
+                cleanup.replace_continuation(hidden_continuation.clone());
                 log_compaction_event(
                     "server_compaction_triggered",
                     &ctx,
-                    translated.input.len(),
+                    prepared.request().input.len(),
                     None,
                 );
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     monitor.compaction_started(&ctx.req_id);
                 }
-                if let Some(build_lease) =
+                let Some(build_lease) =
                     begin_compaction_for_route(permit, &route, &translated.model)
+                else {
+                    abort_continuation_for_owner(&hidden_continuation);
+                    log_compaction_event(
+                        "server_compaction_failed",
+                        &ctx,
+                        prepared.request().input.len(),
+                        Some("compaction route lease could not be acquired"),
+                    );
+                    break 'hidden_routes;
+                };
+                cleanup.replace_compaction_lease(Some(build_lease.clone()));
+                let mut compaction_ctx = ctx.clone();
+                compaction_ctx.monitor = None;
+                match request_compaction_bound_result(
+                    client.as_ref(),
+                    &route,
+                    prepared,
+                    &compaction_ctx,
+                    &hidden_continuation,
+                    &mut buffered_retry_state,
+                )
+                .await
                 {
-                    cleanup.replace_compaction_lease(Some(build_lease.clone()));
-                    let mut compaction_ctx = ctx.clone();
-                    compaction_ctx.monitor = None;
-                    match request_compaction_bound(
-                        client.as_ref(),
-                        &route,
-                        &translated,
-                        &compaction_ctx,
-                        &mut buffered_retry_state,
-                    )
-                    .await
-                    {
-                        Ok(native_history) => {
-                            if store_compaction_for_route(&build_lease, native_history) {
-                                log_compaction_event(
-                                    "server_compaction_completed",
-                                    &ctx,
-                                    translated.input.len(),
-                                    None,
-                                );
-                            } else {
-                                cleanup.abort_compaction();
-                                log_compaction_event(
-                                    "server_compaction_failed",
-                                    &ctx,
-                                    translated.input.len(),
-                                    Some("compaction state exceeded the in-memory limit"),
+                    Ok(bound) => {
+                        if let Some(publication) = bound.continuation_publication() {
+                            if record_continuation_for_owner(
+                                &hidden_continuation,
+                                publication.request,
+                                Some(publication.response_id),
+                                Some(publication.socket_id),
+                                publication.output_items,
+                            ) == ContinuationPublication::Rejected
+                            {
+                                websocket::invalidate_codex_websocket_pool_for_reservation(
+                                    &hidden_continuation,
                                 );
                             }
+                        } else {
+                            // HTTP can install compacted history, but cannot
+                            // fabricate a socket-bound continuation baseline.
+                            abort_continuation_for_owner(&hidden_continuation);
                         }
-                        Err(error) => {
+                        if store_compaction_for_route(&build_lease, bound.compacted_history()) {
+                            log_compaction_event(
+                                "server_compaction_completed",
+                                &ctx,
+                                translated.input.len(),
+                                None,
+                            );
+                        } else {
                             cleanup.abort_compaction();
                             log_compaction_event(
                                 "server_compaction_failed",
                                 &ctx,
                                 translated.input.len(),
-                                Some(&error.to_string()),
+                                Some("compaction state exceeded the in-memory limit"),
                             );
-                            if let compaction::CompactionError::Upstream(upstream) = error {
-                                if upstream.is_in_band_auth_rejection() {
-                                    client.refresh_conversation_auth_after_rejection_in_background(
-                                        &route,
-                                        auth_rejection_budget.clone(),
-                                    );
+                        }
+                        break 'hidden_routes;
+                    }
+                    Err(error) => {
+                        cleanup.abort_compaction();
+                        log_compaction_event(
+                            "server_compaction_failed",
+                            &ctx,
+                            translated.input.len(),
+                            Some(&error.to_string()),
+                        );
+                        if let compaction::CompactionError::Upstream(upstream) = error {
+                            if upstream.is_in_band_auth_rejection() {
+                                client.refresh_conversation_auth_after_rejection_in_background(
+                                    &route,
+                                    auth_rejection_budget.clone(),
+                                );
+                                cleanup.abort();
+                                return map_codex_error_to_response(&upstream);
+                            }
+                            if upstream.is_replayable_auth_rejection() {
+                                let Some(next_route) = rebuild_route_after_unauthorized(
+                                    client.as_ref(),
+                                    &route,
+                                    auth_rejection_budget.as_ref(),
+                                )
+                                .await
+                                else {
                                     cleanup.abort();
                                     return map_codex_error_to_response(&upstream);
-                                }
-                                if upstream.is_replayable_auth_rejection() {
-                                    let Some(next_route) = rebuild_route_after_unauthorized(
-                                        client.as_ref(),
-                                        &route,
-                                        auth_rejection_budget.as_ref(),
-                                    )
-                                    .await
-                                    else {
-                                        cleanup.abort();
-                                        return map_codex_error_to_response(&upstream);
-                                    };
-                                    route = next_route;
-                                    route_rebuilt = true;
-                                    continue 'routes;
-                                }
+                                };
+                                route = next_route;
+                                route_rebuilt = true;
+                                continue 'hidden_routes;
                             }
                         }
+                        abort_continuation_for_owner(&hidden_continuation);
+                        break 'hidden_routes;
                     }
                 }
-            } else if server_compaction_enabled && !compact_boundary {
+            }
+
+            logical_continuation = ContinuationReservation::detached(
+                original_translated.input.len(),
+                "claude_plaintext_summary",
+            );
+            cleanup.replace_continuation(logical_continuation.clone());
+            route = route.auxiliary();
+            route_rebuilt = false;
+        }
+
+        'routes: loop {
+            let mut translated = bind_messages_request_to_route(&original_translated, &route);
+
+            if server_compaction_enabled && !compact_boundary {
                 if let Some(replay) = apply_compaction_replay_for_route(&route, &translated) {
                     translated = replay.request;
                     cleanup.replace_compaction_lease(Some(replay.lease));
-                    request_continuation = request_continuation.full_context_retry();
-                    cleanup.replace_continuation(request_continuation.clone());
                 } else if let Some(replay) = compaction::apply_compaction_replay(
                     legacy_compaction_session.as_deref(),
                     &translated,
                 ) {
                     translated = replay;
-                    request_continuation = request_continuation.full_context_retry();
-                    cleanup.replace_continuation(request_continuation.clone());
                 }
             }
+
+            let mut request_continuation = logical_continuation
+                .evaluate(&translated)
+                .bind_route(&route);
+            if route_rebuilt {
+                request_continuation =
+                    request_continuation.full_context_retry(CodexRecoveryCause::AuthRejection);
+            }
+            cleanup.replace_continuation(request_continuation.clone());
 
             if !upstream_started {
                 if let Some(monitor) = ctx.monitor.as_ref() {
@@ -478,6 +549,7 @@ impl CodexProvider {
                     read_lane,
                     auth_rejection_budget.clone(),
                     &mut live_start_attempt,
+                    &mut conversation_admission,
                 )
                 .await
                 {
@@ -487,6 +559,10 @@ impl CodexProvider {
                     }
                     LiveRouteOutcome::Unauthorized(error) => {
                         cleanup.abort_compaction();
+                        if compact_boundary {
+                            cleanup.disarm();
+                            return map_codex_error_to_response(&error);
+                        }
                         let Some(next_route) = rebuild_route_after_unauthorized(
                             client.as_ref(),
                             &route,
@@ -528,9 +604,16 @@ impl CodexProvider {
                         }
                         if error.is_replayable_auth_rejection() {
                             cleanup.abort_compaction();
-                            websocket::invalidate_codex_websocket_pool_for_reservation(
+                            if compact_boundary {
+                                cleanup.disarm();
+                                return map_codex_error_to_response(&error);
+                            }
+                            if websocket::invalidate_codex_websocket_pool_for_reservation(
                                 &request_continuation,
-                            );
+                            ) {
+                                request_continuation
+                                    .record_socket_cause(CodexRecoveryCause::AuthRejection);
+                            }
                             let Some(next_route) = rebuild_route_after_unauthorized(
                                 client.as_ref(),
                                 &route,
@@ -555,7 +638,10 @@ impl CodexProvider {
                 // A successful terminal event with no output would translate into
                 // an empty end_turn; retry with full context instead.
                 let error = empty_buffered_completion_error();
-                drop_live_continuation_for_retry(&mut active_continuation);
+                drop_live_continuation_for_retry(
+                    &mut active_continuation,
+                    CodexRecoveryCause::EmptyCompletion,
+                );
                 if empty_completion_attempt >= MAX_EMPTY_COMPLETION_RETRIES {
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
@@ -712,6 +798,7 @@ impl Provider for CodexProvider {
             apply_model_lane_for_request(&mut resolved.model, &body, full_lane);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
+            monitor.codex_request_lane(&ctx.req_id, use_responses_lite);
         }
 
         let translated = match translate_request_scoped(
@@ -843,8 +930,8 @@ impl LiveRequestStateCleanup {
         self.continuation = continuation;
     }
 
-    fn compaction_start_permit(&self) -> Option<&CompactionStartPermit> {
-        self.compaction_start_permit.as_ref()
+    fn take_compaction_start_permit(&mut self) -> Option<CompactionStartPermit> {
+        self.compaction_start_permit.take()
     }
 
     fn compaction_lease(&self) -> Option<&CompactionLease> {
@@ -915,6 +1002,7 @@ async fn live_stream_response(
         compaction_start_permit,
     );
     let mut attempt = 0;
+    let mut conversation_admission = None;
     let outcome = live_stream_route_attempt(
         client,
         &route,
@@ -927,6 +1015,7 @@ async fn live_stream_response(
         read_lane,
         Arc::new(AuthRejectionBudget::default()),
         &mut attempt,
+        &mut conversation_admission,
     )
     .await;
     match outcome {
@@ -954,6 +1043,7 @@ async fn live_stream_route_attempt(
     read_lane: Option<OpaqueLane>,
     auth_rejection_budget: Arc<AuthRejectionBudget>,
     attempt: &mut u32,
+    conversation_admission: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> LiveRouteOutcome {
     let model = model.to_string();
     let mut continuation = Some(request_continuation.clone());
@@ -998,7 +1088,9 @@ async fn live_stream_route_attempt(
                 return LiveRouteOutcome::Unauthorized(error);
             }
             Err(error) if retryable_live_start_codex_error(&error) => {
-                let dropped = drop_live_continuation_for_retry(&mut continuation);
+                let cause = client::continuation_retry_cause(&error)
+                    .unwrap_or(CodexRecoveryCause::TransportFailure);
+                let dropped = drop_live_continuation_for_retry(&mut continuation, cause);
                 if dropped && is_missing_previous_response_error(&error) {
                     *attempt += 1;
                     continue;
@@ -1034,6 +1126,7 @@ async fn live_stream_route_attempt(
             request_body.clone(),
             compaction_lease.clone(),
             read_lane,
+            conversation_admission,
         )
         .await
         {
@@ -1047,7 +1140,9 @@ async fn live_stream_route_attempt(
                 error,
                 full_context_retry_attempted,
             } => {
-                let dropped = drop_live_continuation_for_retry(&mut continuation);
+                let cause = client::continuation_retry_cause(&error)
+                    .unwrap_or(CodexRecoveryCause::TransportFailure);
+                let dropped = drop_live_continuation_for_retry(&mut continuation, cause);
                 if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
                     abort_request_state(&request_continuation, compaction_lease.as_ref());
                     return LiveRouteOutcome::Response(map_codex_error_to_response(&error));
@@ -1097,6 +1192,7 @@ async fn live_stream_response_once(
     request_body: translate::request::ResponsesRequest,
     compaction_lease: Option<CompactionLease>,
     read_lane: Option<OpaqueLane>,
+    conversation_admission: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_stable_read_lane(
@@ -1115,7 +1211,7 @@ async fn live_stream_response_once(
         let payload = match item {
             Ok(payload) => payload,
             Err(error) if error.status == 401 => {
-                return handle_live_auth_rejection(
+                let rejection = handle_live_auth_rejection(
                     &upstream_events,
                     &mut translator,
                     pending_chunk,
@@ -1127,12 +1223,17 @@ async fn live_stream_response_once(
                     compaction_lease,
                     error,
                 );
+                upstream_events.cancel_and_wait().await;
+                return rejection;
             }
             Err(error) => {
                 if retryable_live_start_codex_error(&error) {
-                    return provider_retry(&upstream_events, error);
+                    let retry = provider_retry(&upstream_events, error);
+                    upstream_events.cancel_and_wait().await;
+                    return retry;
                 }
                 abort_request_state(&request_continuation, compaction_lease.as_ref());
+                upstream_events.cancel_and_wait().await;
                 return LiveStreamStart::Response(map_codex_error_to_response(&error));
             }
         };
@@ -1144,7 +1245,7 @@ async fn live_stream_response_once(
                 retry_after: failure.retry_after,
                 origin: client::CodexErrorOrigin::WebSocket,
             };
-            return handle_live_auth_rejection(
+            let rejection = handle_live_auth_rejection(
                 &upstream_events,
                 &mut translator,
                 pending_chunk,
@@ -1156,6 +1257,8 @@ async fn live_stream_response_once(
                 compaction_lease,
                 error,
             );
+            upstream_events.cancel_and_wait().await;
+            return rejection;
         }
         if !generation_started && codex_generation_event(&payload) {
             if let Some(monitor) = ctx.monitor.as_ref() {
@@ -1191,7 +1294,7 @@ async fn live_stream_response_once(
                             503
                         }
                     });
-                    return provider_retry(
+                    let retry = provider_retry(
                         &upstream_events,
                         client::CodexError {
                             status,
@@ -1201,8 +1304,11 @@ async fn live_stream_response_once(
                             origin: client::CodexErrorOrigin::WebSocket,
                         },
                     );
+                    upstream_events.cancel_and_wait().await;
+                    return retry;
                 }
                 abort_request_state(&request_continuation, compaction_lease.as_ref());
+                upstream_events.cancel_and_wait().await;
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
@@ -1211,12 +1317,15 @@ async fn live_stream_response_once(
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
         {
-            return provider_retry(&upstream_events, empty_live_completion_error());
+            let retry = provider_retry(&upstream_events, empty_live_completion_error());
+            upstream_events.wait_for_completion().await;
+            return retry;
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
+                upstream_events.wait_for_completion().await;
                 update_continuation_from_upstream(
                     &request_continuation,
                     &request_body,
@@ -1240,9 +1349,11 @@ async fn live_stream_response_once(
                 client,
                 route,
                 auth_rejection_budget,
+                conversation_admission.take(),
             ));
         }
         if terminal {
+            upstream_events.wait_for_completion().await;
             update_continuation_from_upstream(
                 &request_continuation,
                 &request_body,
@@ -1260,6 +1371,7 @@ async fn live_stream_response_once(
         }
     }
 
+    upstream_events.wait_for_completion().await;
     provider_retry(
         &upstream_events,
         client::CodexError {
@@ -1273,10 +1385,13 @@ async fn live_stream_response_once(
 }
 
 fn invalidate_live_route_socket(continuation: &ContinuationReservation, socket_id: Option<u64>) {
-    if socket_id.is_some() {
-        websocket::invalidate_codex_websocket_pool_socket(continuation, socket_id);
+    let removed = if socket_id.is_some() {
+        websocket::invalidate_codex_websocket_pool_socket(continuation, socket_id)
     } else {
-        websocket::invalidate_codex_websocket_pool_for_reservation(continuation);
+        websocket::invalidate_codex_websocket_pool_for_reservation(continuation)
+    };
+    if removed {
+        continuation.record_socket_cause(CodexRecoveryCause::AuthRejection);
     }
 }
 
@@ -1404,18 +1519,30 @@ fn remaining_live_stream_response(
     client: Arc<CodexHttpClient>,
     route: CodexBoundRoute,
     auth_rejection_budget: Arc<AuthRejectionBudget>,
+    conversation_admission: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
+        let _conversation_admission = conversation_admission;
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
-            abort_request_state(&request_continuation, compaction_lease.as_ref());
+            cancel_downstream_live_stream(
+                upstream_events,
+                &request_continuation,
+                compaction_lease.as_ref(),
+            )
+            .await;
             return;
         }
         loop {
             let item = tokio::select! {
                 biased;
                 _ = tx.closed() => {
-                    abort_request_state(&request_continuation, compaction_lease.as_ref());
+                    cancel_downstream_live_stream(
+                        upstream_events,
+                        &request_continuation,
+                        compaction_lease.as_ref(),
+                    )
+                    .await;
                     return;
                 }
                 item = upstream_events.recv() => item,
@@ -1431,6 +1558,7 @@ fn remaining_live_stream_response(
                             upstream_events.socket_id(),
                         );
                         abort_request_state(&request_continuation, compaction_lease.as_ref());
+                        upstream_events.wait_for_completion().await;
                         client.refresh_conversation_auth_after_rejection_in_background(
                             &route,
                             auth_rejection_budget.clone(),
@@ -1455,6 +1583,7 @@ fn remaining_live_stream_response(
                         Ok(result) => result,
                         Err(message) => {
                             abort_request_state(&request_continuation, compaction_lease.as_ref());
+                            upstream_events.cancel_and_wait().await;
                             let chunk = translator.error_chunk(
                                 &message,
                                 "api_error",
@@ -1470,11 +1599,17 @@ fn remaining_live_stream_response(
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                            abort_request_state(&request_continuation, compaction_lease.as_ref());
+                            cancel_downstream_live_stream(
+                                upstream_events,
+                                &request_continuation,
+                                compaction_lease.as_ref(),
+                            )
+                            .await;
                             return;
                         }
                     }
                     if terminal {
+                        upstream_events.wait_for_completion().await;
                         update_continuation_from_upstream(
                             &request_continuation,
                             &request_body,
@@ -1493,6 +1628,7 @@ fn remaining_live_stream_response(
                             upstream_events.socket_id(),
                         );
                         abort_request_state(&request_continuation, compaction_lease.as_ref());
+                        upstream_events.wait_for_completion().await;
                         client.refresh_conversation_auth_after_rejection_in_background(
                             &route,
                             auth_rejection_budget.clone(),
@@ -1509,6 +1645,7 @@ fn remaining_live_stream_response(
                         return;
                     }
                     abort_request_state(&request_continuation, compaction_lease.as_ref());
+                    upstream_events.wait_for_completion().await;
                     let chunk =
                         translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
                     if !chunk.is_empty() {
@@ -1531,6 +1668,7 @@ fn remaining_live_stream_response(
             }
         }
 
+        upstream_events.wait_for_completion().await;
         abort_request_state(&request_continuation, compaction_lease.as_ref());
         let chunk = translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
         if !chunk.is_empty() {
@@ -1553,6 +1691,18 @@ fn remaining_live_stream_response(
         rx.recv().await.map(|item| (item, rx))
     });
     event_stream_response(stream)
+}
+
+async fn cancel_downstream_live_stream(
+    upstream_events: websocket::CodexWebSocketEventStream,
+    continuation: &ContinuationReservation,
+    compaction_lease: Option<&CompactionLease>,
+) {
+    abort_request_state(continuation, compaction_lease);
+    let socket_id = upstream_events.cancel_and_wait_socket_id().await;
+    if websocket::invalidate_codex_websocket_pool_socket(continuation, socket_id) {
+        continuation.record_socket_cause(CodexRecoveryCause::Cancelled);
+    }
 }
 
 fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
@@ -1659,7 +1809,10 @@ fn is_missing_previous_response_error(err: &client::CodexError) -> bool {
     )
 }
 
-fn drop_live_continuation_for_retry(continuation: &mut Option<ContinuationReservation>) -> bool {
+fn drop_live_continuation_for_retry(
+    continuation: &mut Option<ContinuationReservation>,
+    cause: CodexRecoveryCause,
+) -> bool {
     if continuation
         .as_ref()
         .and_then(|reservation| reservation.candidate().previous_response_id.as_deref())
@@ -1669,7 +1822,7 @@ fn drop_live_continuation_for_retry(continuation: &mut Option<ContinuationReserv
     }
 
     if let Some(reservation) = continuation.as_ref() {
-        *continuation = Some(reservation.full_context_retry());
+        *continuation = Some(reservation.full_context_retry(cause));
     }
     true
 }
@@ -2775,10 +2928,13 @@ mod tests {
             captured[0].1["prompt_cache_key"],
             captured[1].1["prompt_cache_key"]
         );
-        assert_eq!(
-            captured[1].1["prompt_cache_key"],
-            captured[2].1["prompt_cache_key"]
-        );
+        assert!(captured[2].1["prompt_cache_key"].is_null());
+        for header in ["session_id", "x-client-request-id", "x-codex-window-id"] {
+            assert!(
+                captured_header(&captured[2].0, header).is_none(),
+                "detached summary leaked {header}"
+            );
+        }
         compaction::clear_all_compactions_for_tests();
     }
 
@@ -3138,6 +3294,7 @@ mod tests {
         .unwrap();
 
         let (rx, _) = websocket::CodexWebSocketEventStream::pending(rx);
+        let mut conversation_admission = None;
         let response = match live_stream_response_once(
             rx,
             client,
@@ -3150,6 +3307,7 @@ mod tests {
             request_body,
             None,
             None,
+            &mut conversation_admission,
         )
         .await
         {
@@ -3876,6 +4034,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_terminal_loses_to_downstream_cancellation_before_publication() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let session_id = "queued-terminal-body-drop";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = live_test_request("one");
+        let reserved = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let client = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let (route, reserved) = bind_live_test_route(client.as_ref(), &owner, &reserved).await;
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(1);
+        let (upstream_events, socket_id_publisher) =
+            websocket::CodexWebSocketEventStream::pending(upstream_rx);
+        socket_id_publisher.publish(Some(41));
+        let translator = LiveStreamTranslator::with_stable_read_lane(
+            "message".to_string(),
+            request.model.clone(),
+            count_translated_tokens(&request),
+            None,
+        );
+        let response = remaining_live_stream_response(
+            upstream_events,
+            translator,
+            b"first".to_vec(),
+            live_test_context(session_id),
+            reserved.clone(),
+            request.clone(),
+            Vec::new(),
+            None,
+            None,
+            client,
+            route,
+            Arc::new(AuthRejectionBudget::default()),
+            None,
+        );
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("first downstream chunk")
+            .expect("first downstream chunk must succeed");
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"first"));
+
+        upstream_tx
+            .try_send(Ok(serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_queued",
+                    "status": "completed",
+                    "output": []
+                }
+            })))
+            .expect("provider-facing terminal channel must accept the terminal");
+        drop(body);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while continuation::is_current_turn_for_owner(&reserved) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("downstream cancellation did not settle the reserved turn");
+        assert!(!continuation::has_continuation_for_owner_for_tests(&owner));
+        assert_eq!(
+            record_continuation_for_owner(&reserved, &request, Some("resp_queued"), Some(41), &[],),
+            ContinuationPublication::Rejected
+        );
+        let next_request = live_test_request("two");
+        let next = continuation_candidate_for_owner(Some(&owner), &next_request, true);
+        assert!(next.candidate().previous_response_id.is_none());
+        assert_eq!(next.candidate().input_delta_count, next_request.input.len());
+        abort_continuation_for_owner(&next);
+    }
+
+    #[tokio::test]
     async fn blocked_older_compaction_cannot_publish_after_newer_completion() {
         let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
         let session_id = "blocked-older-compaction";
@@ -3960,7 +4194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_forces_full_context_without_allocating_another_continuation_generation() {
+    async fn replay_is_canonicalized_before_continuation_evaluation_without_new_generation() {
         let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let session_id = "replay-full-context-generation";
@@ -3989,12 +4223,7 @@ mod tests {
             &[],
         );
         let next_request = compaction_replay_request();
-        let reserved =
-            continuation_candidate_for_owner(Some(&owner), &next_request, true).bind_route(&route);
-        assert_eq!(
-            reserved.candidate().previous_response_id.as_deref(),
-            Some("resp-before-replay")
-        );
+        let reserved = reserve_continuation_for_owner(Some(&owner), true);
         let generation = reserved.turn_id();
 
         let permit = reserve_compaction_start(lane).unwrap();
@@ -4005,13 +4234,17 @@ mod tests {
         ));
         assert!(activate_compaction_for_route(&build, &compaction_output()));
         let replay = apply_compaction_replay_for_route(&route, &next_request).unwrap();
-        let full_context = reserved.full_context_retry();
+        let evaluated = reserved.evaluate(&replay.request).bind_route(&route);
 
-        assert_eq!(full_context.turn_id(), generation);
-        assert!(full_context.candidate().previous_response_id.is_none());
-        assert!(full_context.candidate().input_delta.is_none());
+        assert_eq!(evaluated.turn_id(), generation);
+        assert!(evaluated.candidate().previous_response_id.is_none());
+        assert!(evaluated.candidate().input_delta.is_none());
+        assert_eq!(
+            evaluated.candidate_cause(),
+            Some(CodexRecoveryCause::NotAppendOnly)
+        );
         assert!(activate_compaction_for_route(&replay.lease, &[]));
-        abort_continuation_for_owner(&full_context);
+        abort_continuation_for_owner(&evaluated);
         compaction::clear_compactions_for_lane(lane.unwrap());
         drop(permit);
     }

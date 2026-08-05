@@ -5,9 +5,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::sse::parse_sse_events;
 use crate::provider::RequestContext;
-use crate::providers::codex::client::{BufferedRetryState, CodexError, CodexHttpClient};
+use crate::providers::codex::client::{
+    ActualTransport, BufferedRetryState, CodexError, CodexHttpClient,
+};
 use crate::request_identity::{LaneDomain, OpaqueLane, RequestPurpose, RequestScope};
 
+use super::continuation::ContinuationReservation;
 use super::state::{CodexBoundRoute, CodexConversationKey};
 
 use super::translate::request::{
@@ -15,7 +18,7 @@ use super::translate::request::{
     request_uses_responses_lite,
 };
 
-const RETAINED_MESSAGE_TOKEN_BUDGET: u64 = 20_000;
+const RETAINED_MESSAGE_TOKEN_BUDGET: u64 = 64_000;
 const STATE_TTL_MS: u64 = 30 * 60 * 1_000;
 const MAX_STATES: usize = 1_000;
 const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
@@ -35,6 +38,67 @@ impl std::fmt::Display for CompactionError {
             Self::InvalidResponse(message) => f.write_str(message),
         }
     }
+}
+
+/// The hidden native request and the pre-trigger history it was prepared from.
+/// Keeping these together lets a later stage publish the exact request/output
+/// pair as a continuation only after the terminal response has been validated.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedCompaction {
+    request: ResponsesRequest,
+    native_input_history: Vec<ResponsesInputItem>,
+}
+
+impl PreparedCompaction {
+    pub(crate) fn request(&self) -> &ResponsesRequest {
+        &self.request
+    }
+}
+
+/// A fully validated hidden compaction terminal. HTTP results can install the
+/// compacted history, while WebSocket results additionally carry the physical
+/// socket needed for reusable continuation publication.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct BoundCompactionResult {
+    prepared: PreparedCompaction,
+    response_id: String,
+    compaction_output: ResponsesInputItem,
+    socket_id: Option<u64>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct CompactionContinuationPublication<'a> {
+    pub(crate) request: &'a ResponsesRequest,
+    pub(crate) response_id: &'a str,
+    pub(crate) socket_id: u64,
+    pub(crate) output_items: &'a [ResponsesInputItem],
+}
+
+#[allow(dead_code)]
+impl BoundCompactionResult {
+    pub(crate) fn compacted_history(&self) -> Vec<ResponsesInputItem> {
+        build_compacted_history(
+            &self.prepared.native_input_history,
+            self.compaction_output.clone(),
+        )
+    }
+
+    pub(crate) fn continuation_publication(&self) -> Option<CompactionContinuationPublication<'_>> {
+        self.socket_id
+            .map(|socket_id| CompactionContinuationPublication {
+                request: &self.prepared.request,
+                response_id: &self.response_id,
+                socket_id,
+                output_items: std::slice::from_ref(&self.compaction_output),
+            })
+    }
+}
+
+#[derive(Debug)]
+struct ParsedCompactionTerminal {
+    response_id: String,
+    compaction_output: ResponsesInputItem,
 }
 
 enum CompactionPhase {
@@ -377,12 +441,7 @@ pub(crate) fn apply_compaction_replay_for_route(
         return None;
     }
     let mut replay = request.clone();
-    replay.input = envelope
-        .iter()
-        .cloned()
-        .chain(native_history)
-        .chain(conversation[1..].iter().cloned())
-        .collect();
+    replay.input = build_compaction_replay_input(envelope, &native_history, &conversation[1..]);
     if serialized_size(&replay.input) > MAX_STATE_BYTES
         || !make_bound_retained_room(registry, route_key, candidate_state_size, now)
     {
@@ -832,15 +891,19 @@ pub async fn request_compaction(
     request: &ResponsesRequest,
     ctx: &RequestContext,
 ) -> Result<Vec<ResponsesInputItem>, CompactionError> {
-    let (compaction_request, conversation) = prepare_compaction_request(request);
+    let prepared = prepare_compaction_request(request);
     let response = client
-        .post_codex_for_owner(&compaction_request, ctx, None)
+        .post_codex_for_owner(prepared.request(), ctx, None)
         .await
         .map_err(CompactionError::Upstream)?;
-    let compaction = parse_compaction_response(&response.body)?;
-    Ok(build_compacted_history(&conversation, compaction))
+    let terminal = parse_compaction_response(&response.body)?;
+    Ok(build_compacted_history(
+        &prepared.native_input_history,
+        terminal.compaction_output,
+    ))
 }
 
+#[allow(dead_code)]
 pub(crate) async fn request_compaction_bound(
     client: &CodexHttpClient,
     route: &CodexBoundRoute,
@@ -848,31 +911,70 @@ pub(crate) async fn request_compaction_bound(
     ctx: &RequestContext,
     retry_state: &mut BufferedRetryState,
 ) -> Result<Vec<ResponsesInputItem>, CompactionError> {
-    let (compaction_request, conversation) = prepare_compaction_request(request);
+    let prepared = prepare_compaction_request(request);
     let response = client
-        .post_codex_bound_with_retry_state(route, &compaction_request, ctx, None, retry_state)
+        .post_codex_bound_with_retry_state(route, prepared.request(), ctx, None, retry_state)
         .await
         .map_err(CompactionError::Upstream)?;
-    let compaction = parse_compaction_response(&response.body)?;
-    Ok(build_compacted_history(&conversation, compaction))
+    let terminal = parse_compaction_response(&response.body)?;
+    Ok(build_compacted_history(
+        &prepared.native_input_history,
+        terminal.compaction_output,
+    ))
 }
 
-fn prepare_compaction_request(
-    request: &ResponsesRequest,
-) -> (ResponsesRequest, Vec<ResponsesInputItem>) {
+/// Executes a separately prepared hidden request with an owner-aware turn.
+/// The next orchestration stage can evaluate and bind `continuation` against
+/// `prepared.request()` before calling this hook, then atomically install the
+/// compacted history and publish the returned continuation metadata.
+#[allow(dead_code)]
+pub(crate) async fn request_compaction_bound_result(
+    client: &CodexHttpClient,
+    route: &CodexBoundRoute,
+    prepared: PreparedCompaction,
+    ctx: &RequestContext,
+    continuation: &ContinuationReservation,
+    _retry_state: &mut BufferedRetryState,
+) -> Result<BoundCompactionResult, CompactionError> {
+    // A hidden compaction turn is not idempotent once dispatched. Route-level
+    // 401 recovery is owned by the caller, but transport/status retries must
+    // never issue a second trigger for the same hidden transaction.
+    let mut no_retry = BufferedRetryState::disabled();
+    let response = client
+        .post_codex_bound_with_retry_state(
+            route,
+            prepared.request(),
+            ctx,
+            Some(continuation),
+            &mut no_retry,
+        )
+        .await
+        .map_err(CompactionError::Upstream)?;
+    bind_compaction_terminal(
+        prepared,
+        &response.body,
+        response.transport,
+        response.socket_id,
+    )
+}
+
+pub(crate) fn prepare_compaction_request(request: &ResponsesRequest) -> PreparedCompaction {
     let (envelope, conversation) = split_input_envelope(&request.input);
-    let conversation = without_compaction_instruction(conversation);
+    let native_input_history = without_compaction_instruction(conversation);
     let mut compaction_request = request.clone();
     compaction_request.instructions = None;
     compaction_request.input = envelope
         .iter()
         .filter(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
         .cloned()
-        .chain(conversation.iter().cloned())
+        .chain(native_input_history.iter().cloned())
         .chain(std::iter::once(ResponsesInputItem::CompactionTrigger))
         .collect();
     compaction_request.include = Some(vec!["reasoning.encrypted_content".to_string()]);
-    (compaction_request, conversation)
+    PreparedCompaction {
+        request: compaction_request,
+        native_input_history,
+    }
 }
 
 pub fn store_compaction(
@@ -1031,12 +1133,8 @@ pub fn apply_compaction_replay(
     }
 
     let mut replay = request.clone();
-    replay.input = envelope
-        .iter()
-        .cloned()
-        .chain(state.native_history.iter().cloned())
-        .chain(conversation[1..].iter().cloned())
-        .collect();
+    replay.input =
+        build_compaction_replay_input(envelope, &state.native_history, &conversation[1..]);
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
         registry.states.remove(session_id);
         update_total_bytes(registry);
@@ -1087,6 +1185,30 @@ fn split_input_envelope(
         .take_while(|item| is_envelope_item(item))
         .count();
     input.split_at(prefix_len)
+}
+
+/// Rebuilds a post-compaction turn in the order used by Codex pre-turn
+/// compaction. Responses Lite's `additional_tools` item remains a protocol
+/// prefix, while developer messages from the fresh request are initial context
+/// and therefore follow the stored history's final compaction item.
+fn build_compaction_replay_input(
+    envelope: &[ResponsesInputItem],
+    native_history: &[ResponsesInputItem],
+    new_conversation: &[ResponsesInputItem],
+) -> Vec<ResponsesInputItem> {
+    envelope
+        .iter()
+        .filter(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
+        .cloned()
+        .chain(native_history.iter().cloned())
+        .chain(
+            envelope
+                .iter()
+                .filter(|item| !matches!(item, ResponsesInputItem::AdditionalTools { .. }))
+                .cloned(),
+        )
+        .chain(new_conversation.iter().cloned())
+        .collect()
 }
 
 fn without_compaction_instruction(input: &[ResponsesInputItem]) -> Vec<ResponsesInputItem> {
@@ -1160,9 +1282,38 @@ fn message_text(item: &ResponsesInputItem) -> Option<String> {
     )
 }
 
-fn parse_compaction_response(body: &[u8]) -> Result<ResponsesInputItem, CompactionError> {
-    let mut completed = false;
-    let mut compacted = Vec::new();
+pub(crate) fn bind_compaction_terminal(
+    prepared: PreparedCompaction,
+    body: &[u8],
+    transport: ActualTransport,
+    socket_id: Option<u64>,
+) -> Result<BoundCompactionResult, CompactionError> {
+    let terminal = parse_compaction_response(body)?;
+    let socket_id = match transport {
+        ActualTransport::Http => None,
+        ActualTransport::WebSocket => Some(
+            socket_id
+                .filter(|socket_id| *socket_id != 0)
+                .ok_or_else(|| {
+                    CompactionError::InvalidResponse(
+                        "remote compaction WebSocket result is missing physical socket provenance"
+                            .to_string(),
+                    )
+                })?,
+        ),
+    };
+    Ok(BoundCompactionResult {
+        prepared,
+        response_id: terminal.response_id,
+        compaction_output: terminal.compaction_output,
+        socket_id,
+    })
+}
+
+fn parse_compaction_response(body: &[u8]) -> Result<ParsedCompactionTerminal, CompactionError> {
+    let mut terminal_response_id = None;
+    let mut compaction_count = 0usize;
+    let mut compaction_output = None;
 
     for event in parse_sse_events(body) {
         if event.data == "[DONE]" {
@@ -1179,39 +1330,78 @@ fn parse_compaction_response(body: &[u8]) -> Result<ResponsesInputItem, Compacti
                     .or_else(|| payload.get("message"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("remote compaction failed");
-                return Err(CompactionError::InvalidResponse(message.to_string()));
+                return Err(CompactionError::InvalidResponse(format!(
+                    "remote compaction failed terminal: {message}"
+                )));
+            }
+            Some("response.incomplete") => {
+                return Err(CompactionError::InvalidResponse(
+                    "remote compaction ended with response.incomplete".to_string(),
+                ));
             }
             Some("response.output_item.done") => {
                 let Some(item) = payload.get("item") else {
                     continue;
                 };
-                if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
-                    && let Some(encrypted_content) = item
+                if item.get("type").and_then(serde_json::Value::as_str) != Some("compaction") {
+                    continue;
+                }
+                compaction_count = compaction_count.saturating_add(1);
+                if compaction_output.is_none() {
+                    let encrypted_content = item
                         .get("encrypted_content")
                         .and_then(serde_json::Value::as_str)
-                {
-                    compacted.push(ResponsesInputItem::Compaction {
+                        .ok_or_else(|| {
+                            CompactionError::InvalidResponse(
+                                "remote compaction output item is missing encrypted_content"
+                                    .to_string(),
+                            )
+                        })?;
+                    compaction_output = Some(ResponsesInputItem::Compaction {
                         encrypted_content: encrypted_content.to_string(),
                     });
                 }
             }
-            Some("response.completed") => completed = true,
+            Some("response.completed") => {
+                if terminal_response_id.is_some() {
+                    return Err(CompactionError::InvalidResponse(
+                        "remote compaction received duplicate response.completed terminals"
+                            .to_string(),
+                    ));
+                }
+                let response_id = payload
+                    .pointer("/response/id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|response_id| !response_id.trim().is_empty())
+                    .ok_or_else(|| {
+                        CompactionError::InvalidResponse(
+                            "remote compaction response.completed is missing a non-empty response id"
+                                .to_string(),
+                        )
+                    })?;
+                terminal_response_id = Some(response_id.to_string());
+            }
             _ => {}
         }
     }
 
-    if !completed {
+    let Some(response_id) = terminal_response_id else {
         return Err(CompactionError::InvalidResponse(
             "remote compaction stream ended before response.completed".to_string(),
         ));
-    }
-    if compacted.len() != 1 {
+    };
+    if compaction_count != 1 {
         return Err(CompactionError::InvalidResponse(format!(
-            "remote compaction expected exactly one compaction item, got {}",
-            compacted.len()
+            "remote compaction expected exactly one compaction item, got {compaction_count}"
         )));
     }
-    Ok(compacted.pop().expect("validated one compaction item"))
+    let Some(compaction_output) = compaction_output else {
+        unreachable!("validated one compaction output item");
+    };
+    Ok(ParsedCompactionTerminal {
+        response_id,
+        compaction_output,
+    })
 }
 
 fn build_compacted_history(
@@ -1220,18 +1410,33 @@ fn build_compacted_history(
 ) -> Vec<ResponsesInputItem> {
     let retained = input
         .iter()
-        .filter(|item| {
-            matches!(
-                item,
-                ResponsesInputItem::Message { role, .. }
-                    if matches!(role.as_str(), "user" | "developer" | "system")
-            )
-        })
-        .cloned()
+        .filter_map(retainable_user_message)
         .collect::<Vec<_>>();
     let mut retained = truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
     retained.push(compaction);
     retained
+}
+
+fn retainable_user_message(item: &ResponsesInputItem) -> Option<ResponsesInputItem> {
+    let ResponsesInputItem::Message { role, content } = item else {
+        return None;
+    };
+    if role != "user" {
+        return None;
+    }
+    let content = content
+        .iter()
+        .filter(|part| match part {
+            ResponsesContentPart::InputText { text }
+            | ResponsesContentPart::OutputText { text } => !text.is_empty(),
+            ResponsesContentPart::InputImage { .. } => true,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!content.is_empty()).then(|| ResponsesInputItem::Message {
+        role: role.clone(),
+        content,
+    })
 }
 
 fn truncate_retained_messages(
@@ -1239,15 +1444,15 @@ fn truncate_retained_messages(
     max_tokens: u64,
 ) -> Vec<ResponsesInputItem> {
     let mut remaining = max_tokens;
-    let mut retained = Vec::new();
+    let mut retained = Vec::with_capacity(items.len());
     for item in items.into_iter().rev() {
         if remaining == 0 {
-            break;
+            continue;
         }
         let tokens = message_tokens(&item).max(1);
         if tokens <= remaining {
             retained.push(item);
-            remaining -= tokens;
+            remaining = remaining.saturating_sub(tokens);
         } else if let Some(item) = truncate_message(item, remaining) {
             retained.push(item);
             remaining = 0;
@@ -1266,28 +1471,50 @@ fn message_tokens(item: &ResponsesInputItem) -> u64 {
         .map(|part| match part {
             ResponsesContentPart::InputText { text }
             | ResponsesContentPart::OutputText { text } => text.len().div_ceil(4) as u64,
-            ResponsesContentPart::InputImage { .. } => 2_000,
+            ResponsesContentPart::InputImage { .. } => 0,
         })
         .sum()
 }
 
 fn truncate_message(item: ResponsesInputItem, max_tokens: u64) -> Option<ResponsesInputItem> {
     let ResponsesInputItem::Message { role, content } = item else {
-        return Some(item);
+        return None;
     };
-    let mut remaining_chars = max_tokens.saturating_mul(4) as usize;
-    let mut truncated = Vec::new();
+    let mut remaining = max_tokens;
+    let mut truncated = Vec::with_capacity(content.len());
     for part in content {
         match part {
             ResponsesContentPart::InputImage { .. } => truncated.push(part),
             ResponsesContentPart::InputText { text } => {
-                let text = truncate_text(text, &mut remaining_chars);
+                if remaining == 0 {
+                    continue;
+                }
+                let tokens = approximate_text_tokens(&text);
+                let text = if tokens <= remaining {
+                    remaining = remaining.saturating_sub(tokens);
+                    text
+                } else {
+                    let text = truncate_text_middle(&text, remaining);
+                    remaining = 0;
+                    text
+                };
                 if !text.is_empty() {
                     truncated.push(ResponsesContentPart::InputText { text });
                 }
             }
             ResponsesContentPart::OutputText { text } => {
-                let text = truncate_text(text, &mut remaining_chars);
+                if remaining == 0 {
+                    continue;
+                }
+                let tokens = approximate_text_tokens(&text);
+                let text = if tokens <= remaining {
+                    remaining = remaining.saturating_sub(tokens);
+                    text
+                } else {
+                    let text = truncate_text_middle(&text, remaining);
+                    remaining = 0;
+                    text
+                };
                 if !text.is_empty() {
                     truncated.push(ResponsesContentPart::OutputText { text });
                 }
@@ -1300,19 +1527,36 @@ fn truncate_message(item: ResponsesInputItem, max_tokens: u64) -> Option<Respons
     })
 }
 
-fn truncate_text(mut text: String, remaining_chars: &mut usize) -> String {
-    if *remaining_chars == 0 {
-        return String::new();
+fn approximate_text_tokens(text: &str) -> u64 {
+    text.len().div_ceil(4) as u64
+}
+
+fn truncate_text_middle(text: &str, max_tokens: u64) -> String {
+    let max_bytes = usize::try_from(max_tokens)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4);
+    if text.len() <= max_bytes {
+        return text.to_string();
     }
-    if text.len() > *remaining_chars {
-        let mut boundary = *remaining_chars;
-        while !text.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        text.truncate(boundary);
+
+    let prefix_target = max_bytes / 2;
+    let suffix_target = max_bytes.saturating_sub(prefix_target);
+    let mut prefix_end = prefix_target.min(text.len());
+    while prefix_end > 0 && !text.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
     }
-    *remaining_chars -= text.len();
-    text
+    let suffix_target_start = text.len().saturating_sub(suffix_target);
+    let mut suffix_start = suffix_target_start.max(prefix_end);
+    while suffix_start < text.len() && !text.is_char_boundary(suffix_start) {
+        suffix_start += 1;
+    }
+    let removed_bytes = suffix_start.saturating_sub(prefix_end);
+    let removed_tokens = removed_bytes.div_ceil(4).max(1);
+    format!(
+        "{}…{removed_tokens} tokens truncated…{}",
+        &text[..prefix_end],
+        &text[suffix_start..]
+    )
 }
 
 fn serialized_size(items: &[ResponsesInputItem]) -> usize {
@@ -1553,9 +1797,11 @@ mod tests {
 
     #[test]
     fn parses_exactly_one_completed_compaction_item() {
-        let body = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        let body = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\"}}\n\n";
+        let parsed = parse_compaction_response(body).unwrap();
+        assert_eq!(parsed.response_id, "resp_compact");
         assert!(matches!(
-            parse_compaction_response(body).unwrap(),
+            parsed.compaction_output,
             ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "opaque"
         ));
     }
@@ -1569,13 +1815,89 @@ mod tests {
                 .to_string()
                 .contains("before response.completed")
         );
-        let missing = b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        let missing =
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\"}}\n\n";
         assert!(
             parse_compaction_response(missing)
                 .unwrap_err()
                 .to_string()
                 .contains("exactly one")
         );
+    }
+
+    #[test]
+    fn rejects_missing_response_id_duplicate_compaction_and_failed_terminal() {
+        let missing_id = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        assert!(
+            parse_compaction_response(missing_id)
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty response id")
+        );
+
+        let duplicate = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"first\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"second\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\"}}\n\n";
+        assert!(
+            parse_compaction_response(duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one compaction item, got 2")
+        );
+
+        let failed = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"compaction refused\"}}}\n\n";
+        let failure = parse_compaction_response(failed).unwrap_err().to_string();
+        assert!(failure.contains("failed terminal"));
+        assert!(failure.contains("compaction refused"));
+
+        let incomplete = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_compact\"}}\n\n";
+        assert!(
+            parse_compaction_response(incomplete)
+                .unwrap_err()
+                .to_string()
+                .contains("response.incomplete")
+        );
+    }
+
+    #[test]
+    fn bound_terminal_requires_websocket_provenance_and_preserves_publication_input() {
+        let source = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"remember this"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+        ]));
+        let prepared = prepare_compaction_request(&source);
+        let expected_request = serde_json::to_value(prepared.request()).unwrap();
+        let body = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\"}}\n\n";
+
+        let error =
+            bind_compaction_terminal(prepared.clone(), body, ActualTransport::WebSocket, None)
+                .unwrap_err();
+        assert!(error.to_string().contains("physical socket provenance"));
+
+        let bound =
+            bind_compaction_terminal(prepared, body, ActualTransport::WebSocket, Some(41)).unwrap();
+        let publication = bound.continuation_publication().unwrap();
+        assert_eq!(publication.response_id, "resp_compact");
+        assert_eq!(publication.socket_id, 41);
+        assert_eq!(
+            serde_json::to_value(publication.request).unwrap(),
+            expected_request
+        );
+        assert!(matches!(
+            publication.request.input.last(),
+            Some(ResponsesInputItem::CompactionTrigger)
+        ));
+        assert!(matches!(
+            publication.output_items,
+            [ResponsesInputItem::Compaction { encrypted_content }] if encrypted_content == "opaque"
+        ));
+
+        let http = bind_compaction_terminal(
+            prepare_compaction_request(&source),
+            body,
+            ActualTransport::Http,
+            None,
+        )
+        .unwrap();
+        assert!(http.continuation_publication().is_none());
     }
 
     #[test]
@@ -1609,14 +1931,50 @@ mod tests {
             replay.input[0],
             ResponsesInputItem::AdditionalTools { .. }
         ));
-        assert!(
-            matches!(replay.input[1], ResponsesInputItem::Message { ref role, .. } if role == "developer")
-        );
         assert!(matches!(
-            replay.input[2],
+            replay.input[1],
             ResponsesInputItem::Compaction { .. }
         ));
+        assert!(
+            matches!(replay.input[2], ResponsesInputItem::Message { ref role, .. } if role == "developer")
+        );
+        assert_eq!(message_text(&replay.input[3]).as_deref(), Some("continue"));
         assert_eq!(replay.client_metadata, next.client_metadata);
+    }
+
+    #[test]
+    fn route_bound_replay_places_initial_context_after_compaction() {
+        let _guard = lock_compaction_registry_for_tests();
+        clear_all_compactions_for_tests();
+        let route = bound_route(main_lane("initial-context-order"), "access-a");
+        let (permit, build) = stage_bound(&route, "opaque");
+        anchor_bound(&build);
+        let next = request(json!([
+            {"type":"additional_tools","role":"developer","tools":[]},
+            {"type":"message","role":"developer","content":[{"type":"input_text","text":"fresh instructions"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+
+        let replay = apply_compaction_replay_for_route(&route, &next).unwrap();
+
+        assert!(matches!(
+            replay.request.input[0],
+            ResponsesInputItem::AdditionalTools { .. }
+        ));
+        assert!(matches!(
+            replay.request.input[1],
+            ResponsesInputItem::Compaction { .. }
+        ));
+        assert!(
+            matches!(replay.request.input[2], ResponsesInputItem::Message { ref role, .. } if role == "developer")
+        );
+        assert_eq!(
+            message_text(&replay.request.input[3]).as_deref(),
+            Some("continue")
+        );
+        assert!(activate_compaction_for_route(&replay.lease, &[]));
+        drop(permit);
     }
 
     #[test]
@@ -2297,25 +2655,120 @@ mod tests {
     }
 
     #[test]
-    fn retained_history_obeys_token_budget_at_utf8_boundary() {
-        let text = "é".repeat((RETAINED_MESSAGE_TOKEN_BUDGET as usize + 10) * 4);
+    fn compacted_history_keeps_only_nonempty_user_messages_and_new_compaction_last() {
         let input: Vec<ResponsesInputItem> = serde_json::from_value(json!([
-            {"type":"message","role":"user","content":[{"type":"input_text","text":text}]}
+            {"type":"message","role":"system","content":[{"type":"input_text","text":"system"}]},
+            {"type":"message","role":"developer","content":[{"type":"input_text","text":"developer"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"keep me"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"assistant"}]},
+            {"type":"function_call","call_id":"call","name":"tool","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call","output":"result"},
+            {"type":"reasoning","id":"reason","summary":[],"encrypted_content":"reasoning"},
+            {"type":"compaction","encrypted_content":"old"},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":""}]}
         ]))
         .unwrap();
         let history = build_compacted_history(
             &input,
             ResponsesInputItem::Compaction {
-                encrypted_content: "opaque".to_string(),
+                encrypted_content: "new".to_string(),
             },
         );
-        let ResponsesInputItem::Message { content, .. } = &history[0] else {
+
+        assert_eq!(history.len(), 2);
+        assert!(matches!(
+            &history[0],
+            ResponsesInputItem::Message { role, content }
+                if role == "user"
+                    && matches!(content.as_slice(), [ResponsesContentPart::InputText { text }] if text == "keep me")
+        ));
+        assert!(matches!(
+            history.last(),
+            Some(ResponsesInputItem::Compaction { encrypted_content }) if encrypted_content == "new"
+        ));
+    }
+
+    #[test]
+    fn retained_history_evicts_oldest_first_and_restores_chronology() {
+        let retained: Vec<ResponsesInputItem> = serde_json::from_value(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"old-old"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"middle1234"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"new"}]}
+        ]))
+        .unwrap();
+
+        let retained = truncate_retained_messages(retained, 3);
+        assert_eq!(retained.len(), 2);
+        let texts = retained
+            .iter()
+            .map(message_text)
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        assert_eq!(texts[0], "midd…1 tokens truncated…1234");
+        assert_eq!(texts[1], "new");
+    }
+
+    #[test]
+    fn retained_history_preserves_images_and_middle_truncates_later_text() {
+        let retained: Vec<ResponsesInputItem> = serde_json::from_value(json!([{
+            "type":"message",
+            "role":"user",
+            "content":[
+                {"type":"input_text","text":"abcdef"},
+                {"type":"input_image","image_url":"data:image/png;base64,abc"},
+                {"type":"output_text","text":"uvwxyz"}
+            ]
+        }]))
+        .unwrap();
+
+        let retained = truncate_retained_messages(retained, 3);
+        let ResponsesInputItem::Message { content, .. } = &retained[0] else {
             panic!("expected retained message");
         };
-        let ResponsesContentPart::InputText { text } = &content[0] else {
-            panic!("expected retained text");
-        };
-        assert!(text.len() <= RETAINED_MESSAGE_TOKEN_BUDGET as usize * 4);
+        assert!(matches!(
+            content.as_slice(),
+            [
+                ResponsesContentPart::InputText { text: first },
+                ResponsesContentPart::InputImage { image_url, .. },
+                ResponsesContentPart::OutputText { text: last },
+            ] if first == "abcdef"
+                && image_url == "data:image/png;base64,abc"
+                && last == "uv…1 tokens truncated…yz"
+        ));
+    }
+
+    #[test]
+    fn retained_history_middle_truncation_is_utf8_safe_and_keeps_both_ends() {
+        let text = format!("开始-{}-结尾", "界".repeat(100));
+        let input: Vec<ResponsesInputItem> = serde_json::from_value(json!([{
+            "type":"message","role":"user","content":[{"type":"input_text","text":text}]
+        }]))
+        .unwrap();
+        let retained = truncate_retained_messages(input, 8);
+        let text = message_text(&retained[0]).unwrap();
+
+        assert!(text.starts_with("开始-"));
+        assert!(text.ends_with("-结尾"));
+        assert!(text.contains("tokens truncated"));
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn retained_history_charges_image_only_messages_at_least_one_token() {
+        let retained: Vec<ResponsesInputItem> = serde_json::from_value(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"old"}]},
+            {"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,abc"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"new"}]}
+        ]))
+        .unwrap();
+
+        let retained = truncate_retained_messages(retained, 2);
+        assert_eq!(retained.len(), 2);
+        assert!(matches!(
+            &retained[0],
+            ResponsesInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [ResponsesContentPart::InputImage { .. }])
+        ));
+        assert_eq!(message_text(&retained[1]).as_deref(), Some("new"));
     }
 }

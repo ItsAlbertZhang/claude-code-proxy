@@ -5,12 +5,393 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use crate::{logging::create_logger, request_identity::ConversationIdentity};
+
 mod mock;
 
 pub use mock::{MockMonitor, mock_state};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
+const MAX_CODEX_OWNER_STATES: usize = 10_000;
+const CODEX_OWNER_STATE_TTL: Duration = Duration::from_secs(30 * 60);
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodexMetricsSnapshot {
+    pub previous_id_no_candidates: u64,
+    pub previous_id_hits: u64,
+    pub previous_id_fallbacks: u64,
+    pub route_baselines: u64,
+    pub route_reuses: u64,
+    pub route_switches: u64,
+    pub lane_switches: u64,
+    pub socket_baselines: u64,
+    pub socket_reuses: u64,
+    pub socket_switches: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexPreviousIdOutcome {
+    NoCandidate,
+    Hit,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexLane {
+    Lite,
+    Full,
+}
+
+impl CodexLane {
+    fn from_responses_lite(responses_lite: bool) -> Self {
+        if responses_lite {
+            Self::Lite
+        } else {
+            Self::Full
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Lite => "lite",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CodexRequestPreviousId {
+    #[default]
+    NotApplicable,
+    Pending,
+    NoCandidate,
+    Hit,
+    Fallback,
+    Unsettled,
+}
+
+impl CodexRequestPreviousId {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Pending => "pending",
+            Self::NoCandidate => "no_candidate",
+            Self::Hit => "hit",
+            Self::Fallback => "fallback",
+            Self::Unsettled => "unsettled",
+        }
+    }
+}
+
+impl From<CodexPreviousIdOutcome> for CodexRequestPreviousId {
+    fn from(outcome: CodexPreviousIdOutcome) -> Self {
+        match outcome {
+            CodexPreviousIdOutcome::NoCandidate => Self::NoCandidate,
+            CodexPreviousIdOutcome::Hit => Self::Hit,
+            CodexPreviousIdOutcome::Fallback => Self::Fallback,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexDispatchOutcome {
+    Baseline,
+    Reuse,
+    Switch,
+}
+
+impl CodexDispatchOutcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Reuse => "reuse",
+            Self::Switch => "switch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum CodexRecoveryCause {
+    MissingState,
+    SupersededTurn,
+    PromptChanged,
+    NotAppendOnly,
+    EmptyDelta,
+    RouteChanged,
+    CompactionReplay,
+    AuthRejection,
+    PreviousResponseMissing,
+    OriginSocketMissing,
+    SocketValidationFailed,
+    ResponseStartTimeout,
+    MissingTerminal,
+    EmptyCompletion,
+    RetryableUpstreamEvent,
+    TransportFailure,
+    Cancelled,
+}
+
+impl CodexRecoveryCause {
+    const ALL: [Self; 17] = [
+        Self::MissingState,
+        Self::SupersededTurn,
+        Self::PromptChanged,
+        Self::NotAppendOnly,
+        Self::EmptyDelta,
+        Self::RouteChanged,
+        Self::CompactionReplay,
+        Self::AuthRejection,
+        Self::PreviousResponseMissing,
+        Self::OriginSocketMissing,
+        Self::SocketValidationFailed,
+        Self::ResponseStartTimeout,
+        Self::MissingTerminal,
+        Self::EmptyCompletion,
+        Self::RetryableUpstreamEvent,
+        Self::TransportFailure,
+        Self::Cancelled,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::MissingState => "missing_state",
+            Self::SupersededTurn => "superseded_turn",
+            Self::PromptChanged => "prompt_changed",
+            Self::NotAppendOnly => "not_append_only",
+            Self::EmptyDelta => "empty_delta",
+            Self::RouteChanged => "route_changed",
+            Self::CompactionReplay => "compaction_replay",
+            Self::AuthRejection => "auth_rejection",
+            Self::PreviousResponseMissing => "previous_response_missing",
+            Self::OriginSocketMissing => "origin_socket_missing",
+            Self::SocketValidationFailed => "socket_validation_failed",
+            Self::ResponseStartTimeout => "response_start_timeout",
+            Self::MissingTerminal => "missing_terminal",
+            Self::EmptyCompletion => "empty_completion",
+            Self::RetryableUpstreamEvent => "retryable_upstream_event",
+            Self::TransportFailure => "transport_failure",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexAppendOnlyOutcome {
+    Appended,
+    NoDelta,
+    RetainedLonger,
+    FirstMismatch,
+}
+
+impl CodexAppendOnlyOutcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Appended => "appended",
+            Self::NoDelta => "no_delta",
+            Self::RetainedLonger => "retained_longer",
+            Self::FirstMismatch => "first_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexAppendOnlyDiagnostics {
+    pub(crate) outcome: CodexAppendOnlyOutcome,
+    pub(crate) incoming_items: u32,
+    pub(crate) retained_items: u32,
+    pub(crate) delta_items: u32,
+    pub(crate) first_mismatch_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexPoolResolution {
+    PoolingDisabled,
+    NoEntry,
+    ReusableEntry,
+    ExactOriginMatched,
+    ExactOriginUnavailable,
+    ExactOriginMismatch,
+}
+
+impl CodexPoolResolution {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PoolingDisabled => "pooling_disabled",
+            Self::NoEntry => "no_entry",
+            Self::ReusableEntry => "reusable_entry",
+            Self::ExactOriginMatched => "exact_origin_matched",
+            Self::ExactOriginUnavailable => "exact_origin_unavailable",
+            Self::ExactOriginMismatch => "exact_origin_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CodexPoolDiagnostics {
+    pub(crate) latest: Option<CodexPoolResolution>,
+    pub(crate) lookups: u16,
+    pub(crate) hits: u16,
+    pub(crate) misses: u16,
+    pub(crate) exact_matches: u16,
+    pub(crate) exact_unavailable: u16,
+    pub(crate) exact_mismatches: u16,
+}
+
+impl CodexPoolDiagnostics {
+    fn record(&mut self, resolution: CodexPoolResolution) {
+        self.latest = Some(resolution);
+        self.lookups = self.lookups.saturating_add(1);
+        match resolution {
+            CodexPoolResolution::PoolingDisabled => {}
+            CodexPoolResolution::NoEntry => self.misses = self.misses.saturating_add(1),
+            CodexPoolResolution::ReusableEntry => self.hits = self.hits.saturating_add(1),
+            CodexPoolResolution::ExactOriginMatched => {
+                self.hits = self.hits.saturating_add(1);
+                self.exact_matches = self.exact_matches.saturating_add(1);
+            }
+            CodexPoolResolution::ExactOriginUnavailable => {
+                self.misses = self.misses.saturating_add(1);
+                self.exact_unavailable = self.exact_unavailable.saturating_add(1);
+            }
+            CodexPoolResolution::ExactOriginMismatch => {
+                self.misses = self.misses.saturating_add(1);
+                self.exact_mismatches = self.exact_mismatches.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexSocketValidationFailure {
+    PingSend,
+    PongReplySend,
+    Timeout,
+    UnexpectedPong,
+    UnexpectedText,
+    UnexpectedBinary,
+    UnexpectedClose,
+    UnexpectedRawFrame,
+    TransportRead,
+    ConnectionClosed,
+}
+
+impl CodexSocketValidationFailure {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PingSend => "ping_send",
+            Self::PongReplySend => "pong_reply_send",
+            Self::Timeout => "timeout",
+            Self::UnexpectedPong => "unexpected_pong",
+            Self::UnexpectedText => "unexpected_text",
+            Self::UnexpectedBinary => "unexpected_binary",
+            Self::UnexpectedClose => "unexpected_close",
+            Self::UnexpectedRawFrame => "unexpected_raw_frame",
+            Self::TransportRead => "transport_read",
+            Self::ConnectionClosed => "connection_closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CodexSocketValidationDiagnostics {
+    pub(crate) attempts: u16,
+    pub(crate) successes: u16,
+    pub(crate) failures: u16,
+    pub(crate) latest_failure: Option<CodexSocketValidationFailure>,
+    pub(crate) latest_elapsed_ms: u32,
+    pub(crate) latest_required_origin: bool,
+}
+
+impl CodexSocketValidationDiagnostics {
+    fn record(
+        &mut self,
+        failure: Option<CodexSocketValidationFailure>,
+        elapsed_ms: u32,
+        required_origin: bool,
+    ) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.latest_failure = failure;
+        self.latest_elapsed_ms = elapsed_ms;
+        self.latest_required_origin = required_origin;
+        if failure.is_some() {
+            self.failures = self.failures.saturating_add(1);
+        } else {
+            self.successes = self.successes.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CodexCauseSet(u32);
+
+impl CodexCauseSet {
+    pub(crate) fn insert(&mut self, cause: CodexRecoveryCause) {
+        self.0 |= 1_u32 << cause as u8;
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = CodexRecoveryCause> {
+        CodexRecoveryCause::ALL
+            .into_iter()
+            .filter(move |cause| self.0 & (1_u32 << *cause as u8) != 0)
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CodexRecoveryDiagnostics {
+    pub(crate) previous_id_cause: Option<CodexRecoveryCause>,
+    pub(crate) socket_causes: CodexCauseSet,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CodexDispatchSummary {
+    pub(crate) first: Option<CodexDispatchOutcome>,
+    pub(crate) latest: Option<CodexDispatchOutcome>,
+    pub(crate) dispatches: u16,
+    pub(crate) baselines: u16,
+    pub(crate) reuses: u16,
+    pub(crate) switches: u16,
+}
+
+impl CodexDispatchSummary {
+    fn record(&mut self, outcome: CodexDispatchOutcome) {
+        self.first.get_or_insert(outcome);
+        self.latest = Some(outcome);
+        self.dispatches = self.dispatches.saturating_add(1);
+        let counter = match outcome {
+            CodexDispatchOutcome::Baseline => &mut self.baselines,
+            CodexDispatchOutcome::Reuse => &mut self.reuses,
+            CodexDispatchOutcome::Switch => &mut self.switches,
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CodexRequestDiagnostics {
+    pub(crate) lane: Option<CodexLane>,
+    pub(crate) previous_id: CodexRequestPreviousId,
+    pub(crate) recovery: CodexRecoveryDiagnostics,
+    pub(crate) append_only: Option<CodexAppendOnlyDiagnostics>,
+    pub(crate) pool: CodexPoolDiagnostics,
+    pub(crate) validation: CodexSocketValidationDiagnostics,
+    pub(crate) route: CodexDispatchSummary,
+    pub(crate) socket: CodexDispatchSummary,
+    pub(crate) event_sequence: u16,
+}
+
+impl CodexRequestDiagnostics {
+    fn finish(&mut self) {
+        if self.previous_id == CodexRequestPreviousId::Pending {
+            self.previous_id = CodexRequestPreviousId::Unsettled;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointKind {
@@ -152,11 +533,16 @@ pub struct ActiveRequest {
     pub output_tokens: Option<u64>,
     pub error: Option<String>,
     pub traffic_capture_path: Option<PathBuf>,
+    codex: Option<CodexRequestDiagnostics>,
 }
 
 impl ActiveRequest {
     pub fn elapsed(&self) -> Duration {
         self.started_instant.elapsed()
+    }
+
+    pub(crate) fn codex_diagnostics(&self) -> Option<&CodexRequestDiagnostics> {
+        self.codex.as_ref()
     }
 
     pub fn rate(&self) -> Throughput {
@@ -196,9 +582,14 @@ pub struct CompletedRequest {
     pub output_tokens: Option<u64>,
     pub error: Option<String>,
     pub traffic_capture_path: Option<PathBuf>,
+    codex: Option<CodexRequestDiagnostics>,
 }
 
 impl CompletedRequest {
+    pub(crate) fn codex_diagnostics(&self) -> Option<&CodexRequestDiagnostics> {
+        self.codex.as_ref()
+    }
+
     pub fn rate(&self) -> Throughput {
         throughput(
             self.output_tokens
@@ -238,6 +629,7 @@ pub struct MonitorState {
     pub sessions: Vec<SessionSummary>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
+    pub codex: CodexMetricsSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -283,7 +675,22 @@ struct MonitorStore {
     recent: VecDeque<CompletedRequest>,
     session_usage: HashMap<Option<String>, SessionUsage>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
+    codex: CodexMetricsStore,
     recent_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastCodexOwnerDispatch {
+    route_identity: [u8; 32],
+    responses_lite: bool,
+    socket_id: u64,
+    updated_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct CodexMetricsStore {
+    totals: CodexMetricsSnapshot,
+    owner_dispatches: HashMap<ConversationIdentity, LastCodexOwnerDispatch>,
 }
 
 #[derive(Debug, Default)]
@@ -295,16 +702,174 @@ struct SessionUsage {
 #[derive(Debug, Clone)]
 pub struct MonitorHandle {
     store: Arc<Mutex<MonitorStore>>,
+    diagnostic_logging: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CodexUpdateSnapshot {
+    diagnostics: CodexRequestDiagnostics,
+    completed: Option<CompletedRequest>,
+    changed: bool,
+}
+
+fn codex_dispatch_json(summary: CodexDispatchSummary) -> serde_json::Value {
+    serde_json::json!({
+        "first": summary.first.map(CodexDispatchOutcome::label),
+        "latest": summary.latest.map(CodexDispatchOutcome::label),
+        "dispatches": summary.dispatches,
+        "baselines": summary.baselines,
+        "reuses": summary.reuses,
+        "switches": summary.switches,
+    })
+}
+
+fn codex_diagnostics_json(diagnostics: CodexRequestDiagnostics) -> serde_json::Value {
+    let append_only = diagnostics.append_only.map(|append| {
+        serde_json::json!({
+            "outcome": append.outcome.label(),
+            "incomingItems": append.incoming_items,
+            "retainedItems": append.retained_items,
+            "deltaItems": append.delta_items,
+            "firstMismatchIndex": append.first_mismatch_index,
+        })
+    });
+    serde_json::json!({
+        "eventSequence": diagnostics.event_sequence,
+        "lane": diagnostics.lane.map(CodexLane::label),
+        "previousId": diagnostics.previous_id.label(),
+        "previousIdCause": diagnostics.recovery.previous_id_cause.map(CodexRecoveryCause::label),
+        "socketCauses": diagnostics.recovery.socket_causes
+            .iter()
+            .map(CodexRecoveryCause::label)
+            .collect::<Vec<_>>(),
+        "appendOnly": append_only,
+        "pool": {
+            "latest": diagnostics.pool.latest.map(CodexPoolResolution::label),
+            "lookups": diagnostics.pool.lookups,
+            "hits": diagnostics.pool.hits,
+            "misses": diagnostics.pool.misses,
+            "exactMatches": diagnostics.pool.exact_matches,
+            "exactUnavailable": diagnostics.pool.exact_unavailable,
+            "exactMismatches": diagnostics.pool.exact_mismatches,
+        },
+        "validation": {
+            "attempts": diagnostics.validation.attempts,
+            "successes": diagnostics.validation.successes,
+            "failures": diagnostics.validation.failures,
+            "latestFailure": diagnostics.validation.latest_failure.map(CodexSocketValidationFailure::label),
+            "latestElapsedMs": diagnostics.validation.latest_elapsed_ms,
+            "latestRequiredOrigin": diagnostics.validation.latest_required_origin,
+        },
+        "route": codex_dispatch_json(diagnostics.route),
+        "socket": codex_dispatch_json(diagnostics.socket),
+    })
+}
+
+fn codex_event_fields(
+    request_id: &str,
+    diagnostics: CodexRequestDiagnostics,
+    state_changed: bool,
+    mut fields: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    fields.insert("schemaVersion".into(), serde_json::json!(1));
+    fields.insert("reqId".into(), serde_json::json!(request_id));
+    fields.insert(
+        "eventSequence".into(),
+        serde_json::json!(diagnostics.event_sequence),
+    );
+    fields.insert("stateChanged".into(), serde_json::json!(state_changed));
+    fields
+}
+
+fn log_codex_event(
+    enabled: bool,
+    request_id: &str,
+    message: &str,
+    diagnostics: CodexRequestDiagnostics,
+    state_changed: bool,
+    fields: serde_json::Map<String, serde_json::Value>,
+) {
+    if !enabled {
+        return;
+    }
+    create_logger("codex").info(
+        message,
+        Some(codex_event_fields(
+            request_id,
+            diagnostics,
+            state_changed,
+            fields,
+        )),
+    );
+}
+
+fn codex_request_snapshot_fields(
+    request: &CompletedRequest,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if request.provider.as_deref() != Some("codex") {
+        return None;
+    }
+    let diagnostics = request.codex?;
+    let mut fields = serde_json::Map::new();
+    fields.insert("schemaVersion".into(), serde_json::json!(1));
+    fields.insert("reqId".into(), serde_json::json!(request.request_id));
+    fields.insert(
+        "endpoint".into(),
+        serde_json::json!(request.endpoint.label()),
+    );
+    fields.insert("outcome".into(), serde_json::json!(request.status.label()));
+    fields.insert("httpStatus".into(), serde_json::json!(request.http_status));
+    fields.insert(
+        "latencyMs".into(),
+        serde_json::json!(request.latency.as_millis().min(u128::from(u64::MAX)) as u64),
+    );
+    fields.insert(
+        "streamedBytes".into(),
+        serde_json::json!(request.streamed_bytes),
+    );
+    fields.insert(
+        "streamChunks".into(),
+        serde_json::json!(request.stream_chunks),
+    );
+    fields.insert(
+        "inputTokens".into(),
+        serde_json::json!(request.input_tokens),
+    );
+    fields.insert(
+        "outputTokens".into(),
+        serde_json::json!(request.output_tokens),
+    );
+    fields.insert("diagnostics".into(), codex_diagnostics_json(diagnostics));
+    Some(fields)
+}
+
+fn log_codex_request_snapshot(request: &CompletedRequest, message: &str) {
+    if let Some(fields) = codex_request_snapshot_fields(request) {
+        create_logger("codex").info(message, Some(fields));
+    }
+}
+
+fn log_codex_update_snapshot(enabled: bool, update: &CodexUpdateSnapshot) {
+    if enabled
+        && update.changed
+        && let Some(completed) = update.completed.as_ref()
+    {
+        log_codex_request_snapshot(completed, "codex_request_diagnostic_update");
+    }
 }
 
 impl Default for MonitorHandle {
     fn default() -> Self {
-        Self::new(DEFAULT_RECENT_LIMIT)
+        Self::with_diagnostic_logging(DEFAULT_RECENT_LIMIT, cfg!(not(test)))
     }
 }
 
 impl MonitorHandle {
     pub fn new(recent_limit: usize) -> Self {
+        Self::with_diagnostic_logging(recent_limit, false)
+    }
+
+    fn with_diagnostic_logging(recent_limit: usize, diagnostic_logging: bool) -> Self {
         Self {
             store: Arc::new(Mutex::new(MonitorStore {
                 started_at: SystemTime::now(),
@@ -312,14 +877,22 @@ impl MonitorHandle {
                 recent: VecDeque::new(),
                 session_usage: HashMap::new(),
                 session_output_buckets: HashMap::new(),
+                codex: CodexMetricsStore::default(),
                 recent_limit,
             })),
+            diagnostic_logging,
         }
     }
 
     pub fn publish(&self, event: MonitorEvent) {
-        if let Ok(mut store) = self.store.lock() {
-            store.apply(event);
+        let completed = match self.store.lock() {
+            Ok(mut store) => store.apply(event),
+            Err(_) => None,
+        };
+        if self.diagnostic_logging
+            && let Some(completed) = completed.as_ref()
+        {
+            log_codex_request_snapshot(completed, "codex_request_diagnostic_summary");
         }
     }
 
@@ -331,6 +904,7 @@ impl MonitorHandle {
                 sessions: Vec::new(),
                 active: Vec::new(),
                 recent: Vec::new(),
+                codex: CodexMetricsSnapshot::default(),
             },
         }
     }
@@ -469,6 +1043,278 @@ impl MonitorHandle {
         });
     }
 
+    pub(crate) fn codex_request_lane(&self, request_id: &str, responses_lite: bool) {
+        let lane = CodexLane::from_responses_lite(responses_lite);
+        let update = match self.store.lock() {
+            Ok(mut store) => store.update_codex_request(request_id, |diagnostics| {
+                diagnostics.lane = Some(lane);
+            }),
+            Err(_) => None,
+        };
+        if let Some(update) = update {
+            let mut fields = serde_json::Map::new();
+            fields.insert("lane".into(), serde_json::json!(lane.label()));
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_request_lane",
+                update.diagnostics,
+                update.changed,
+                fields,
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
+    }
+
+    pub(crate) fn codex_previous_id_pending(&self, request_id: &str) {
+        let update = match self.store.lock() {
+            Ok(mut store) => store.update_codex_request(request_id, |diagnostics| {
+                diagnostics.previous_id = CodexRequestPreviousId::Pending;
+            }),
+            Err(_) => None,
+        };
+        if let Some(update) = update {
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_previous_id_pending",
+                update.diagnostics,
+                update.changed,
+                serde_json::Map::new(),
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
+    }
+
+    pub(crate) fn codex_previous_id_settled(
+        &self,
+        request_id: &str,
+        outcome: CodexPreviousIdOutcome,
+    ) {
+        let previous_id = CodexRequestPreviousId::from(outcome);
+        let update = match self.store.lock() {
+            Ok(mut store) => {
+                store.codex.record_previous_id(outcome);
+                store.update_codex_request(request_id, |diagnostics| {
+                    diagnostics.previous_id = previous_id;
+                })
+            }
+            Err(_) => None,
+        };
+        if let Some(update) = update {
+            let mut fields = serde_json::Map::new();
+            fields.insert("outcome".into(), serde_json::json!(previous_id.label()));
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_previous_id_settled",
+                update.diagnostics,
+                update.changed,
+                fields,
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
+    }
+
+    pub(crate) fn codex_previous_id_cause(&self, request_id: &str, cause: CodexRecoveryCause) {
+        let update = match self.store.lock() {
+            Ok(mut store) => store.update_codex_request(request_id, |diagnostics| {
+                diagnostics.recovery.previous_id_cause.get_or_insert(cause);
+            }),
+            Err(_) => None,
+        };
+        if let Some(update) = update {
+            let mut fields = serde_json::Map::new();
+            fields.insert("cause".into(), serde_json::json!(cause.label()));
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_previous_id_cause",
+                update.diagnostics,
+                update.changed,
+                fields,
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
+    }
+
+    pub(crate) fn codex_socket_cause(&self, request_id: &str, cause: CodexRecoveryCause) {
+        let update = match self.store.lock() {
+            Ok(mut store) => store.update_codex_request(request_id, |diagnostics| {
+                diagnostics.recovery.socket_causes.insert(cause);
+            }),
+            Err(_) => None,
+        };
+        if let Some(update) = update {
+            let mut fields = serde_json::Map::new();
+            fields.insert("cause".into(), serde_json::json!(cause.label()));
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_socket_recovery",
+                update.diagnostics,
+                update.changed,
+                fields,
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
+    }
+
+    pub(crate) fn codex_append_only(
+        &self,
+        request_id: &str,
+        append_only: CodexAppendOnlyDiagnostics,
+    ) {
+        let update = match self.store.lock() {
+            Ok(mut store) => store.update_codex_request(request_id, |diagnostics| {
+                diagnostics.append_only = Some(append_only);
+            }),
+            Err(_) => None,
+        };
+        if let Some(update) = update {
+            let mut fields = serde_json::Map::new();
+            fields.insert(
+                "outcome".into(),
+                serde_json::json!(append_only.outcome.label()),
+            );
+            fields.insert(
+                "incomingItems".into(),
+                serde_json::json!(append_only.incoming_items),
+            );
+            fields.insert(
+                "retainedItems".into(),
+                serde_json::json!(append_only.retained_items),
+            );
+            fields.insert(
+                "deltaItems".into(),
+                serde_json::json!(append_only.delta_items),
+            );
+            fields.insert(
+                "firstMismatchIndex".into(),
+                serde_json::json!(append_only.first_mismatch_index),
+            );
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_append_only_comparison",
+                update.diagnostics,
+                update.changed,
+                fields,
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
+    }
+
+    pub(crate) fn codex_pool_resolution(&self, request_id: &str, resolution: CodexPoolResolution) {
+        let update = match self.store.lock() {
+            Ok(mut store) => store.update_codex_request(request_id, |diagnostics| {
+                diagnostics.pool.record(resolution);
+            }),
+            Err(_) => None,
+        };
+        if let Some(update) = update {
+            let mut fields = serde_json::Map::new();
+            fields.insert("resolution".into(), serde_json::json!(resolution.label()));
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_pool_resolution",
+                update.diagnostics,
+                update.changed,
+                fields,
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
+    }
+
+    pub(crate) fn codex_socket_validation(
+        &self,
+        request_id: &str,
+        failure: Option<CodexSocketValidationFailure>,
+        elapsed_ms: u32,
+        required_origin: bool,
+    ) {
+        let update = match self.store.lock() {
+            Ok(mut store) => store.update_codex_request(request_id, |diagnostics| {
+                diagnostics
+                    .validation
+                    .record(failure, elapsed_ms, required_origin);
+            }),
+            Err(_) => None,
+        };
+        if let Some(update) = update {
+            let mut fields = serde_json::Map::new();
+            fields.insert(
+                "outcome".into(),
+                serde_json::json!(if failure.is_some() {
+                    "failed"
+                } else {
+                    "passed"
+                }),
+            );
+            fields.insert(
+                "failure".into(),
+                serde_json::json!(failure.map(CodexSocketValidationFailure::label)),
+            );
+            fields.insert("elapsedMs".into(), serde_json::json!(elapsed_ms));
+            fields.insert("requiredOrigin".into(), serde_json::json!(required_origin));
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_socket_validation",
+                update.diagnostics,
+                update.changed,
+                fields,
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
+    }
+
+    pub(crate) fn codex_websocket_dispatch(
+        &self,
+        request_id: &str,
+        owner: ConversationIdentity,
+        route_identity: [u8; 32],
+        responses_lite: bool,
+        socket_id: u64,
+    ) {
+        let update_and_outcomes = match self.store.lock() {
+            Ok(mut store) => {
+                let (route, socket) = store.codex.record_owner_dispatch(
+                    owner,
+                    route_identity,
+                    responses_lite,
+                    socket_id,
+                );
+                let update = store.update_codex_request(request_id, |diagnostics| {
+                    diagnostics.lane = Some(CodexLane::from_responses_lite(responses_lite));
+                    diagnostics.route.record(route);
+                    diagnostics.socket.record(socket);
+                });
+                update.map(|update| (update, route, socket))
+            }
+            Err(_) => None,
+        };
+        if let Some((update, route, socket)) = update_and_outcomes {
+            let mut fields = serde_json::Map::new();
+            fields.insert("route".into(), serde_json::json!(route.label()));
+            fields.insert("socket".into(), serde_json::json!(socket.label()));
+            fields.insert(
+                "dispatch".into(),
+                serde_json::json!(update.diagnostics.route.dispatches),
+            );
+            log_codex_event(
+                self.diagnostic_logging,
+                request_id,
+                "codex_websocket_dispatch",
+                update.diagnostics,
+                update.changed,
+                fields,
+            );
+            log_codex_update_snapshot(self.diagnostic_logging, &update);
+        }
+    }
+
     pub fn request_abandoned(&self, request_id: impl Into<String>, error: impl Into<String>) {
         self.publish(MonitorEvent::RequestAbandoned {
             request_id: request_id.into(),
@@ -477,8 +1323,114 @@ impl MonitorHandle {
     }
 }
 
+impl CodexMetricsStore {
+    fn record_previous_id(&mut self, outcome: CodexPreviousIdOutcome) {
+        let counter = match outcome {
+            CodexPreviousIdOutcome::NoCandidate => &mut self.totals.previous_id_no_candidates,
+            CodexPreviousIdOutcome::Hit => &mut self.totals.previous_id_hits,
+            CodexPreviousIdOutcome::Fallback => &mut self.totals.previous_id_fallbacks,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    fn record_owner_dispatch(
+        &mut self,
+        owner: ConversationIdentity,
+        route_identity: [u8; 32],
+        responses_lite: bool,
+        socket_id: u64,
+    ) -> (CodexDispatchOutcome, CodexDispatchOutcome) {
+        let now = Instant::now();
+        let current = LastCodexOwnerDispatch {
+            route_identity,
+            responses_lite,
+            socket_id,
+            updated_at: now,
+        };
+        let previous = self
+            .owner_dispatches
+            .remove(&owner)
+            .filter(|previous| now.duration_since(previous.updated_at) <= CODEX_OWNER_STATE_TTL);
+        self.owner_dispatches.insert(owner, current);
+
+        let (route_outcome, socket_outcome) = if let Some(previous) = previous {
+            let route_outcome = if previous.route_identity == route_identity {
+                self.totals.route_reuses = self.totals.route_reuses.saturating_add(1);
+                CodexDispatchOutcome::Reuse
+            } else {
+                self.totals.route_switches = self.totals.route_switches.saturating_add(1);
+                if previous.responses_lite != responses_lite {
+                    self.totals.lane_switches = self.totals.lane_switches.saturating_add(1);
+                }
+                CodexDispatchOutcome::Switch
+            };
+            let socket_outcome = if previous.socket_id == socket_id {
+                self.totals.socket_reuses = self.totals.socket_reuses.saturating_add(1);
+                CodexDispatchOutcome::Reuse
+            } else {
+                self.totals.socket_switches = self.totals.socket_switches.saturating_add(1);
+                CodexDispatchOutcome::Switch
+            };
+            (route_outcome, socket_outcome)
+        } else {
+            self.totals.route_baselines = self.totals.route_baselines.saturating_add(1);
+            self.totals.socket_baselines = self.totals.socket_baselines.saturating_add(1);
+            (
+                CodexDispatchOutcome::Baseline,
+                CodexDispatchOutcome::Baseline,
+            )
+        };
+
+        while self.owner_dispatches.len() > MAX_CODEX_OWNER_STATES {
+            let oldest = self
+                .owner_dispatches
+                .iter()
+                .min_by_key(|(_, dispatch)| dispatch.updated_at)
+                .map(|(owner, _)| owner.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            self.owner_dispatches.remove(&oldest);
+        }
+        (route_outcome, socket_outcome)
+    }
+}
+
 impl MonitorStore {
-    fn apply(&mut self, event: MonitorEvent) {
+    fn update_codex_request(
+        &mut self,
+        request_id: &str,
+        update: impl FnOnce(&mut CodexRequestDiagnostics),
+    ) -> Option<CodexUpdateSnapshot> {
+        if let Some(active) = self.active.get_mut(request_id) {
+            let diagnostics = active.codex.get_or_insert_default();
+            let before = *diagnostics;
+            update(diagnostics);
+            let changed = *diagnostics != before;
+            diagnostics.event_sequence = diagnostics.event_sequence.saturating_add(1);
+            return Some(CodexUpdateSnapshot {
+                diagnostics: *diagnostics,
+                completed: None,
+                changed,
+            });
+        }
+        let completed = self
+            .recent
+            .iter_mut()
+            .find(|request| request.request_id == request_id)?;
+        let diagnostics = completed.codex.get_or_insert_default();
+        let before = *diagnostics;
+        update(diagnostics);
+        let changed = *diagnostics != before;
+        diagnostics.event_sequence = diagnostics.event_sequence.saturating_add(1);
+        Some(CodexUpdateSnapshot {
+            diagnostics: *diagnostics,
+            completed: Some(completed.clone()),
+            changed,
+        })
+    }
+
+    fn apply(&mut self, event: MonitorEvent) -> Option<CompletedRequest> {
         match event {
             MonitorEvent::RequestStarted {
                 request_id,
@@ -511,6 +1463,7 @@ impl MonitorStore {
                         output_tokens: None,
                         error: None,
                         traffic_capture_path: None,
+                        codex: None,
                     },
                 );
             }
@@ -690,7 +1643,7 @@ impl MonitorStore {
                 input_tokens,
                 output_tokens,
             } => {
-                self.finish(
+                return self.finish(
                     &request_id,
                     RequestStatus::Completed,
                     Some(http_status),
@@ -704,7 +1657,7 @@ impl MonitorStore {
                 http_status,
                 error,
             } => {
-                self.finish(
+                return self.finish(
                     &request_id,
                     RequestStatus::Failed,
                     http_status,
@@ -714,7 +1667,7 @@ impl MonitorStore {
                 );
             }
             MonitorEvent::RequestAbandoned { request_id, error } => {
-                self.finish_active(
+                return self.finish_active(
                     &request_id,
                     RequestStatus::Failed,
                     None,
@@ -724,6 +1677,7 @@ impl MonitorStore {
                 );
             }
         }
+        None
     }
 
     fn finish_active(
@@ -734,9 +1688,9 @@ impl MonitorStore {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         error: Option<String>,
-    ) {
+    ) -> Option<CompletedRequest> {
         if self.active.contains_key(request_id) {
-            self.finish(
+            return self.finish(
                 request_id,
                 status,
                 http_status,
@@ -745,6 +1699,7 @@ impl MonitorStore {
                 error,
             );
         }
+        None
     }
 
     fn finish(
@@ -755,7 +1710,7 @@ impl MonitorStore {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         error: Option<String>,
-    ) {
+    ) -> Option<CompletedRequest> {
         let mut active = self
             .active
             .remove(request_id)
@@ -782,7 +1737,11 @@ impl MonitorStore {
                 output_tokens: None,
                 error: None,
                 traffic_capture_path: None,
+                codex: None,
             });
+        if let Some(diagnostics) = active.codex.as_mut() {
+            diagnostics.finish();
+        }
         if output_tokens.is_some()
             && let Some(started) = active.generation_started_instant
         {
@@ -817,6 +1776,7 @@ impl MonitorStore {
             output_tokens: active.output_tokens,
             error: error.or(active.error),
             traffic_capture_path: active.traffic_capture_path,
+            codex: active.codex,
         };
         if let Some(tokens) = completed.output_tokens.filter(|tokens| *tokens > 0) {
             self.record_session_output(
@@ -827,10 +1787,11 @@ impl MonitorStore {
                 tokens,
             );
         }
-        self.recent.push_front(completed);
+        self.recent.push_front(completed.clone());
         while self.recent.len() > self.recent_limit {
             self.recent.pop_back();
         }
+        Some(completed)
     }
 
     fn record_session_usage(
@@ -872,6 +1833,7 @@ impl MonitorStore {
             sessions,
             active,
             recent: self.recent.iter().cloned().collect(),
+            codex: self.codex.totals,
         }
     }
 }
@@ -1073,6 +2035,337 @@ pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_metrics_count_previous_id_outcomes_and_owner_transitions() {
+        let monitor = MonitorHandle::new(10);
+        monitor.codex_previous_id_settled("prev-none", CodexPreviousIdOutcome::NoCandidate);
+        monitor.codex_previous_id_settled("prev-hit", CodexPreviousIdOutcome::Hit);
+        monitor.codex_previous_id_settled("prev-fallback", CodexPreviousIdOutcome::Fallback);
+
+        let main = ConversationIdentity::Main("session-a".into());
+        let agent = ConversationIdentity::Agent("session-a".into(), "agent-a".into());
+        let sibling = ConversationIdentity::Agent("session-a".into(), "agent-b".into());
+        let same_agent_other_session =
+            ConversationIdentity::Agent("session-b".into(), "agent-a".into());
+        let route_a = [1; 32];
+        let route_b = [2; 32];
+        let route_c = [3; 32];
+
+        monitor.codex_websocket_dispatch("main-a", main.clone(), route_a, true, 11);
+        monitor.codex_websocket_dispatch("agent-a", agent.clone(), route_a, true, 21);
+        monitor.codex_websocket_dispatch("sibling-a", sibling.clone(), route_a, true, 31);
+        monitor.codex_websocket_dispatch(
+            "other-a",
+            same_agent_other_session.clone(),
+            route_a,
+            true,
+            41,
+        );
+        assert_eq!(
+            monitor.snapshot().codex,
+            CodexMetricsSnapshot {
+                previous_id_no_candidates: 1,
+                previous_id_hits: 1,
+                previous_id_fallbacks: 1,
+                route_baselines: 4,
+                socket_baselines: 4,
+                ..CodexMetricsSnapshot::default()
+            }
+        );
+
+        monitor.codex_websocket_dispatch("main-b", main, route_a, true, 11);
+        monitor.codex_websocket_dispatch("agent-b", agent, route_a, true, 22);
+        monitor.codex_websocket_dispatch("sibling-b", sibling, route_b, true, 31);
+        monitor.codex_websocket_dispatch("other-b", same_agent_other_session, route_c, false, 42);
+
+        assert_eq!(
+            monitor.snapshot().codex,
+            CodexMetricsSnapshot {
+                previous_id_no_candidates: 1,
+                previous_id_hits: 1,
+                previous_id_fallbacks: 1,
+                route_baselines: 4,
+                route_reuses: 2,
+                route_switches: 2,
+                lane_switches: 1,
+                socket_baselines: 4,
+                socket_reuses: 2,
+                socket_switches: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn codex_metrics_rebuild_baselines_after_owner_state_expires() {
+        let monitor = MonitorHandle::new(10);
+        let main = ConversationIdentity::Main("session-a".into());
+        let agent = ConversationIdentity::Agent("session-a".into(), "agent-a".into());
+        let route_a = [1; 32];
+        let route_b = [2; 32];
+
+        monitor.codex_websocket_dispatch("main-a", main.clone(), route_a, true, 11);
+        monitor.codex_websocket_dispatch("agent-a", agent.clone(), route_a, true, 21);
+        {
+            let mut store = monitor.store.lock().unwrap();
+            store
+                .codex
+                .owner_dispatches
+                .get_mut(&main)
+                .unwrap()
+                .updated_at = Instant::now() - CODEX_OWNER_STATE_TTL - Duration::from_secs(1);
+        }
+        monitor.codex_websocket_dispatch("main-b", main, route_b, false, 12);
+        monitor.codex_websocket_dispatch("agent-b", agent.clone(), route_a, true, 21);
+        {
+            let mut store = monitor.store.lock().unwrap();
+            store
+                .codex
+                .owner_dispatches
+                .get_mut(&agent)
+                .unwrap()
+                .updated_at = Instant::now() - CODEX_OWNER_STATE_TTL - Duration::from_secs(1);
+        }
+        monitor.codex_websocket_dispatch("agent-c", agent, route_b, false, 22);
+
+        assert_eq!(
+            monitor.snapshot().codex,
+            CodexMetricsSnapshot {
+                route_baselines: 4,
+                route_reuses: 1,
+                socket_baselines: 4,
+                socket_reuses: 1,
+                ..CodexMetricsSnapshot::default()
+            }
+        );
+    }
+
+    #[test]
+    fn codex_request_diagnostics_follow_request_across_retries_and_completion() {
+        let monitor = MonitorHandle::new(10);
+        let owner = ConversationIdentity::Main("session-a".into());
+        let route_a = [1; 32];
+        let route_b = [2; 32];
+
+        monitor.request_started(
+            "r-codex",
+            Some("session-a".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.codex_request_lane("r-codex", true);
+        monitor.codex_previous_id_pending("r-codex");
+        monitor.codex_websocket_dispatch("r-codex", owner.clone(), route_a, true, 11);
+        monitor.codex_websocket_dispatch("r-codex", owner.clone(), route_a, true, 11);
+        monitor.codex_websocket_dispatch("r-codex", owner, route_b, false, 12);
+
+        let state = monitor.snapshot();
+        let diagnostics = state.active[0].codex_diagnostics().unwrap();
+        assert_eq!(diagnostics.lane, Some(CodexLane::Full));
+        assert_eq!(diagnostics.previous_id, CodexRequestPreviousId::Pending);
+        assert_eq!(
+            diagnostics.route,
+            CodexDispatchSummary {
+                first: Some(CodexDispatchOutcome::Baseline),
+                latest: Some(CodexDispatchOutcome::Switch),
+                dispatches: 3,
+                baselines: 1,
+                reuses: 1,
+                switches: 1,
+            }
+        );
+        assert_eq!(diagnostics.socket, diagnostics.route);
+
+        monitor.request_completed("r-codex", 200, None, None);
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(
+            state.recent[0].codex_diagnostics().unwrap().previous_id,
+            CodexRequestPreviousId::Unsettled
+        );
+
+        monitor.codex_previous_id_settled("r-codex", CodexPreviousIdOutcome::Hit);
+        assert_eq!(
+            monitor.snapshot().recent[0]
+                .codex_diagnostics()
+                .unwrap()
+                .previous_id,
+            CodexRequestPreviousId::Hit
+        );
+    }
+
+    #[test]
+    fn codex_recovery_causes_are_first_wins_deduped_and_late_safe() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r-recovery", None, None, EndpointKind::Messages);
+        monitor.codex_previous_id_cause("r-recovery", CodexRecoveryCause::PromptChanged);
+        monitor.codex_previous_id_cause("r-recovery", CodexRecoveryCause::AuthRejection);
+        monitor.codex_socket_cause("r-recovery", CodexRecoveryCause::TransportFailure);
+        monitor.codex_socket_cause("r-recovery", CodexRecoveryCause::OriginSocketMissing);
+        monitor.codex_socket_cause("r-recovery", CodexRecoveryCause::TransportFailure);
+
+        let active = monitor.snapshot();
+        let diagnostics = active.active[0].codex_diagnostics().unwrap();
+        let recovery = diagnostics.recovery;
+        assert_eq!(diagnostics.event_sequence, 5);
+        assert_eq!(
+            recovery.previous_id_cause,
+            Some(CodexRecoveryCause::PromptChanged)
+        );
+        assert_eq!(
+            recovery.socket_causes.iter().collect::<Vec<_>>(),
+            vec![
+                CodexRecoveryCause::OriginSocketMissing,
+                CodexRecoveryCause::TransportFailure,
+            ]
+        );
+
+        monitor.request_completed("r-recovery", 200, None, None);
+        monitor.codex_previous_id_cause("r-recovery", CodexRecoveryCause::MissingState);
+        monitor.codex_socket_cause("r-recovery", CodexRecoveryCause::AuthRejection);
+        let recent = monitor.snapshot();
+        let diagnostics = recent.recent[0].codex_diagnostics().unwrap();
+        let recovery = diagnostics.recovery;
+        assert_eq!(diagnostics.event_sequence, 7);
+        assert_eq!(
+            recovery.previous_id_cause,
+            Some(CodexRecoveryCause::PromptChanged)
+        );
+        assert_eq!(
+            recovery.socket_causes.iter().collect::<Vec<_>>(),
+            vec![
+                CodexRecoveryCause::AuthRejection,
+                CodexRecoveryCause::OriginSocketMissing,
+                CodexRecoveryCause::TransportFailure,
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_detailed_diagnostics_are_bounded_and_privacy_safe() {
+        let monitor = MonitorHandle::new(10);
+        let owner = ConversationIdentity::Main("private-session".into());
+        monitor.request_started(
+            "r-detail",
+            Some("private-session".into()),
+            Some(9),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("r-detail", "codex", "private-model-alias", None);
+        monitor.codex_append_only(
+            "r-detail",
+            CodexAppendOnlyDiagnostics {
+                outcome: CodexAppendOnlyOutcome::FirstMismatch,
+                incoming_items: 14,
+                retained_items: 11,
+                delta_items: 3,
+                first_mismatch_index: Some(6),
+            },
+        );
+        monitor.codex_pool_resolution("r-detail", CodexPoolResolution::ExactOriginMatched);
+        monitor.codex_socket_validation("r-detail", None, 7, true);
+        monitor.codex_socket_validation(
+            "r-detail",
+            Some(CodexSocketValidationFailure::UnexpectedText),
+            12,
+            true,
+        );
+        monitor.codex_websocket_dispatch("r-detail", owner, [9; 32], true, 9_999);
+        monitor.request_failed("r-detail", Some(502), "private upstream error body");
+        monitor.codex_pool_resolution("r-detail", CodexPoolResolution::ExactOriginUnavailable);
+
+        let state = monitor.snapshot();
+        let request = &state.recent[0];
+        let diagnostics = request.codex_diagnostics().unwrap();
+        assert_eq!(
+            diagnostics.append_only,
+            Some(CodexAppendOnlyDiagnostics {
+                outcome: CodexAppendOnlyOutcome::FirstMismatch,
+                incoming_items: 14,
+                retained_items: 11,
+                delta_items: 3,
+                first_mismatch_index: Some(6),
+            })
+        );
+        assert_eq!(diagnostics.pool.lookups, 2);
+        assert_eq!(diagnostics.pool.hits, 1);
+        assert_eq!(diagnostics.pool.misses, 1);
+        assert_eq!(diagnostics.pool.exact_matches, 1);
+        assert_eq!(diagnostics.pool.exact_unavailable, 1);
+        assert_eq!(diagnostics.validation.attempts, 2);
+        assert_eq!(diagnostics.validation.successes, 1);
+        assert_eq!(diagnostics.validation.failures, 1);
+        assert_eq!(
+            diagnostics.validation.latest_failure,
+            Some(CodexSocketValidationFailure::UnexpectedText)
+        );
+        assert_eq!(diagnostics.validation.latest_elapsed_ms, 12);
+        assert!(diagnostics.validation.latest_required_origin);
+
+        let mut event_specific = serde_json::Map::new();
+        event_specific.insert(
+            "cause".into(),
+            serde_json::json!(CodexRecoveryCause::SocketValidationFailed.label()),
+        );
+        let event_fields = serde_json::Value::Object(codex_event_fields(
+            "r-detail",
+            *diagnostics,
+            false,
+            event_specific,
+        ));
+        assert_eq!(event_fields["schemaVersion"], 1);
+        assert_eq!(event_fields["reqId"], "r-detail");
+        assert_eq!(event_fields["eventSequence"], 6);
+        assert_eq!(event_fields["stateChanged"], false);
+        assert_eq!(event_fields["cause"], "socket_validation_failed");
+
+        let fields = serde_json::Value::Object(codex_request_snapshot_fields(request).unwrap());
+        assert_eq!(fields["schemaVersion"], 1);
+        assert_eq!(
+            fields["diagnostics"]["appendOnly"]["outcome"],
+            "first_mismatch"
+        );
+        assert_eq!(
+            fields["diagnostics"]["validation"]["latestFailure"],
+            "unexpected_text"
+        );
+        assert_eq!(
+            fields["diagnostics"]["pool"]["latest"],
+            "exact_origin_unavailable"
+        );
+        let serialized = fields.to_string();
+        assert!(!serialized.contains("private-session"));
+        assert!(!serialized.contains("private-model-alias"));
+        assert!(!serialized.contains("private upstream error body"));
+        assert!(!serialized.contains("9999"));
+    }
+
+    #[test]
+    fn codex_dispatch_does_not_infer_causes_and_evicted_updates_are_noops() {
+        let monitor = MonitorHandle::new(1);
+        let owner = ConversationIdentity::Main("session-recovery".into());
+        monitor.request_started("r-old", None, None, EndpointKind::Messages);
+        monitor.codex_websocket_dispatch("r-old", owner.clone(), [1; 32], true, 11);
+        monitor.codex_websocket_dispatch("r-old", owner, [2; 32], false, 12);
+        assert_eq!(
+            monitor.snapshot().active[0]
+                .codex_diagnostics()
+                .unwrap()
+                .recovery,
+            CodexRecoveryDiagnostics::default()
+        );
+        monitor.request_completed("r-old", 200, None, None);
+
+        monitor.request_started("r-new", None, None, EndpointKind::Messages);
+        monitor.request_completed("r-new", 200, None, None);
+        monitor.codex_previous_id_cause("r-old", CodexRecoveryCause::RouteChanged);
+        monitor.codex_socket_cause("r-old", CodexRecoveryCause::Cancelled);
+
+        let state = monitor.snapshot();
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(state.recent[0].request_id, "r-new");
+        assert!(state.recent[0].codex_diagnostics().is_none());
+    }
 
     #[test]
     fn started_requests_appear_active() {
@@ -1317,6 +2610,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             output_tokens: Some(output_tokens),
             error: None,
             traffic_capture_path: None,
+            codex: None,
         }
     }
 

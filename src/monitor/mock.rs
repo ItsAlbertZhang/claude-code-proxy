@@ -374,6 +374,7 @@ fn mock_state_for_tick(
         sessions,
         active,
         recent: recent.into_iter().collect(),
+        codex: Default::default(),
     }
 }
 
@@ -679,6 +680,7 @@ fn active_request(
         output_tokens: None,
         error: None,
         traffic_capture_path: None,
+        codex: None,
     }
 }
 
@@ -720,6 +722,7 @@ fn completed_request(
         output_tokens: None,
         error: None,
         traffic_capture_path: None,
+        codex: None,
     }
 }
 

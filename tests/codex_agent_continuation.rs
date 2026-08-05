@@ -134,12 +134,18 @@ impl CapturedRequest {
         self.body["input"]
             .as_array()
             .and_then(|input| input.last())
-            .and_then(|item| item.get("content"))
-            .and_then(Value::as_array)
-            .and_then(|content| content.last())
-            .and_then(|part| part.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("request has no final text marker: {}", self.body))
+            .and_then(|item| {
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|content| content.last())
+                    .and_then(|part| part.get("text"))
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        (item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+                            .then_some("<compaction_trigger>")
+                    })
+            })
+            .unwrap_or_else(|| panic!("request has no final marker: {}", self.body))
     }
 
     fn previous_response_id(&self) -> Option<&str> {
@@ -206,8 +212,17 @@ enum MockOutcome {
         close_after: bool,
         acknowledged: oneshot::Sender<()>,
     },
+    Compaction {
+        response_id: String,
+        encrypted_content: String,
+        acknowledged: oneshot::Sender<()>,
+    },
     RawEvent {
         event: Value,
+        acknowledged: oneshot::Sender<()>,
+    },
+    RawEvents {
+        events: Vec<Value>,
         acknowledged: oneshot::Sender<()>,
     },
 }
@@ -240,6 +255,52 @@ impl PendingRequest {
         self.captured
     }
 
+    async fn respond_compaction(
+        self,
+        response_id: &str,
+        encrypted_content: &str,
+    ) -> CapturedRequest {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        self.outcome
+            .send(MockOutcome::Compaction {
+                response_id: response_id.to_string(),
+                encrypted_content: encrypted_content.to_string(),
+                acknowledged,
+            })
+            .unwrap_or_else(|_| panic!("upstream socket closed before compaction response"));
+        tokio::time::timeout(REQUEST_TIMEOUT, acknowledgement)
+            .await
+            .expect("mock compaction acknowledgement timed out")
+            .expect("mock compaction acknowledgement sender dropped");
+        self.captured
+    }
+
+    async fn respond_partial(self, text: &str) -> CapturedRequest {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        self.outcome
+            .send(MockOutcome::RawEvents {
+                events: vec![
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {"type": "message", "id": "msg-partial"}
+                    }),
+                    json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "delta": text
+                    }),
+                ],
+                acknowledged,
+            })
+            .unwrap_or_else(|_| panic!("upstream socket closed before partial response"));
+        tokio::time::timeout(REQUEST_TIMEOUT, acknowledgement)
+            .await
+            .expect("mock partial acknowledgement timed out")
+            .expect("mock partial acknowledgement sender dropped");
+        self.captured
+    }
+
     async fn respond_rate_limited(self) -> CapturedRequest {
         let (acknowledged, acknowledgement) = oneshot::channel();
         self.outcome
@@ -264,9 +325,21 @@ impl PendingRequest {
     }
 }
 
+struct SocketCloseGuard {
+    socket_ordinal: usize,
+    closed: mpsc::UnboundedSender<usize>,
+}
+
+impl Drop for SocketCloseGuard {
+    fn drop(&mut self) {
+        let _ = self.closed.send(self.socket_ordinal);
+    }
+}
+
 struct InstrumentedUpstream {
     base_url: String,
     requests: mpsc::UnboundedReceiver<PendingRequest>,
+    closed_sockets: mpsc::UnboundedReceiver<usize>,
     captures: Arc<Mutex<Vec<CapturedRequest>>>,
     probes: ProbeLog,
     shutdown: Option<oneshot::Sender<()>>,
@@ -278,6 +351,7 @@ impl InstrumentedUpstream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (requests_tx, requests) = mpsc::unbounded_channel();
+        let (closed_tx, closed_sockets) = mpsc::unbounded_channel();
         let captures = Arc::new(Mutex::new(Vec::new()));
         let probes = Arc::new(Mutex::new(Vec::new()));
         let (shutdown, shutdown_rx) = oneshot::channel();
@@ -287,6 +361,7 @@ impl InstrumentedUpstream {
             run_upstream(
                 listener,
                 requests_tx,
+                closed_tx,
                 task_captures,
                 task_probes,
                 shutdown_rx,
@@ -296,6 +371,7 @@ impl InstrumentedUpstream {
         Self {
             base_url: format!("http://{address}/backend-api/codex/responses"),
             requests,
+            closed_sockets,
             captures,
             probes,
             shutdown: Some(shutdown),
@@ -320,6 +396,18 @@ impl InstrumentedUpstream {
             .expect("mock upstream stopped before response.create");
         pending.captured.assert_protocol_headers(expected_session);
         pending
+    }
+
+    async fn wait_for_socket_close(&mut self, socket_ordinal: usize) {
+        loop {
+            let closed = tokio::time::timeout(REQUEST_TIMEOUT, self.closed_sockets.recv())
+                .await
+                .expect("timed out waiting for upstream socket teardown")
+                .expect("mock upstream stopped reporting socket teardown");
+            if closed == socket_ordinal {
+                return;
+            }
+        }
     }
 
     fn snapshot(&self) -> Vec<CapturedRequest> {
@@ -390,6 +478,7 @@ impl InstrumentedUpstream {
 async fn run_upstream(
     listener: TcpListener,
     requests: mpsc::UnboundedSender<PendingRequest>,
+    closed_sockets: mpsc::UnboundedSender<usize>,
     captures: Arc<Mutex<Vec<CapturedRequest>>>,
     probes: ProbeLog,
     mut shutdown: oneshot::Receiver<()>,
@@ -409,6 +498,7 @@ async fn run_upstream(
                     stream,
                     socket_ordinal,
                     requests.clone(),
+                    closed_sockets.clone(),
                     captures.clone(),
                     probes.clone(),
                 ));
@@ -430,9 +520,14 @@ async fn handle_socket(
     stream: TcpStream,
     socket_ordinal: usize,
     requests: mpsc::UnboundedSender<PendingRequest>,
+    closed_sockets: mpsc::UnboundedSender<usize>,
     captures: Arc<Mutex<Vec<CapturedRequest>>>,
     probes: ProbeLog,
 ) {
+    let _close_guard = SocketCloseGuard {
+        socket_ordinal,
+        closed: closed_sockets,
+    };
     let handshake_headers = Arc::new(Mutex::new(None));
     let callback_headers = handshake_headers.clone();
     let Ok(mut websocket) =
@@ -515,6 +610,40 @@ async fn handle_socket(
                         }
                         let _ = acknowledged.send(());
                     }
+                    MockOutcome::Compaction {
+                        response_id,
+                        encrypted_content,
+                        acknowledged,
+                    } => {
+                        let events = [
+                            json!({
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": {
+                                    "type": "compaction",
+                                    "encrypted_content": encrypted_content
+                                }
+                            }),
+                            json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": response_id,
+                                    "usage": {"input_tokens": 100, "output_tokens": 1}
+                                }
+                            }),
+                        ];
+                        for event in events {
+                            if websocket
+                                .send(Message::Text(event.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                let _ = acknowledged.send(());
+                                return;
+                            }
+                        }
+                        let _ = acknowledged.send(());
+                    }
                     MockOutcome::RawEvent {
                         event,
                         acknowledged,
@@ -526,6 +655,22 @@ async fn handle_socket(
                         {
                             let _ = acknowledged.send(());
                             return;
+                        }
+                        let _ = acknowledged.send(());
+                    }
+                    MockOutcome::RawEvents {
+                        events,
+                        acknowledged,
+                    } => {
+                        for event in events {
+                            if websocket
+                                .send(Message::Text(event.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                let _ = acknowledged.send(());
+                                return;
+                            }
                         }
                         let _ = acknowledged.send(());
                     }
@@ -647,10 +792,17 @@ struct TestHarness {
 
 impl TestHarness {
     async fn start() -> Self {
+        Self::start_with_server_compaction(false).await
+    }
+
+    async fn start_with_server_compaction(server_compaction: bool) -> Self {
         let upstream = InstrumentedUpstream::spawn().await;
         let config_dir = TempDir::new().unwrap();
         write_codex_auth(config_dir.path());
-        let environment = configure_environment(config_dir.path(), &upstream.base_url);
+        let mut environment = configure_environment(config_dir.path(), &upstream.base_url);
+        if server_compaction {
+            environment.push(EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1"));
+        }
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_address = listener.local_addr().unwrap();
@@ -673,6 +825,25 @@ impl TestHarness {
             _config_dir: config_dir,
             _environment: environment,
         }
+    }
+
+    fn start_response(
+        &self,
+        body: Value,
+        identity: IdentityHeaders,
+    ) -> JoinHandle<reqwest::Response> {
+        let client = self.client.clone();
+        let url = self.proxy_url.clone();
+        tokio::spawn(async move {
+            let mut request = client.post(url).json(&body);
+            for (name, value) in identity.values {
+                request = request.header(name, value);
+            }
+            tokio::time::timeout(REQUEST_TIMEOUT, request.send())
+                .await
+                .expect("proxy response headers timed out")
+                .expect("proxy request failed")
+        })
     }
 
     fn start_request(&self, body: Value, identity: IdentityHeaders) -> JoinHandle<DrainedResponse> {
@@ -767,6 +938,17 @@ fn messages_body(stream: bool, messages: Vec<Value>) -> Value {
         "stream": stream,
         "messages": messages
     })
+}
+
+fn messages_body_with_initial_context(stream: bool, messages: Vec<Value>, system: &str) -> Value {
+    let mut body = messages_body(stream, messages);
+    body["system"] = json!(system);
+    body["tools"] = json!([{
+        "name": "context_probe",
+        "description": "initial context probe",
+        "input_schema": {"type": "object", "properties": {}}
+    }]);
+    body
 }
 
 fn upstream_item(role: &str, text: &str) -> Value {
@@ -1636,7 +1818,7 @@ async fn consecutive_rate_limit_handoffs_are_attempt_local() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn same_owner_stale_completion_cannot_overwrite_newer_turn() {
+async fn same_owner_turns_are_serialized_until_terminal_cleanup() {
     let _environment_lock = env_lock();
     let mut harness = TestHarness::start().await;
     let case = unique("stale-completion");
@@ -1650,6 +1832,7 @@ async fn same_owner_stale_completion_cannot_overwrite_newer_turn() {
     let newer_reply = tagged(&case, "newer-reply");
     let follow = tagged(&case, "follow");
     let base_response = tagged(&case, "resp-base");
+    let old_response = tagged(&case, "resp-old");
     let newer_response = tagged(&case, "resp-newer");
 
     let baseline = harness
@@ -1694,8 +1877,26 @@ async fn same_owner_stale_completion_cannot_overwrite_newer_turn() {
         ),
         headers.clone(),
     );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        harness.upstream.snapshot().len(),
+        2,
+        "same-owner newer turn reached upstream before the old turn completed"
+    );
+    assert!(
+        !newer_request.is_finished(),
+        "same-owner newer turn completed while admission was still held"
+    );
+
+    let old_capture =
+        resolve_request(old_pending, old_request, &old_response, &old_reply, false).await;
+    assert_eq!(old_capture.socket_ordinal, baseline.socket_ordinal);
+
     let newer_pending = harness.pending(&newer, &headers).await;
-    assert_eq!(newer_pending.captured.socket_ordinal, 2);
+    assert_eq!(
+        newer_pending.captured.socket_ordinal,
+        old_capture.socket_ordinal
+    );
     assert_full_input(
         &newer_pending.captured,
         &[
@@ -1712,16 +1913,6 @@ async fn same_owner_stale_completion_cannot_overwrite_newer_turn() {
         false,
     )
     .await;
-
-    let old_capture = resolve_request(
-        old_pending,
-        old_request,
-        &tagged(&case, "resp-old"),
-        &old_reply,
-        false,
-    )
-    .await;
-    assert_eq!(old_capture.socket_ordinal, baseline.socket_ordinal);
 
     let following = harness
         .round_trip(
@@ -1747,7 +1938,7 @@ async fn same_owner_stale_completion_cannot_overwrite_newer_turn() {
         newer_capture.socket_ordinal,
         &follow,
     );
-    assert_ne!(following.socket_ordinal, old_capture.socket_ordinal);
+    assert_eq!(following.socket_ordinal, old_capture.socket_ordinal);
     assert_eq!(harness.upstream.snapshot().len(), 4);
     harness.shutdown().await;
 }
@@ -1903,5 +2094,282 @@ async fn cross_owner_completion_order_is_independent() {
     assert_eq!(b3_capture.socket_ordinal, b1_capture.socket_ordinal);
     assert_ne!(a3_capture.socket_ordinal, b3_capture.socket_ordinal);
     assert_eq!(harness.upstream.snapshot().len(), 6);
+    harness.shutdown().await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hidden_compaction_owns_origin_while_summary_stays_detached() {
+    let _environment_lock = env_lock();
+    let mut harness = TestHarness::start_with_server_compaction(true).await;
+    let case = unique("hidden-compaction-lifecycle");
+    let session = tagged(&case, "session");
+    let headers = IdentityHeaders::agent(&session, &tagged(&case, "agent"), None);
+    let base = tagged(&case, "base");
+    let base_reply = tagged(&case, "base-reply");
+    let baseline_response = tagged(&case, "resp-base");
+    let compact_response = tagged(&case, "resp-compact");
+    let summary_response = tagged(&case, "resp-summary");
+    let summary = tagged(
+        &case,
+        "portable summary with enough detail to anchor the compacted conversation",
+    );
+    let initial_context = tagged(&case, "fresh-initial-context");
+    let summary_request = format!(
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests. {case}"
+    );
+
+    let baseline = harness
+        .round_trip(
+            messages_body(false, vec![message("user", &base)]),
+            headers.clone(),
+            &base,
+            &baseline_response,
+            &base_reply,
+        )
+        .await;
+    assert_full_input(&baseline, &[("user", &base)]);
+
+    let compact_request = harness.start_request(
+        messages_body(
+            false,
+            vec![
+                message("user", &base),
+                message("assistant", &base_reply),
+                message("user", &summary_request),
+            ],
+        ),
+        headers.clone(),
+    );
+    let hidden = harness
+        .upstream
+        .next_request("<compaction_trigger>", Some(&session))
+        .await;
+    assert_eq!(hidden.captured.socket_ordinal, baseline.socket_ordinal);
+    assert_eq!(
+        hidden.captured.previous_response_id(),
+        Some(baseline_response.as_str())
+    );
+    assert_eq!(
+        hidden.captured.body["input"].as_array(),
+        Some(&vec![json!({"type": "compaction_trigger"})]),
+        "hidden compaction must use an exact-origin previous-ID delta"
+    );
+    let hidden = hidden
+        .respond_compaction(&compact_response, "opaque-compacted-history")
+        .await;
+
+    let detached_summary = harness.upstream.next_request(&summary_request, None).await;
+    assert_ne!(
+        detached_summary.captured.socket_ordinal, hidden.socket_ordinal,
+        "plaintext summary must use an auxiliary socket"
+    );
+    assert!(detached_summary.captured.previous_response_id().is_none());
+    let detached_socket = detached_summary.captured.socket_ordinal;
+    detached_summary
+        .respond(&summary_response, &summary, false)
+        .await;
+    let compact_downstream = tokio::time::timeout(REQUEST_TIMEOUT, compact_request)
+        .await
+        .expect("compact request timed out")
+        .expect("compact request task failed");
+    compact_downstream.assert_success(&summary);
+
+    let follow = tagged(&case, "follow-after-compaction");
+    let follow_reply = tagged(&case, "follow-reply");
+    let follow_response = tagged(&case, "resp-follow");
+    let follow_request = harness.start_request(
+        messages_body_with_initial_context(
+            false,
+            vec![
+                message("user", &format!("<summary>{summary}</summary>")),
+                message("user", &follow),
+            ],
+            &initial_context,
+        ),
+        headers.clone(),
+    );
+    let first_follow = harness.pending(&follow, &headers).await;
+    assert_eq!(first_follow.captured.socket_ordinal, hidden.socket_ordinal);
+    assert_ne!(first_follow.captured.socket_ordinal, detached_socket);
+    assert!(first_follow.captured.previous_response_id().is_none());
+    assert_eq!(
+        first_follow.captured.body["input"].as_array(),
+        Some(&vec![
+            json!({
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "function",
+                    "name": "context_probe",
+                    "description": "initial context probe",
+                    "parameters": {"type": "object", "properties": {}},
+                    "strict": false
+                }]
+            }),
+            upstream_item("user", &base),
+            json!({"type": "compaction", "encrypted_content": "opaque-compacted-history"}),
+            upstream_item("developer", &initial_context),
+            upstream_item("user", &follow),
+        ]),
+        "first canonical replay must append fresh initial context after the compact item"
+    );
+    let first_follow = resolve_request(
+        first_follow,
+        follow_request,
+        &follow_response,
+        &follow_reply,
+        false,
+    )
+    .await;
+
+    let next = tagged(&case, "second-follow");
+    let second = harness
+        .round_trip(
+            messages_body_with_initial_context(
+                false,
+                vec![
+                    message("user", &format!("<summary>{summary}</summary>")),
+                    message("user", &follow),
+                    message("assistant", &follow_reply),
+                    message("user", &next),
+                ],
+                &initial_context,
+            ),
+            headers,
+            &next,
+            &tagged(&case, "resp-second"),
+            &tagged(&case, "second-reply"),
+        )
+        .await;
+    assert_delta_input(
+        &second,
+        &follow_response,
+        first_follow.socket_ordinal,
+        &next,
+    );
+    assert_eq!(second.socket_ordinal, hidden.socket_ordinal);
+    assert_eq!(harness.upstream.snapshot().len(), 5);
+    harness.shutdown().await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn downstream_cancellation_tears_down_before_next_owner_turn_and_recovery_resumes() {
+    let _environment_lock = env_lock();
+    let mut harness = TestHarness::start().await;
+    let case = unique("downstream-cancel-order");
+    let session = tagged(&case, "session");
+    let headers = IdentityHeaders::agent(&session, &tagged(&case, "agent"), None);
+    let base = tagged(&case, "base");
+    let base_reply = tagged(&case, "base-reply");
+    let baseline_response = tagged(&case, "resp-base");
+
+    let baseline = harness
+        .round_trip(
+            messages_body(false, vec![message("user", &base)]),
+            headers.clone(),
+            &base,
+            &baseline_response,
+            &base_reply,
+        )
+        .await;
+
+    let cancelled = tagged(&case, "cancelled-turn");
+    let cancelled_response = harness.start_response(
+        messages_body(
+            true,
+            vec![
+                message("user", &base),
+                message("assistant", &base_reply),
+                message("user", &cancelled),
+            ],
+        ),
+        headers.clone(),
+    );
+    let pending_cancelled = harness.pending(&cancelled, &headers).await;
+    assert_delta_input(
+        &pending_cancelled.captured,
+        &baseline_response,
+        baseline.socket_ordinal,
+        &cancelled,
+    );
+    let cancelled_socket = pending_cancelled.captured.socket_ordinal;
+    pending_cancelled.respond_partial("partial output").await;
+    let response = tokio::time::timeout(REQUEST_TIMEOUT, cancelled_response)
+        .await
+        .expect("cancelled response headers timed out")
+        .expect("cancelled response task failed");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let replacement = tagged(&case, "replacement-turn");
+    let replacement_reply = tagged(&case, "replacement-reply");
+    let replacement_response = tagged(&case, "resp-replacement");
+    let replacement_request = harness.start_request(
+        messages_body(
+            false,
+            vec![
+                message("user", &base),
+                message("assistant", &base_reply),
+                message("user", &replacement),
+            ],
+        ),
+        headers.clone(),
+    );
+
+    harness
+        .upstream
+        .wait_for_socket_close(cancelled_socket)
+        .await;
+    let replacement_pending = harness.pending(&replacement, &headers).await;
+    assert_ne!(
+        replacement_pending.captured.socket_ordinal,
+        cancelled_socket
+    );
+    assert_full_input(
+        &replacement_pending.captured,
+        &[
+            ("user", &base),
+            ("assistant", &base_reply),
+            ("user", &replacement),
+        ],
+    );
+    let replacement_capture = resolve_request(
+        replacement_pending,
+        replacement_request,
+        &replacement_response,
+        &replacement_reply,
+        false,
+    )
+    .await;
+
+    let later = tagged(&case, "later-turn");
+    let later_capture = harness
+        .round_trip(
+            messages_body(
+                false,
+                vec![
+                    message("user", &base),
+                    message("assistant", &base_reply),
+                    message("user", &replacement),
+                    message("assistant", &replacement_reply),
+                    message("user", &later),
+                ],
+            ),
+            headers,
+            &later,
+            &tagged(&case, "resp-later"),
+            &tagged(&case, "later-reply"),
+        )
+        .await;
+    assert_delta_input(
+        &later_capture,
+        &replacement_response,
+        replacement_capture.socket_ordinal,
+        &later,
+    );
+    assert_ne!(later_capture.socket_ordinal, cancelled_socket);
+    assert_eq!(harness.upstream.snapshot().len(), 4);
     harness.shutdown().await;
 }

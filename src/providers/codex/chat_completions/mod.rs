@@ -62,6 +62,7 @@ impl ChatCompletionsBackend {
         let (ctx, scope) = scoped.into_parts();
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &request.model);
+            monitor.codex_request_lane(&ctx.req_id, request.use_responses_lite);
         }
         let lane = scope.provider_lane(LaneDomain::CodexConversation);
         let protocol = ProtocolLane::from_uses_responses_lite(request.use_responses_lite);

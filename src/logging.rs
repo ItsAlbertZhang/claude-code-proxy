@@ -4,12 +4,16 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 
 static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static LOG_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 pub const REDACT_KEYS: [&str; 15] = [
     "authorization",
@@ -123,18 +127,26 @@ pub fn create_logger(service: &str) -> Logger {
 }
 
 fn write_log_line(line: &str) -> io::Result<()> {
-    let file = log_file();
+    write_log_line_to(&log_file(), line)
+}
+
+fn write_log_line_to(file: &Path, line: &str) -> io::Result<()> {
+    let _guard = LOG_FILE_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("log file lock poisoned"))?;
     if let Some(dir) = file.parent() {
         create_dir(dir, 0o700)?;
     }
 
-    if fs::metadata(&file).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
-        rotate_file(&file)?;
+    if fs::metadata(file).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
+        rotate_file(file)?;
     }
 
-    let mut out = OpenOptions::new().create(true).append(true).open(&file)?;
-    out.write_all(line.as_bytes())?;
-    out.write_all(b"\n")?;
+    let mut buffer = Vec::with_capacity(line.len().saturating_add(1));
+    buffer.extend_from_slice(line.as_bytes());
+    buffer.push(b'\n');
+    let mut out = OpenOptions::new().create(true).append(true).open(file)?;
+    out.write_all(&buffer)?;
     Ok(())
 }
 
@@ -259,6 +271,42 @@ mod tests {
 
         drop(outer);
         assert!(should_mirror_to_stderr("warn"));
+    }
+
+    #[test]
+    fn concurrent_writes_remain_complete_jsonl_records() {
+        static PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "claude-code-proxy-log-test-{}-{}",
+            std::process::id(),
+            PATH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = root.join("proxy.log");
+        let mut writers = Vec::new();
+        for writer in 0..8 {
+            let file = file.clone();
+            writers.push(std::thread::spawn(move || {
+                for record in 0..50 {
+                    let line = serde_json::json!({
+                        "writer": writer,
+                        "record": record,
+                    })
+                    .to_string();
+                    write_log_line_to(&file, &line).unwrap();
+                }
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let contents = fs::read_to_string(&file).unwrap();
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 400);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
