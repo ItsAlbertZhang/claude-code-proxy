@@ -435,15 +435,16 @@ async fn handler_transcription(State(state): State<Arc<AppState>>, req: Request<
             ("query".to_string(), json!({})),
         ])),
     );
-    let session_id = native_session_id(&headers);
+    let request_scope = RequestScope::from_openai_headers(&headers, RequestPurpose::Auxiliary);
     if let Some(monitor) = state.monitor.as_ref() {
-        monitor.request_started(
+        monitor.request_started_with_identity(
             &req_id,
-            session_id.clone(),
+            request_scope.identity(),
             None,
             EndpointKind::Transcriptions,
         );
         monitor.provider_selected(&req_id, "codex", "codex-transcribe", None);
+        monitor.model_resolved(&req_id, "codex-transcribe");
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     if req.uri().query().is_some() {
@@ -571,8 +572,13 @@ async fn handler_transcription(State(state): State<Arc<AppState>>, req: Request<
                     }
                 };
             }
-            "model" => {
-                if multipart_text(field, "model").await.is_err() {
+            "model" => match multipart_text(field, "model").await {
+                Ok(model) => {
+                    if let Some(monitor) = state.monitor.as_ref() {
+                        monitor.model_requested(&req_id, model);
+                    }
+                }
+                Err(_) => {
                     let response =
                         transcription_error_response(TranscriptionRequestError::invalid(
                             "Invalid multipart 'model' field",
@@ -580,7 +586,7 @@ async fn handler_transcription(State(state): State<Arc<AppState>>, req: Request<
                         ));
                     return monitor_response_body(response, request_guard);
                 }
-            }
+            },
             _ => {
                 let response = transcription_error_response(TranscriptionRequestError::invalid(
                     format!("Unsupported multipart field '{name}'"),
@@ -664,9 +670,14 @@ async fn dispatch_image_request(
             ("query".to_string(), json!(redacted_query(&uri))),
         ])),
     );
-    let session_id = native_session_id(&headers);
+    let request_scope = RequestScope::from_openai_headers(&headers, RequestPurpose::Auxiliary);
     if let Some(monitor) = state.monitor.as_ref() {
-        monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Images);
+        monitor.request_started_with_identity(
+            &req_id,
+            request_scope.identity(),
+            None,
+            EndpointKind::Images,
+        );
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
 
@@ -778,6 +789,7 @@ async fn dispatch_image_request(
     };
     let model = prepared.model.clone();
     if let Some(monitor) = state.monitor.as_ref() {
+        monitor.model_requested(&req_id, &model);
         monitor.provider_selected(&req_id, "codex", &model, None);
     }
     let context = RequestContext {
@@ -916,7 +928,12 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         .identity()
         .map(|identity| identity.session_component().to_string());
     if let Some(monitor) = state.monitor.as_ref() {
-        monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Responses);
+        monitor.request_started_with_identity(
+            &req_id,
+            request_scope.identity(),
+            None,
+            EndpointKind::Responses,
+        );
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
@@ -958,6 +975,9 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         Ok(model) => model,
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.model_requested(&req_id, &requested_model);
+    }
     let now = current_millis();
     let session_state = session::existing_conversation(request_scope.conversational_lane(), now);
     let affinity = session_state
@@ -1162,9 +1182,9 @@ async fn handler_chat_completions(
         .identity()
         .map(|identity| identity.session_component().to_string());
     if let Some(monitor) = state.monitor.as_ref() {
-        monitor.request_started(
+        monitor.request_started_with_identity(
             &req_id,
-            session_id.clone(),
+            request_scope.identity(),
             None,
             EndpointKind::ChatCompletions,
         );
@@ -1209,6 +1229,9 @@ async fn handler_chat_completions(
         Ok(model) => model,
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.model_requested(&req_id, &requested_model);
+    }
     let now = current_millis();
     let session_state = session::existing_conversation(request_scope.conversational_lane(), now);
     let affinity = session_state
@@ -1398,12 +1421,6 @@ async fn handler_chat_completions(
     monitor_response_body(response, request_guard)
 }
 
-fn native_session_id(headers: &http::HeaderMap) -> Option<String> {
-    RequestScope::from_openai_headers(headers, RequestPurpose::Auxiliary)
-        .identity()
-        .map(|identity| identity.session_component().to_string())
-}
-
 #[allow(clippy::result_large_err)]
 fn parse_native_json_body(body: &[u8]) -> Result<Value, Response> {
     if body.is_empty() {
@@ -1510,7 +1527,7 @@ async fn dispatch_request(
         .identity()
         .map(|identity| identity.session_component().to_string());
     if let Some(monitor) = state.monitor.as_ref() {
-        monitor.request_started(&req_id, session_id.clone(), None, endpoint);
+        monitor.request_started_with_identity(&req_id, request_scope.identity(), None, endpoint);
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
@@ -1654,6 +1671,9 @@ async fn dispatch_request(
         }
     };
 
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.model_requested(&req_id, model);
+    }
     let mut normalized_model = normalize_incoming_model(model);
     body.model = Some(normalized_model.clone());
     let session_state = session::existing_conversation(request_scope.conversational_lane(), now);

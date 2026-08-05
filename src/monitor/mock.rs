@@ -5,18 +5,21 @@ use std::{
 };
 
 use super::{
-    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, RequestStatus, SessionUsage,
+    ActiveRequest, CodexCauseSet, CodexDispatchOutcome, CodexDispatchSummary, CodexLane,
+    CodexRecoveryCause, CodexRecoveryDiagnostics, CodexRequestDiagnostics, CodexRequestPreviousId,
+    CompletedRequest, EndpointKind, MonitorState, RequestStatus, SessionKey, SessionUsage,
     session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
 const REQUEST_TICKS: u64 = 24;
 const COMPLETED_PHASE: u64 = 20;
+const CODEX_AGENT_ID: &str = "a11ce914-ada4-4f40-9672-985f950fbb66";
 
 #[derive(Debug)]
 pub struct MockMonitor {
     started_at: SystemTime,
-    output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
+    output_buckets: HashMap<SessionKey, Vec<(u64, u64)>>,
     tick: u64,
 }
 
@@ -69,7 +72,7 @@ fn mock_state_for_tick(
     now: SystemTime,
     instant_now: Instant,
     tick: u64,
-    output_buckets: &HashMap<Option<String>, Vec<(u64, u64)>>,
+    output_buckets: &HashMap<SessionKey, Vec<(u64, u64)>>,
 ) -> MonitorState {
     let mut streaming = active_request(
         now,
@@ -81,9 +84,11 @@ fn mock_state_for_tick(
         Duration::from_secs(14),
         RequestStatus::Streaming,
     );
+    streaming.agent_id = Some(CODEX_AGENT_ID.to_string());
     streaming.project = Some("claude-code-proxy".to_string());
     streaming.provider = Some("codex".to_string());
-    streaming.model = Some("claude-sonnet-4-6 → gpt-5.6-sol".to_string());
+    streaming.model = Some("claude-sonnet-4-6".to_string());
+    streaming.resolved_model = Some("gpt-5.6-sol".to_string());
     streaming.effort = Some("high".to_string());
     streaming.generation_started_at = Some(now - Duration::from_secs(10));
     streaming.generation_started_instant = Some(instant_now - Duration::from_secs(10));
@@ -112,6 +117,14 @@ fn mock_state_for_tick(
         .output_tokens
         .unwrap_or(0)
         .saturating_sub(160 + (tick % 12) * 9);
+    streaming.codex = Some(CodexRequestDiagnostics {
+        lane: Some(CodexLane::Lite),
+        previous_id: CodexRequestPreviousId::Hit,
+        recovery: CodexRecoveryDiagnostics::default(),
+        route: single_codex_dispatch(CodexDispatchOutcome::Reuse),
+        socket: single_codex_dispatch(CodexDispatchOutcome::Reuse),
+        ..CodexRequestDiagnostics::default()
+    });
 
     let mut upstream = active_request(
         now,
@@ -189,9 +202,11 @@ fn mock_state_for_tick(
         RequestStatus::Completed,
         Some(200),
     );
+    success.agent_id = Some(CODEX_AGENT_ID.to_string());
     success.project = Some("claude-code-proxy".to_string());
     success.provider = Some("codex".to_string());
-    success.model = Some("claude-sonnet-4-6 → gpt-5.6-terra".to_string());
+    success.model = Some("claude-sonnet-4-6".to_string());
+    success.resolved_model = Some("gpt-5.6-terra".to_string());
     success.effort = Some("xhigh".to_string());
     success.generation_duration = Some(Duration::from_secs(4));
     success.generation_initial_output_tokens = 32;
@@ -202,6 +217,20 @@ fn mock_state_for_tick(
     success.traffic_capture_path = Some(PathBuf::from(
         "/tmp/claude-code-proxy-demo/traffic/req-complete-codex",
     ));
+    success.codex = Some(CodexRequestDiagnostics {
+        lane: Some(CodexLane::Full),
+        previous_id: CodexRequestPreviousId::Fallback,
+        recovery: CodexRecoveryDiagnostics {
+            previous_id_cause: Some(CodexRecoveryCause::PreviousResponseMissing),
+            socket_causes: codex_cause_set(&[
+                CodexRecoveryCause::AuthRejection,
+                CodexRecoveryCause::PreviousResponseMissing,
+            ]),
+        },
+        route: single_codex_dispatch(CodexDispatchOutcome::Switch),
+        socket: single_codex_dispatch(CodexDispatchOutcome::Switch),
+        ..CodexRequestDiagnostics::default()
+    });
     recent.push_back(success);
 
     let mut unavailable = completed_request(
@@ -349,7 +378,7 @@ fn mock_state_for_tick(
     recent.push_back(no_status);
 
     add_simulated_requests(now, instant_now, tick, &mut active, &mut recent);
-    let mut session_usage = HashMap::<Option<String>, SessionUsage>::new();
+    let mut session_usage = HashMap::<SessionKey, SessionUsage>::new();
     for request in &recent {
         let usage = session_usage.entry(request.session_id.clone()).or_default();
         usage.input_tokens = usage
@@ -368,17 +397,34 @@ fn mock_state_for_tick(
             .output_tokens
             .saturating_add(request.output_tokens.unwrap_or(0));
     }
-    let sessions = session_summaries(&active, &recent, &session_usage, output_buckets);
+    let sessions = session_summaries(
+        &active,
+        &recent,
+        &session_usage,
+        &HashMap::new(),
+        output_buckets,
+    );
     MonitorState {
         started_at,
         sessions,
         active,
         recent: recent.into_iter().collect(),
-        codex: Default::default(),
+        codex: super::CodexMetricsSnapshot {
+            previous_id_no_candidates: 5,
+            previous_id_hits: 42,
+            previous_id_fallbacks: 7,
+            route_baselines: 5,
+            route_reuses: 38,
+            route_switches: 3,
+            lane_switches: 2,
+            socket_baselines: 5,
+            socket_reuses: 31,
+            socket_switches: 10,
+        },
     }
 }
 
-fn initial_output_buckets(now: SystemTime) -> HashMap<Option<String>, Vec<(u64, u64)>> {
+fn initial_output_buckets(now: SystemTime) -> HashMap<SessionKey, Vec<(u64, u64)>> {
     const HISTORIES: [(&str, [u64; 12]); 3] = [
         (
             "57c7c914-ada4-4f40-9672-985f950fbb66",
@@ -395,7 +441,7 @@ fn initial_output_buckets(now: SystemTime) -> HashMap<Option<String>, Vec<(u64, 
     ];
 
     let current_bucket = super::session_token_bucket(now);
-    let mut buckets = HashMap::<Option<String>, Vec<(u64, u64)>>::new();
+    let mut buckets = HashMap::<SessionKey, Vec<(u64, u64)>>::new();
     for (session_id, history) in HISTORIES {
         for (index, tokens) in history.iter().copied().enumerate() {
             if tokens == 0 {
@@ -414,7 +460,7 @@ fn initial_output_buckets(now: SystemTime) -> HashMap<Option<String>, Vec<(u64, 
 }
 
 fn advance_output_buckets(
-    buckets: &mut HashMap<Option<String>, Vec<(u64, u64)>>,
+    buckets: &mut HashMap<SessionKey, Vec<(u64, u64)>>,
     now: SystemTime,
     tick: u64,
 ) {
@@ -458,12 +504,12 @@ fn advance_output_buckets(
 }
 
 fn record_output_bucket(
-    buckets: &mut HashMap<Option<String>, Vec<(u64, u64)>>,
-    session_id: Option<String>,
+    buckets: &mut HashMap<SessionKey, Vec<(u64, u64)>>,
+    key: SessionKey,
     bucket: u64,
     tokens: u64,
 ) {
-    let samples = buckets.entry(session_id).or_default();
+    let samples = buckets.entry(key).or_default();
     if let Some((_, existing)) = samples
         .iter_mut()
         .find(|(existing_bucket, _)| *existing_bucket == bucket)
@@ -646,6 +692,29 @@ fn simulation_profile(cycle: u64) -> SimulationProfile {
     PROFILES[index]
 }
 
+fn codex_cause_set(causes: &[CodexRecoveryCause]) -> CodexCauseSet {
+    let mut set = CodexCauseSet::default();
+    for &cause in causes {
+        set.insert(cause);
+    }
+    set
+}
+
+fn single_codex_dispatch(outcome: CodexDispatchOutcome) -> CodexDispatchSummary {
+    let mut summary = CodexDispatchSummary {
+        first: Some(outcome),
+        latest: Some(outcome),
+        dispatches: 1,
+        ..CodexDispatchSummary::default()
+    };
+    match outcome {
+        CodexDispatchOutcome::Baseline => summary.baselines = 1,
+        CodexDispatchOutcome::Reuse => summary.reuses = 1,
+        CodexDispatchOutcome::Switch => summary.switches = 1,
+    }
+    summary
+}
+
 #[allow(clippy::too_many_arguments)]
 fn active_request(
     now: SystemTime,
@@ -660,10 +729,12 @@ fn active_request(
     ActiveRequest {
         request_id: request_id.to_string(),
         session_id: session_id.map(str::to_string),
+        agent_id: None,
         session_seq,
         project: None,
         provider: None,
         model: None,
+        resolved_model: None,
         effort: None,
         endpoint,
         started_at: now - elapsed,
@@ -700,10 +771,12 @@ fn completed_request(
     CompletedRequest {
         request_id: request_id.to_string(),
         session_id: session_id.map(str::to_string),
+        agent_id: None,
         session_seq,
         project: None,
         provider: None,
         model: None,
+        resolved_model: None,
         effort: None,
         endpoint,
         started_at: finished_at - latency,
@@ -785,11 +858,11 @@ mod tests {
     #[test]
     fn mock_sparkline_grows_current_bucket_and_freezes_completed_buckets() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let session_id = Some("57c7c914-ada4-4f40-9672-985f950fbb66".to_string());
+        let session_key = Some("57c7c914-ada4-4f40-9672-985f950fbb66".to_string());
         let current_bucket = super::super::session_token_bucket(now);
         let mut buckets = initial_output_buckets(now);
         advance_output_buckets(&mut buckets, now, 0);
-        let initial_samples = buckets.get(&session_id).unwrap().clone();
+        let initial_samples = buckets.get(&session_key).unwrap().clone();
         let initial_current = initial_samples
             .iter()
             .find(|(bucket, _)| *bucket == current_bucket)
@@ -802,7 +875,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         advance_output_buckets(&mut buckets, now + Duration::from_secs(1), 1);
-        let growing_samples = buckets.get(&session_id).unwrap();
+        let growing_samples = buckets.get(&session_key).unwrap();
         assert_eq!(
             growing_samples
                 .iter()
@@ -822,7 +895,7 @@ mod tests {
 
         let next_bucket_time = now + Duration::from_secs(10);
         advance_output_buckets(&mut buckets, next_bucket_time, 2);
-        let advanced_samples = buckets.get(&session_id).unwrap();
+        let advanced_samples = buckets.get(&session_key).unwrap();
         assert_eq!(
             advanced_samples
                 .iter()

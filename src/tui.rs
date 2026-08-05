@@ -1,10 +1,9 @@
 mod layout;
 
 use layout::{
-    CODE_WIDTH, COUNT_WIDTH, ColumnSpec, DURATION_WIDTH, EFFORT_WIDTH, ENDPOINT_WIDTH, ERROR_WIDTH,
-    ID_WIDTH, LayoutTier, MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH, MODEL_WIDE_WIDTH,
-    PROJECT_MEDIUM_WIDTH, PROJECT_WIDE_WIDTH, PROVIDER_WIDTH, RATE_WIDTH, STATUS_WIDTH, TIME_WIDTH,
-    TOKEN_WIDTH,
+    AGENT_WIDTH, CODE_WIDTH, COUNT_WIDTH, ColumnSpec, DURATION_WIDTH, EFFORT_WIDTH, ENDPOINT_WIDTH,
+    ERROR_WIDTH, ID_WIDTH, LayoutTier, MODEL_WIDTH, PROJECT_MEDIUM_WIDTH, PROJECT_WIDE_WIDTH,
+    RATE_WIDTH, STATUS_WIDTH, TIME_WIDTH, TOKEN_WIDTH,
 };
 
 use std::{
@@ -14,8 +13,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(windows)]
+use std::collections::HashSet;
+
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -32,8 +37,11 @@ use tokio::sync::oneshot;
 
 use crate::{
     monitor::{
-        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState,
-        RequestAcceleration, SESSION_TOKEN_BUCKET_SECS, SessionSummary,
+        ActiveRequest, CodexAppendOnlyDiagnostics, CodexCauseSet, CodexDispatchOutcome,
+        CodexDispatchSummary, CodexLane, CodexMetricsSnapshot, CodexPoolDiagnostics,
+        CodexRecoveryCause, CodexRequestDiagnostics, CodexRequestPreviousId,
+        CodexSocketValidationDiagnostics, CompletedRequest, MockMonitor, MonitorHandle,
+        MonitorState, RequestAcceleration, SESSION_TOKEN_BUCKET_SECS, SessionSummary,
     },
     paths,
     registry::Registry,
@@ -54,6 +62,7 @@ const PURPLE: Color = Color::Rgb(190, 140, 240);
 const DIM: Color = Color::Rgb(100, 104, 114);
 const SESSION_SPARKLINE_MIN_WIDTH: u16 = 170;
 const SESSION_SPARKLINE_MAX_TOKENS: u64 = 4_000;
+const CODEX_REQUEST_WIDTH: u16 = 7;
 
 pub struct MonitorUiConfig<'a> {
     pub listen_url: String,
@@ -97,14 +106,14 @@ fn run_monitor_loop(
     config: MonitorUiConfig<'_>,
     setup_text_override: Option<String>,
 ) -> Result<MonitorExit, anyhow::Error> {
-    let mut terminal = setup_terminal()?;
-    let _guard = TerminalGuard;
+    let (mut terminal, _guard) = setup_terminal()?;
     let mut app = MonitorApp {
         listen_url: config.listen_url,
         setup_text: setup_text_override.unwrap_or_else(|| setup_text(config.port, config.registry)),
         show_setup: false,
         show_help: false,
         detail: None,
+        detail_scroll: 0,
         focus: FocusPane::Sessions,
         selected: 0,
         recent_selected: 0,
@@ -132,6 +141,7 @@ fn run_monitor_events(
     mut snapshot: impl FnMut() -> MonitorState,
     app: &mut MonitorApp,
 ) -> Result<MonitorExit, anyhow::Error> {
+    let mut input = MonitorInputState::default();
     loop {
         let state = snapshot();
         app.clamp_selection(state.sessions.len(), state.recent.len());
@@ -140,66 +150,120 @@ fn run_monitor_events(
         if app.shutdown_is_complete() {
             return Ok(MonitorExit::ShutdownComplete);
         }
-        if event::poll(Duration::from_millis(250))? {
-            match event::read()? {
-                Event::Key(key) => match key.code {
-                    KeyCode::Char('c')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && app.handle_ctrl_c() =>
-                    {
-                        return Ok(MonitorExit::ForceQuit);
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
-                    _ if app.phase == MonitorPhase::ShuttingDown => {}
-                    KeyCode::Char('y') if app.phase == MonitorPhase::ConfirmingShutdown => {
-                        app.begin_shutdown()
-                    }
-                    KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q')
-                        if app.phase == MonitorPhase::ConfirmingShutdown =>
-                    {
-                        app.cancel_shutdown_confirmation()
-                    }
-                    _ if app.phase == MonitorPhase::ConfirmingShutdown => {}
-                    KeyCode::Char('q') => app.request_shutdown_confirmation(),
-                    KeyCode::Char('?') => app.show_help = !app.show_help,
-                    KeyCode::Char('b') => app.show_setup = !app.show_setup,
-                    KeyCode::Tab => app.focus = app.focus.next(),
-                    KeyCode::Down => app.move_down(state.sessions.len(), state.recent.len(), true),
-                    KeyCode::Char('j') => {
-                        app.move_down(state.sessions.len(), state.recent.len(), false)
-                    }
-                    KeyCode::Up => app.move_up(state.sessions.len(), state.recent.len(), true),
-                    KeyCode::Char('k') => {
-                        app.move_up(state.sessions.len(), state.recent.len(), false)
-                    }
-                    KeyCode::Right => app.focus = FocusPane::Recent,
-                    KeyCode::Left => app.focus = FocusPane::Sessions,
-                    KeyCode::Enter => {
-                        app.detail = match app.focus {
-                            FocusPane::Sessions if !state.sessions.is_empty() => {
-                                Some(DetailView::Session)
-                            }
-                            FocusPane::Recent if !state.recent.is_empty() => {
-                                Some(DetailView::Request)
-                            }
-                            _ => None,
-                        }
-                    }
-                    KeyCode::Esc => {
-                        if app.show_help {
-                            app.show_help = false;
-                        } else if app.show_setup {
-                            app.show_setup = false;
-                        } else {
-                            app.detail = None;
-                        }
-                    }
-                    _ => {}
-                },
-                Event::Resize(_, _) => {}
-                _ => {}
+        if event::poll(Duration::from_millis(250))?
+            && let Some(exit) = handle_monitor_event(
+                app,
+                &mut input,
+                event::read()?,
+                state.sessions.len(),
+                state.recent.len(),
+            )
+        {
+            return Ok(exit);
+        }
+    }
+}
+
+#[derive(Default)]
+struct MonitorInputState {
+    #[cfg(windows)]
+    held_one_shot_keys: HashSet<KeyCode>,
+}
+
+impl MonitorInputState {
+    fn should_dispatch(&mut self, key: &KeyEvent) -> bool {
+        let repeatable = matches!(
+            key.code,
+            KeyCode::Down | KeyCode::Up | KeyCode::Char('j') | KeyCode::Char('k')
+        );
+        match key.kind {
+            KeyEventKind::Release => {
+                #[cfg(windows)]
+                self.held_one_shot_keys.remove(&key.code);
+                false
+            }
+            KeyEventKind::Repeat => repeatable,
+            KeyEventKind::Press if repeatable => true,
+            KeyEventKind::Press => {
+                #[cfg(windows)]
+                {
+                    self.held_one_shot_keys.insert(key.code)
+                }
+                #[cfg(not(windows))]
+                {
+                    true
+                }
             }
         }
     }
+}
+
+fn handle_monitor_event(
+    app: &mut MonitorApp,
+    input: &mut MonitorInputState,
+    event: Event,
+    sessions: usize,
+    recent: usize,
+) -> Option<MonitorExit> {
+    match event {
+        Event::Key(key) if input.should_dispatch(&key) => match key.code {
+            KeyCode::Char('c')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && app.handle_ctrl_c() =>
+            {
+                return Some(MonitorExit::ForceQuit);
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+            _ if app.phase == MonitorPhase::ShuttingDown => {}
+            KeyCode::Char('y') if app.phase == MonitorPhase::ConfirmingShutdown => {
+                app.begin_shutdown()
+            }
+            KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q')
+                if app.phase == MonitorPhase::ConfirmingShutdown =>
+            {
+                app.cancel_shutdown_confirmation()
+            }
+            _ if app.phase == MonitorPhase::ConfirmingShutdown => {}
+            KeyCode::Char('q') => app.request_shutdown_confirmation(),
+            KeyCode::Char('?') => app.show_help = !app.show_help,
+            KeyCode::Char('b') => app.show_setup = !app.show_setup,
+            KeyCode::Tab => app.focus = app.focus.next(),
+            KeyCode::Down | KeyCode::Char('j') if app.detail.is_some() => app.scroll_detail_down(),
+            KeyCode::Up | KeyCode::Char('k') if app.detail.is_some() => app.scroll_detail_up(),
+            KeyCode::Down => app.move_down(sessions, recent, true),
+            KeyCode::Char('j') => app.move_down(sessions, recent, false),
+            KeyCode::Up => app.move_up(sessions, recent, true),
+            KeyCode::Char('k') => app.move_up(sessions, recent, false),
+            KeyCode::Right => app.focus = FocusPane::Recent,
+            KeyCode::Left => app.focus = FocusPane::Sessions,
+            KeyCode::Enter => {
+                let detail = match app.focus {
+                    FocusPane::Sessions if sessions > 0 => Some(DetailView::Session),
+                    FocusPane::Recent if recent > 0 => Some(DetailView::Request),
+                    _ => None,
+                };
+                app.set_detail(detail);
+            }
+            KeyCode::Esc => {
+                if app.show_help {
+                    app.show_help = false;
+                } else if app.show_setup {
+                    app.show_setup = false;
+                } else {
+                    app.set_detail(None);
+                }
+            }
+            _ => {}
+        },
+        Event::Mouse(mouse) if app.phase == MonitorPhase::Running => match mouse.kind {
+            MouseEventKind::ScrollDown if app.detail.is_some() => app.scroll_detail_down(),
+            MouseEventKind::ScrollUp if app.detail.is_some() => app.scroll_detail_up(),
+            MouseEventKind::ScrollDown => app.move_down(sessions, recent, true),
+            MouseEventKind::ScrollUp => app.move_up(sessions, recent, true),
+            _ => {}
+        },
+        _ => {}
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,7 +281,7 @@ impl FocusPane {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailView {
     Session,
     Request,
@@ -236,6 +300,7 @@ struct MonitorApp {
     show_setup: bool,
     show_help: bool,
     detail: Option<DetailView>,
+    detail_scroll: u16,
     focus: FocusPane,
     selected: usize,
     recent_selected: usize,
@@ -296,8 +361,35 @@ impl MonitorApp {
     }
 
     fn clamp_selection(&mut self, sessions: usize, recent: usize) {
+        let previous_selected = self.selected;
+        let previous_recent_selected = self.recent_selected;
         self.selected = self.selected.min(sessions.saturating_sub(1));
         self.recent_selected = self.recent_selected.min(recent.saturating_sub(1));
+        let selection_changed = match self.detail {
+            Some(DetailView::Session) => self.selected != previous_selected,
+            Some(DetailView::Request) => self.recent_selected != previous_recent_selected,
+            None => false,
+        };
+        if selection_changed {
+            self.detail_scroll = 0;
+        }
+    }
+
+    fn set_detail(&mut self, detail: Option<DetailView>) {
+        self.detail = detail;
+        self.detail_scroll = 0;
+    }
+
+    fn scroll_detail_down(&mut self) {
+        if self.detail.is_some() {
+            self.detail_scroll = self.detail_scroll.saturating_add(1);
+        }
+    }
+
+    fn scroll_detail_up(&mut self) {
+        if self.detail.is_some() {
+            self.detail_scroll = self.detail_scroll.saturating_sub(1);
+        }
     }
 
     fn move_down(&mut self, sessions: usize, recent: usize, switch_panes: bool) {
@@ -346,22 +438,43 @@ impl Drop for MonitorApp {
     }
 }
 
-struct TerminalGuard;
+struct TerminalGuard {
+    raw_mode: bool,
+    alternate_screen: bool,
+    mouse_capture: bool,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        if self.mouse_capture {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
+        if self.alternate_screen {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+        if self.raw_mode {
+            let _ = disable_raw_mode();
+        }
     }
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, anyhow::Error> {
+fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, TerminalGuard), anyhow::Error> {
     enable_raw_mode()?;
+    let mut guard = TerminalGuard {
+        raw_mode: true,
+        alternate_screen: false,
+        mouse_capture: false,
+    };
+
+    guard.alternate_screen = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
+    guard.mouse_capture = true;
+    execute!(io::stdout(), EnableMouseCapture)?;
+
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    Ok(terminal)
+    Ok((terminal, guard))
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorState) {
@@ -377,33 +490,57 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
             Constraint::Percentage(25),
             Constraint::Percentage(25),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
 
     render_header(frame, root[0], app, state);
-    match app.detail {
-        Some(DetailView::Session) => render_session_detail(frame, root[1], state, app.selected),
-        Some(DetailView::Request) => {
-            render_request_detail(frame, root[1], state, app.recent_selected)
+    if let Some(detail) = app.detail {
+        let detail_area = Rect {
+            x: root[1].x,
+            y: root[1].y,
+            width: root[1].width,
+            height: root[4]
+                .y
+                .saturating_add(root[4].height)
+                .saturating_sub(root[1].y),
+        };
+        match detail {
+            DetailView::Session => render_session_detail_scrolled(
+                frame,
+                detail_area,
+                state,
+                app.selected,
+                &mut app.detail_scroll,
+            ),
+            DetailView::Request => render_request_detail_scrolled(
+                frame,
+                detail_area,
+                state,
+                app.recent_selected,
+                &mut app.detail_scroll,
+            ),
         }
-        None => render_sessions(
+    } else {
+        render_sessions(
             frame,
             root[1],
             &state.sessions,
             app.selected,
             app.focus == FocusPane::Sessions,
-        ),
+        );
+        render_active(frame, root[2], &state.active, app.tick);
+        render_recent(
+            frame,
+            root[3],
+            &state.recent,
+            app.recent_selected,
+            app.focus == FocusPane::Recent,
+        );
+        render_events(frame, root[4], &state.recent);
     }
-    render_active(frame, root[2], &state.active, app.tick);
-    render_recent(
-        frame,
-        root[3],
-        &state.recent,
-        app.recent_selected,
-        app.focus == FocusPane::Recent,
-    );
-    render_events(frame, root[4], &state.recent);
-    render_footer(frame, root[5], app);
+    render_codex_metrics(frame, root[5], &state.codex);
+    render_footer(frame, root[6], app);
 
     if app.show_setup {
         render_setup_overlay(frame, area, &app.setup_text);
@@ -536,8 +673,18 @@ fn text_cell(value: impl Into<String>) -> Cell<'static> {
     Cell::from(Span::styled(value.into(), Style::default().fg(DIM_WHITE)))
 }
 
-fn model_cell(value: Option<&str>, width: usize) -> Cell<'static> {
-    text_cell(ellipsize(value.unwrap_or("-"), width))
+fn model_cell(value: Option<&str>, codex_priority: bool, width: usize) -> Cell<'static> {
+    let value = value.map_or_else(
+        || "-".to_string(),
+        |model| {
+            if codex_priority {
+                format!("f|{model}")
+            } else {
+                model.to_string()
+            }
+        },
+    );
+    text_cell(ellipsize(&value, width))
 }
 
 fn table_column_width(area: Rect, widths: &[Constraint], column: usize) -> usize {
@@ -566,7 +713,7 @@ fn ellipsize(value: &str, width: usize) -> String {
 
 fn display_session_id(session_id: Option<&str>) -> &str {
     let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
-        return "no-session";
+        return "-";
     };
     if uuid::Uuid::parse_str(session_id).is_ok() {
         return session_id
@@ -574,6 +721,35 @@ fn display_session_id(session_id: Option<&str>) -> &str {
             .map_or(session_id, |(first, _)| first);
     }
     session_id
+}
+
+fn truncate_id(value: &str, width: usize) -> &str {
+    value
+        .char_indices()
+        .nth(width)
+        .map_or(value, |(index, _)| &value[..index])
+}
+
+fn display_agent_id<'a>(session_id: Option<&str>, agent_id: Option<&'a str>) -> &'a str {
+    if let Some(agent_id) = agent_id.filter(|value| !value.is_empty()) {
+        return truncate_id(agent_id, usize::from(AGENT_WIDTH));
+    }
+    if session_id.is_some_and(|value| !value.is_empty()) {
+        "main"
+    } else {
+        "-"
+    }
+}
+
+fn identity_cell(value: &str, width: usize) -> Cell<'static> {
+    text_cell(ellipsize(value, width))
+}
+
+fn mapped_model_detail<'a>(
+    model: Option<&str>,
+    resolved_model: Option<&'a str>,
+) -> Option<&'a str> {
+    resolved_model.filter(|resolved| Some(*resolved) != model)
 }
 
 fn number_cell(value: impl Into<String>) -> Cell<'static> {
@@ -630,18 +806,6 @@ fn rate_cell(value: String) -> Cell<'static> {
     )
 }
 
-fn provider_cell(value: Option<&str>) -> Cell<'static> {
-    let value = value.unwrap_or("-");
-    let color = match value {
-        "codex" => TEAL,
-        "kimi" => Color::Rgb(190, 150, 220),
-        "cursor" => Color::Rgb(140, 170, 230),
-        "-" => DIM,
-        _ => DIM_WHITE,
-    };
-    Cell::from(Span::styled(value.to_string(), Style::default().fg(color)))
-}
-
 fn detail_cell(value: &str) -> Cell<'static> {
     if value.is_empty() || value == "-" {
         Cell::from(Span::styled("", Style::default().fg(DIM)))
@@ -664,18 +828,45 @@ fn error_indicator(request: &CompletedRequest) -> &'static str {
     }
 }
 
-fn compact_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
+fn compact_metric(value: u64, units: &[&str]) -> String {
+    let mut scaled = value as f64;
+    let mut unit = 0;
+    while scaled >= 1_000.0 && unit < units.len() - 1 {
+        scaled /= 1_000.0;
+        unit += 1;
     }
+    if unit > 0 && scaled >= 999.5 && unit < units.len() - 1 {
+        scaled /= 1_000.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{value}{}", units[unit])
+    } else if scaled < 100.0 {
+        format!("{scaled:.1}{}", units[unit])
+    } else {
+        format!("{scaled:.0}{}", units[unit])
+    }
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    compact_metric(tokens, &["", "k", "M", "G", "T", "P", "E"])
 }
 
 fn token_value(value: Option<u64>) -> String {
     value.map(compact_tokens).unwrap_or_else(|| "-".to_string())
+}
+
+fn compact_bytes(bytes: u64) -> String {
+    compact_metric(bytes, &["B", "kB", "MB", "GB", "TB", "PB", "EB"])
+}
+
+fn active_output_value(output_tokens: Option<u64>, streamed_bytes: u64) -> String {
+    output_tokens
+        .filter(|tokens| *tokens > 0)
+        .map(compact_tokens)
+        .or_else(|| (streamed_bytes > 0).then(|| compact_bytes(streamed_bytes)))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn spinner(tick: usize) -> &'static str {
@@ -749,12 +940,6 @@ fn column_header<K>(columns: &[ColumnSpec<K>]) -> Row<'static> {
     )
 }
 
-fn target_cell(provider: Option<&str>, model: Option<&str>, width: usize) -> Cell<'static> {
-    let provider = provider.unwrap_or("-");
-    let model = model.unwrap_or("-");
-    text_cell(ellipsize(&format!("{provider}/{model}"), width))
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionColumn {
     Marker,
@@ -764,9 +949,7 @@ enum SessionColumn {
     Requests,
     Failures,
     Counts,
-    Provider,
     Model,
-    Target,
     Effort,
     Input,
     Output,
@@ -785,8 +968,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
             ColumnSpec::fixed(C::Active, "A", Alignment::Right, COUNT_WIDTH),
             ColumnSpec::fixed(C::Requests, "R", Alignment::Right, COUNT_WIDTH),
             ColumnSpec::fixed(C::Failures, "F", Alignment::Right, COUNT_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
@@ -799,8 +981,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_MEDIUM_WIDTH),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_NARROW_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
@@ -811,10 +992,9 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
         (LayoutTier::Medium, _) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_MEDIUM_WIDTH),
+            ColumnSpec::flex(C::Project, "Project", Alignment::Left, 1),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
             ColumnSpec::fixed(C::Activity, "Tok/10s", Alignment::Left, 8),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
@@ -822,17 +1002,16 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
         (LayoutTier::Narrow, _) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, 10),
+            ColumnSpec::flex(C::Project, "Project", Alignment::Left, 1),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
-            ColumnSpec::flex(C::Target, "Target", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
             ColumnSpec::fixed(C::Activity, "Trend", Alignment::Left, 6),
-            ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
         ],
         (LayoutTier::Emergency, _) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
-            ColumnSpec::flex(C::Target, "Target", Alignment::Left, 1),
+            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
         ],
     }
@@ -871,7 +1050,7 @@ fn render_sessions(
                         Cell::from(Span::styled(marker, Style::default().fg(TEAL)))
                     }
                     SessionColumn::Id => {
-                        text_cell(display_session_id(session.session_id.as_deref()))
+                        identity_cell(display_session_id(session.session_id.as_deref()), width)
                     }
                     SessionColumn::Project => {
                         text_cell(ellipsize(session.project.as_deref().unwrap_or("-"), width))
@@ -883,11 +1062,14 @@ fn render_sessions(
                         "{}/{}/{}",
                         session.active_count, session.request_count, session.failure_count
                     )),
-                    SessionColumn::Provider => provider_cell(session.provider.as_deref()),
-                    SessionColumn::Model => model_cell(session.model.as_deref(), width),
-                    SessionColumn::Target => {
-                        target_cell(session.provider.as_deref(), session.model.as_deref(), width)
-                    }
+                    SessionColumn::Model => model_cell(
+                        session
+                            .resolved_model
+                            .as_deref()
+                            .or(session.model.as_deref()),
+                        session.codex_priority,
+                        width,
+                    ),
                     SessionColumn::Effort => text_cell(session.effort.as_deref().unwrap_or("-")),
                     SessionColumn::Input => number_cell(compact_tokens(session.input_tokens)),
                     SessionColumn::Output => number_cell(compact_tokens(session.output_tokens)),
@@ -914,15 +1096,181 @@ fn render_sessions(
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
+fn codex_dispatch_short(summary: &CodexDispatchSummary) -> char {
+    if summary.switches > 0 {
+        'S'
+    } else if summary.reuses > 0 {
+        'R'
+    } else if summary.baselines > 0 {
+        'B'
+    } else {
+        '-'
+    }
+}
+
+fn codex_request_text(diagnostics: Option<&CodexRequestDiagnostics>) -> String {
+    let Some(diagnostics) = diagnostics else {
+        return "- -/-/-".to_string();
+    };
+    let lane = match diagnostics.lane {
+        Some(CodexLane::Lite) => 'L',
+        Some(CodexLane::Full) => 'F',
+        None => '-',
+    };
+    let previous_id = match diagnostics.previous_id {
+        CodexRequestPreviousId::NotApplicable => '-',
+        CodexRequestPreviousId::Pending => 'P',
+        CodexRequestPreviousId::NoCandidate => 'N',
+        CodexRequestPreviousId::Hit => 'H',
+        CodexRequestPreviousId::Fallback => 'F',
+        CodexRequestPreviousId::Unsettled => 'U',
+    };
+    format!(
+        "{lane} {previous_id}/{}/{}",
+        codex_dispatch_short(&diagnostics.route),
+        codex_dispatch_short(&diagnostics.socket),
+    )
+}
+
+fn codex_request_cell(diagnostics: Option<&CodexRequestDiagnostics>) -> Cell<'static> {
+    Cell::from(Span::styled(
+        codex_request_text(diagnostics),
+        Style::default().fg(if diagnostics.is_some() { TEAL } else { DIM }),
+    ))
+}
+
+fn codex_previous_id_detail(previous_id: CodexRequestPreviousId) -> &'static str {
+    match previous_id {
+        CodexRequestPreviousId::NotApplicable => "not applicable",
+        CodexRequestPreviousId::Pending => "pending",
+        CodexRequestPreviousId::NoCandidate => "no candidate",
+        CodexRequestPreviousId::Hit => "hit",
+        CodexRequestPreviousId::Fallback => "fallback",
+        CodexRequestPreviousId::Unsettled => "unsettled",
+    }
+}
+
+fn codex_recovery_cause_label(cause: CodexRecoveryCause) -> &'static str {
+    match cause {
+        CodexRecoveryCause::MissingState => "missing state",
+        CodexRecoveryCause::SupersededTurn => "superseded turn",
+        CodexRecoveryCause::PromptChanged => "prompt changed",
+        CodexRecoveryCause::NotAppendOnly => "history not append-only",
+        CodexRecoveryCause::EmptyDelta => "empty delta",
+        CodexRecoveryCause::RouteChanged => "route changed",
+        CodexRecoveryCause::CompactionReplay => "compaction replay",
+        CodexRecoveryCause::AuthRejection => "auth rejection",
+        CodexRecoveryCause::PreviousResponseMissing => "previous response missing",
+        CodexRecoveryCause::OriginSocketMissing => "exact origin unavailable",
+        CodexRecoveryCause::SocketValidationFailed => "socket validation failed",
+        CodexRecoveryCause::ResponseStartTimeout => "response start timeout",
+        CodexRecoveryCause::MissingTerminal => "terminal event missing",
+        CodexRecoveryCause::EmptyCompletion => "empty completion",
+        CodexRecoveryCause::RetryableUpstreamEvent => "retryable upstream event",
+        CodexRecoveryCause::TransportFailure => "transport failure",
+        CodexRecoveryCause::Cancelled => "cancelled",
+    }
+}
+
+fn codex_socket_recovery_detail(causes: CodexCauseSet) -> String {
+    if causes.is_empty() {
+        return "-".to_string();
+    }
+    causes
+        .iter()
+        .map(codex_recovery_cause_label)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn codex_append_only_detail(diagnostics: Option<CodexAppendOnlyDiagnostics>) -> String {
+    let Some(diagnostics) = diagnostics else {
+        return "-".to_string();
+    };
+    let outcome = match diagnostics.outcome {
+        crate::monitor::CodexAppendOnlyOutcome::Appended => "appended".to_string(),
+        crate::monitor::CodexAppendOnlyOutcome::NoDelta => "no delta".to_string(),
+        crate::monitor::CodexAppendOnlyOutcome::RetainedLonger => {
+            "retained history longer".to_string()
+        }
+        crate::monitor::CodexAppendOnlyOutcome::FirstMismatch => format!(
+            "first mismatch at item {}",
+            diagnostics.first_mismatch_index.unwrap_or(0)
+        ),
+    };
+    format!(
+        "{outcome} · incoming/retained/delta {}/{}/{}",
+        diagnostics.incoming_items, diagnostics.retained_items, diagnostics.delta_items
+    )
+}
+
+fn codex_pool_detail(diagnostics: CodexPoolDiagnostics) -> String {
+    let Some(latest) = diagnostics.latest else {
+        return "-".to_string();
+    };
+    format!(
+        "{} · {} lookups · hit/miss {}/{} · exact ok/missing/mismatch {}/{}/{}",
+        latest.label().replace('_', " "),
+        diagnostics.lookups,
+        diagnostics.hits,
+        diagnostics.misses,
+        diagnostics.exact_matches,
+        diagnostics.exact_unavailable,
+        diagnostics.exact_mismatches,
+    )
+}
+
+fn codex_validation_detail(diagnostics: CodexSocketValidationDiagnostics) -> String {
+    if diagnostics.attempts == 0 {
+        return "-".to_string();
+    }
+    let outcome = diagnostics.latest_failure.map_or_else(
+        || "passed".to_string(),
+        |failure| format!("failed: {}", failure.label().replace('_', " ")),
+    );
+    let origin = if diagnostics.latest_required_origin {
+        " · exact origin required"
+    } else {
+        ""
+    };
+    format!(
+        "{outcome} · {}ms · pass/fail {}/{}{origin}",
+        diagnostics.latest_elapsed_ms, diagnostics.successes, diagnostics.failures
+    )
+}
+
+fn codex_dispatch_detail(summary: &CodexDispatchSummary) -> String {
+    let outcome = |outcome| match outcome {
+        CodexDispatchOutcome::Baseline => "baseline",
+        CodexDispatchOutcome::Reuse => "reuse",
+        CodexDispatchOutcome::Switch => "switch",
+    };
+    let Some(latest) = summary.latest else {
+        return "-".to_string();
+    };
+    if summary.dispatches == 1 {
+        return outcome(latest).to_string();
+    }
+    format!(
+        "{} -> {} · {} sends · B/R/S {}/{}/{}",
+        outcome(summary.first.unwrap_or(latest)),
+        outcome(latest),
+        summary.dispatches,
+        summary.baselines,
+        summary.reuses,
+        summary.switches,
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActiveColumn {
     Started,
     Status,
     Project,
     Session,
-    Provider,
+    Agent,
     Model,
-    Target,
+    Codex,
     Effort,
     Endpoint,
     Input,
@@ -939,8 +1287,9 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
             ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_WIDE_WIDTH),
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::flex(C::Endpoint, "Endpoint", Alignment::Left, 1),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
@@ -951,38 +1300,40 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
         LayoutTier::Expanded => vec![
             ColumnSpec::fixed(C::Started, "Started", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_MEDIUM_WIDTH),
+            ColumnSpec::flex(C::Project, "Project", Alignment::Left, 1),
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
-            ColumnSpec::fixed(C::Endpoint, "Endpoint", Alignment::Left, ENDPOINT_WIDTH),
+            ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
             ColumnSpec::fixed(C::Elapsed, "Elapsed", Alignment::Right, DURATION_WIDTH),
         ],
         LayoutTier::Medium => vec![
-            ColumnSpec::fixed(C::Started, "Started", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
-            ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
-            ColumnSpec::fixed(C::Endpoint, "Endpoint", Alignment::Left, ENDPOINT_WIDTH),
+            ColumnSpec::flex(C::Project, "Project", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
             ColumnSpec::fixed(C::Elapsed, "Elapsed", Alignment::Right, DURATION_WIDTH),
         ],
         LayoutTier::Narrow => vec![
-            ColumnSpec::fixed(C::Started, "Started", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
-            ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
+            ColumnSpec::flex(C::Session, "Session", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
             ColumnSpec::fixed(C::Elapsed, "Elapsed", Alignment::Right, DURATION_WIDTH),
         ],
         LayoutTier::Emergency => vec![
-            ColumnSpec::fixed(C::Started, "Started", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
-            ColumnSpec::flex(C::Target, "Target", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
+            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Elapsed, "Elapsed", Alignment::Right, DURATION_WIDTH),
         ],
     }
@@ -1022,17 +1373,31 @@ fn render_active(
                         text_cell(ellipsize(request.project.as_deref().unwrap_or("-"), width))
                     }
                     ActiveColumn::Session => {
-                        text_cell(display_session_id(request.session_id.as_deref()))
+                        identity_cell(display_session_id(request.session_id.as_deref()), width)
                     }
-                    ActiveColumn::Provider => provider_cell(request.provider.as_deref()),
-                    ActiveColumn::Model => model_cell(request.model.as_deref(), width),
-                    ActiveColumn::Target => {
-                        target_cell(request.provider.as_deref(), request.model.as_deref(), width)
-                    }
+                    ActiveColumn::Agent => identity_cell(
+                        display_agent_id(
+                            request.session_id.as_deref(),
+                            request.agent_id.as_deref(),
+                        ),
+                        width,
+                    ),
+                    ActiveColumn::Model => model_cell(
+                        request
+                            .resolved_model
+                            .as_deref()
+                            .or(request.model.as_deref()),
+                        request.codex_priority(),
+                        width,
+                    ),
+                    ActiveColumn::Codex => codex_request_cell(request.codex_diagnostics()),
                     ActiveColumn::Effort => text_cell(request.effort.as_deref().unwrap_or("-")),
                     ActiveColumn::Endpoint => muted_cell(request.endpoint.label()),
                     ActiveColumn::Input => number_cell(token_value(request.input_tokens)),
-                    ActiveColumn::Output => number_cell(token_value(request.output_tokens)),
+                    ActiveColumn::Output => number_cell(active_output_value(
+                        request.output_tokens,
+                        request.streamed_bytes,
+                    )),
                     ActiveColumn::Rate => rate_cell(request.rate().label()),
                     ActiveColumn::Elapsed => number_cell(format_duration(request.elapsed())),
                 }
@@ -1052,9 +1417,9 @@ enum RecentColumn {
     Code,
     Project,
     Session,
-    Provider,
+    Agent,
     Model,
-    Target,
+    Codex,
     Effort,
     Endpoint,
     Latency,
@@ -1073,8 +1438,9 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
             ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_WIDE_WIDTH),
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Endpoint, "Endpoint", Alignment::Left, ENDPOINT_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
@@ -1086,11 +1452,11 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
         LayoutTier::Expanded => vec![
             ColumnSpec::fixed(C::Finished, "Finished", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_MEDIUM_WIDTH),
+            ColumnSpec::flex(C::Project, "Project", Alignment::Left, 1),
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
-            ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
@@ -1098,11 +1464,11 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
         ],
         LayoutTier::Medium => vec![
-            ColumnSpec::fixed(C::Finished, "Finished", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
-            ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
+            ColumnSpec::flex(C::Session, "Session", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
@@ -1110,21 +1476,19 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
         ],
         LayoutTier::Narrow => vec![
-            ColumnSpec::fixed(C::Finished, "Finished", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
+            ColumnSpec::flex(C::Session, "Session", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
-            ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
-            ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
         ],
         LayoutTier::Emergency => vec![
-            ColumnSpec::fixed(C::Finished, "Finished", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
-            ColumnSpec::flex(C::Target, "Target", Alignment::Left, 1),
-            ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
+            ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
+            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
         ],
     }
@@ -1175,13 +1539,24 @@ fn render_recent(
                         text_cell(ellipsize(request.project.as_deref().unwrap_or("-"), width))
                     }
                     RecentColumn::Session => {
-                        text_cell(display_session_id(request.session_id.as_deref()))
+                        identity_cell(display_session_id(request.session_id.as_deref()), width)
                     }
-                    RecentColumn::Provider => provider_cell(request.provider.as_deref()),
-                    RecentColumn::Model => model_cell(request.model.as_deref(), width),
-                    RecentColumn::Target => {
-                        target_cell(request.provider.as_deref(), request.model.as_deref(), width)
-                    }
+                    RecentColumn::Agent => identity_cell(
+                        display_agent_id(
+                            request.session_id.as_deref(),
+                            request.agent_id.as_deref(),
+                        ),
+                        width,
+                    ),
+                    RecentColumn::Model => model_cell(
+                        request
+                            .resolved_model
+                            .as_deref()
+                            .or(request.model.as_deref()),
+                        request.codex_priority(),
+                        width,
+                    ),
+                    RecentColumn::Codex => codex_request_cell(request.codex_diagnostics()),
                     RecentColumn::Effort => text_cell(request.effort.as_deref().unwrap_or("-")),
                     RecentColumn::Endpoint => muted_cell(request.endpoint.label()),
                     RecentColumn::Latency => number_cell(format_duration(request.latency)),
@@ -1212,7 +1587,7 @@ enum EventColumn {
     Code,
     Project,
     Session,
-    Provider,
+    Agent,
     Model,
     Message,
 }
@@ -1225,30 +1600,25 @@ fn event_columns(tier: LayoutTier) -> Vec<ColumnSpec<EventColumn>> {
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
             ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_WIDE_WIDTH),
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
             ColumnSpec::flex(C::Message, "Message", Alignment::Left, 1),
         ],
         LayoutTier::Expanded => vec![
             ColumnSpec::fixed(C::Time, "Time", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
             ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_MEDIUM_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_MEDIUM_WIDTH),
+            ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
             ColumnSpec::flex(C::Message, "Message", Alignment::Left, 1),
         ],
-        LayoutTier::Medium => vec![
+        LayoutTier::Medium | LayoutTier::Narrow => vec![
             ColumnSpec::fixed(C::Time, "Time", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_MEDIUM_WIDTH),
-            ColumnSpec::flex(C::Message, "Message", Alignment::Left, 1),
-        ],
-        LayoutTier::Narrow => vec![
-            ColumnSpec::fixed(C::Time, "Time", Alignment::Left, TIME_WIDTH),
-            ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
-            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_NARROW_WIDTH),
+            ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
+            ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
             ColumnSpec::flex(C::Message, "Message", Alignment::Left, 1),
         ],
         LayoutTier::Emergency => vec![
@@ -1294,10 +1664,23 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
                         text_cell(ellipsize(request.project.as_deref().unwrap_or("-"), width))
                     }
                     EventColumn::Session => {
-                        text_cell(display_session_id(request.session_id.as_deref()))
+                        identity_cell(display_session_id(request.session_id.as_deref()), width)
                     }
-                    EventColumn::Provider => provider_cell(request.provider.as_deref()),
-                    EventColumn::Model => model_cell(request.model.as_deref(), width),
+                    EventColumn::Agent => identity_cell(
+                        display_agent_id(
+                            request.session_id.as_deref(),
+                            request.agent_id.as_deref(),
+                        ),
+                        width,
+                    ),
+                    EventColumn::Model => model_cell(
+                        request
+                            .resolved_model
+                            .as_deref()
+                            .or(request.model.as_deref()),
+                        request.codex_priority(),
+                        width,
+                    ),
                     EventColumn::Message => detail_cell(message),
                 }
             })
@@ -1310,14 +1693,15 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
     frame.render_widget(table, area);
 }
 
-fn render_session_detail(
+fn render_session_detail_scrolled(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     state: &MonitorState,
     selected: usize,
+    scroll: &mut u16,
 ) {
     let lines = if let Some(session) = state.sessions.get(selected) {
-        vec![
+        let mut lines = vec![
             detail_line("session", session.label(), WHITE),
             detail_line("project", session.project.as_deref().unwrap_or("-"), TEAL),
             detail_line("active requests", session.active_count.to_string(), YELLOW),
@@ -1327,8 +1711,14 @@ fn render_session_detail(
                 DIM_WHITE,
             ),
             detail_line("failures", session.failure_count.to_string(), RED),
-            detail_line("provider", session.provider.as_deref().unwrap_or("-"), TEAL),
             detail_line("model", session.model.as_deref().unwrap_or("-"), DIM_WHITE),
+        ];
+        if let Some(mapped) =
+            mapped_model_detail(session.model.as_deref(), session.resolved_model.as_deref())
+        {
+            lines.push(detail_line("mapped model", mapped, DIM));
+        }
+        lines.extend([
             detail_line("effort", session.effort.as_deref().unwrap_or("-"), YELLOW),
             detail_line(
                 "input tokens",
@@ -1355,19 +1745,26 @@ fn render_session_detail(
                 session.last_status.as_str(),
                 status_color(&session.last_status),
             ),
-        ]
+        ]);
+        lines
     } else {
         vec![Line::from(Span::styled(
             "No session selected",
             Style::default().fg(DIM),
         ))]
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(PANEL_BG))
-            .block(panel("Session detail", true)),
-        area,
-    );
+    render_detail_lines(frame, area, lines, "Session detail", scroll);
+}
+
+#[cfg(test)]
+fn render_session_detail(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &MonitorState,
+    selected: usize,
+) {
+    let mut scroll = 0;
+    render_session_detail_scrolled(frame, area, state, selected, &mut scroll);
 }
 
 fn format_acceleration(acceleration: RequestAcceleration) -> String {
@@ -1382,11 +1779,12 @@ fn format_acceleration(acceleration: RequestAcceleration) -> String {
     }
 }
 
-fn render_request_detail(
+fn render_request_detail_scrolled(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     state: &MonitorState,
     selected: usize,
+    scroll: &mut u16,
 ) {
     let lines = if let Some(request) = state.recent.get(selected) {
         let mut lines = vec![
@@ -1396,6 +1794,29 @@ fn render_request_detail(
                 display_session_id(request.session_id.as_deref()),
                 TEAL,
             ),
+            detail_line(
+                "agent",
+                display_agent_id(request.session_id.as_deref(), request.agent_id.as_deref()),
+                TEAL,
+            ),
+            detail_line("model", request.model.as_deref().unwrap_or("-"), DIM_WHITE),
+        ];
+        if let Some(mapped) =
+            mapped_model_detail(request.model.as_deref(), request.resolved_model.as_deref())
+        {
+            lines.push(detail_line("mapped model", mapped, DIM));
+        }
+        if let Some(error) = request.error.as_deref().filter(|error| !error.is_empty()) {
+            lines.push(detail_line("detail", error, YELLOW));
+        }
+        if let Some(path) = &request.traffic_capture_path {
+            lines.push(detail_line(
+                "capture",
+                path.to_string_lossy().into_owned(),
+                DIM_WHITE,
+            ));
+        }
+        lines.extend([
             detail_line(
                 "session seq",
                 request
@@ -1424,10 +1845,8 @@ fn render_request_detail(
                     .unwrap_or_else(|| "-".to_string()),
                 http_status_color(request.http_status),
             ),
-            detail_line("provider", request.provider.as_deref().unwrap_or("-"), TEAL),
-            detail_line("model", request.model.as_deref().unwrap_or("-"), DIM_WHITE),
             detail_line("effort", request.effort.as_deref().unwrap_or("-"), YELLOW),
-        ];
+        ]);
         if let Some(acceleration) = request
             .codex_diagnostics()
             .map(|diagnostics| diagnostics.acceleration)
@@ -1459,15 +1878,59 @@ fn render_request_detail(
                 DIM_WHITE,
             ),
         ]);
-        if let Some(error) = request.error.as_deref().filter(|error| !error.is_empty()) {
-            lines.push(detail_line("detail", error, YELLOW));
-        }
-        if let Some(path) = &request.traffic_capture_path {
-            lines.push(detail_line(
-                "capture",
-                path.to_string_lossy().into_owned(),
-                DIM_WHITE,
-            ));
+        if let Some(diagnostics) = request.codex_diagnostics() {
+            let lane = match diagnostics.lane {
+                Some(CodexLane::Lite) => "lite",
+                Some(CodexLane::Full) => "full",
+                None => "-",
+            };
+            lines.extend([
+                detail_line("codex lane", lane, TEAL),
+                detail_line(
+                    "previous ID",
+                    codex_previous_id_detail(diagnostics.previous_id),
+                    YELLOW,
+                ),
+                detail_line(
+                    "previous cause",
+                    diagnostics
+                        .recovery
+                        .previous_id_cause
+                        .map(codex_recovery_cause_label)
+                        .unwrap_or("-"),
+                    YELLOW,
+                ),
+                detail_line(
+                    "socket recovery",
+                    codex_socket_recovery_detail(diagnostics.recovery.socket_causes),
+                    DIM_WHITE,
+                ),
+                detail_line(
+                    "append check",
+                    codex_append_only_detail(diagnostics.append_only),
+                    DIM_WHITE,
+                ),
+                detail_line(
+                    "pool lookup",
+                    codex_pool_detail(diagnostics.pool),
+                    DIM_WHITE,
+                ),
+                detail_line(
+                    "socket validate",
+                    codex_validation_detail(diagnostics.validation),
+                    DIM_WHITE,
+                ),
+                detail_line(
+                    "route dispatch",
+                    codex_dispatch_detail(&diagnostics.route),
+                    DIM_WHITE,
+                ),
+                detail_line(
+                    "socket dispatch",
+                    codex_dispatch_detail(&diagnostics.socket),
+                    DIM_WHITE,
+                ),
+            ]);
         }
         lines
     } else {
@@ -1476,10 +1939,38 @@ fn render_request_detail(
             Style::default().fg(DIM),
         ))]
     };
+    render_detail_lines(frame, area, lines, "Request detail", scroll);
+}
+
+#[cfg(test)]
+fn render_request_detail(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &MonitorState,
+    selected: usize,
+) {
+    let mut scroll = 0;
+    render_request_detail_scrolled(frame, area, state, selected, &mut scroll);
+}
+
+fn render_detail_lines(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'_>>,
+    title: &'static str,
+    scroll: &mut u16,
+) {
+    let visible_lines = usize::from(area.height.saturating_sub(2));
+    let max_scroll = lines
+        .len()
+        .saturating_sub(visible_lines)
+        .min(usize::from(u16::MAX)) as u16;
+    *scroll = (*scroll).min(max_scroll);
     frame.render_widget(
         Paragraph::new(lines)
+            .scroll((*scroll, 0))
             .style(Style::default().bg(PANEL_BG))
-            .block(panel("Request detail", true)),
+            .block(panel(title, true)),
         area,
     );
 }
@@ -1489,6 +1980,71 @@ fn detail_line<'a>(label: &'static str, value: impl Into<String>, value_color: C
         Span::styled(format!("  {label:<16}"), Style::default().fg(DIM)),
         Span::styled(value.into(), Style::default().fg(value_color)),
     ])
+}
+
+fn codex_metrics_text(width: u16, metrics: &CodexMetricsSnapshot) -> String {
+    let wide = format!(
+        " Codex  PrevID N/H/F {}/{}/{} │ Route B/R/S {}/{}/{} (lane {}) │ Socket B/R/S {}/{}/{}",
+        metrics.previous_id_no_candidates,
+        metrics.previous_id_hits,
+        metrics.previous_id_fallbacks,
+        metrics.route_baselines,
+        metrics.route_reuses,
+        metrics.route_switches,
+        metrics.lane_switches,
+        metrics.socket_baselines,
+        metrics.socket_reuses,
+        metrics.socket_switches,
+    );
+    if wide.chars().count() <= usize::from(width) {
+        return wide;
+    }
+
+    let medium = format!(
+        " Codex  P N/H/F {}/{}/{} │ R B/R/S {}/{}/{} L{} │ S B/R/S {}/{}/{}",
+        metrics.previous_id_no_candidates,
+        metrics.previous_id_hits,
+        metrics.previous_id_fallbacks,
+        metrics.route_baselines,
+        metrics.route_reuses,
+        metrics.route_switches,
+        metrics.lane_switches,
+        metrics.socket_baselines,
+        metrics.socket_reuses,
+        metrics.socket_switches,
+    );
+    if medium.chars().count() <= usize::from(width) {
+        return medium;
+    }
+
+    format!(
+        " P {}/{}/{} R {}/{}/{} L{} S {}/{}/{}",
+        metrics.previous_id_no_candidates,
+        metrics.previous_id_hits,
+        metrics.previous_id_fallbacks,
+        metrics.route_baselines,
+        metrics.route_reuses,
+        metrics.route_switches,
+        metrics.lane_switches,
+        metrics.socket_baselines,
+        metrics.socket_reuses,
+        metrics.socket_switches,
+    )
+}
+
+fn render_codex_metrics(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    metrics: &CodexMetricsSnapshot,
+) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            codex_metrics_text(area.width, metrics),
+            Style::default().fg(DIM_WHITE),
+        )))
+        .style(Style::default().bg(BG)),
+        area,
+    );
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) {
@@ -1501,7 +2057,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled("b", Style::default().fg(TEAL)),
         Span::styled(" setup  ", Style::default().fg(DIM)),
         Span::styled("arrows/j/k", Style::default().fg(TEAL)),
-        Span::styled(" navigate  ", Style::default().fg(DIM)),
+        Span::styled(" navigate/scroll  ", Style::default().fg(DIM)),
         Span::styled("Tab", Style::default().fg(TEAL)),
         Span::styled(" pane  ", Style::default().fg(DIM)),
         Span::styled("Enter", Style::default().fg(TEAL)),
@@ -1608,10 +2164,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("q / Ctrl-C", "quit proxy"),
         ("?", "toggle help"),
         ("b", "toggle setup"),
-        ("arrows", "navigate rows and panes"),
-        ("j / k", "previous / next row"),
+        ("arrows", "navigate / scroll detail"),
+        ("j / k", "rows / scroll detail"),
         ("Tab", "switch pane"),
-        ("Enter", "open detail"),
+        ("Enter", "open full detail"),
         ("Esc", "close overlay / detail"),
     ];
     let content = lines
@@ -1764,6 +2320,47 @@ mod tests {
             .join("\n")
     }
 
+    fn test_app() -> MonitorApp {
+        MonitorApp {
+            listen_url: "http://127.0.0.1:3000".to_string(),
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            detail_scroll: 0,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            phase: MonitorPhase::Running,
+            shutdown: None,
+            shutdown_complete: Some(mpsc::channel().1),
+        }
+    }
+
+    fn key_event(code: KeyCode, kind: KeyEventKind) -> Event {
+        key_event_with_modifiers(code, KeyModifiers::NONE, kind)
+    }
+
+    fn key_event_with_modifiers(
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        kind: KeyEventKind,
+    ) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            code, modifiers, kind,
+        ))
+    }
+
+    fn mouse_event(kind: MouseEventKind) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
     fn placeholder_position(buffer: &Buffer, placeholder: &str) -> Option<(u16, u16)> {
         let symbols = placeholder
             .chars()
@@ -1834,6 +2431,68 @@ mod tests {
     }
 
     #[test]
+    fn codex_metrics_row_uses_responsive_labels() {
+        let metrics = CodexMetricsSnapshot {
+            previous_id_no_candidates: 5,
+            previous_id_hits: 42,
+            previous_id_fallbacks: 7,
+            route_baselines: 5,
+            route_reuses: 38,
+            route_switches: 3,
+            lane_switches: 2,
+            socket_baselines: 5,
+            socket_reuses: 31,
+            socket_switches: 10,
+        };
+
+        let wide = codex_metrics_text(120, &metrics);
+        assert!(wide.contains("PrevID N/H/F 5/42/7"), "{wide}");
+        assert!(wide.contains("Route B/R/S 5/38/3 (lane 2)"), "{wide}");
+        assert!(wide.contains("Socket B/R/S 5/31/10"), "{wide}");
+
+        let medium = codex_metrics_text(70, &metrics);
+        assert!(medium.contains("P N/H/F 5/42/7"), "{medium}");
+        assert!(medium.contains("R B/R/S 5/38/3 L2"), "{medium}");
+        assert!(medium.contains("S B/R/S 5/31/10"), "{medium}");
+
+        let mut growing = metrics;
+        growing.previous_id_no_candidates = 10;
+        let boundary = codex_metrics_text(60, &growing);
+        assert_eq!(boundary, " P 10/42/7 R 5/38/3 L2 S 5/31/10");
+        assert!(boundary.chars().count() <= 60, "{boundary}");
+
+        let large = CodexMetricsSnapshot {
+            previous_id_no_candidates: 9_999,
+            previous_id_hits: 9_999,
+            previous_id_fallbacks: 9_999,
+            route_baselines: 9_999,
+            route_reuses: 9_999,
+            route_switches: 9_999,
+            lane_switches: 9_999,
+            socket_baselines: 9_999,
+            socket_reuses: 9_999,
+            socket_switches: 9_999,
+        };
+        let large_at_wide_boundary = codex_metrics_text(90, &large);
+        assert!(large_at_wide_boundary.chars().count() <= 90);
+        assert!(large_at_wide_boundary.ends_with("9999/9999/9999"));
+
+        assert_eq!(
+            codex_metrics_text(40, &metrics),
+            " P 5/42/7 R 5/38/3 L2 S 5/31/10"
+        );
+
+        let rendered = draw(120, 1, |frame| {
+            render_codex_metrics(frame, frame.area(), &metrics)
+        });
+        assert!(
+            buffer_text(&rendered).contains("PrevID N/H/F 5/42/7"),
+            "{}",
+            buffer_text(&rendered)
+        );
+    }
+
+    #[test]
     fn format_system_time_applies_non_utc_time_zone() {
         let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(20 * 60 * 60);
         let time_zone = TimeZone::fixed(jiff::tz::offset(5));
@@ -1842,52 +2501,86 @@ mod tests {
     }
 
     #[test]
-    fn request_tables_share_time_status_provider_model_rhythm() {
+    fn active_output_uses_live_bytes_until_positive_tokens_arrive() {
+        assert_eq!(active_output_value(None, 0), "-");
+        assert_eq!(active_output_value(Some(0), 0), "-");
+        assert_eq!(active_output_value(Some(0), 999), "999B");
+        assert_eq!(active_output_value(Some(0), 12_345), "12.3kB");
+        assert_eq!(active_output_value(Some(48), 12_345), "48");
+        assert_eq!(compact_tokens(999_999), "1.0M");
+        assert_eq!(compact_bytes(999_999), "1.0MB");
+        for value in [
+            active_output_value(Some(0), u64::MAX),
+            active_output_value(Some(u64::MAX), u64::MAX),
+        ] {
+            assert!(value.chars().count() <= TOKEN_WIDTH as usize, "{value}");
+        }
+    }
+
+    #[test]
+    fn active_table_renders_live_output_fallback() {
+        let mut request = mock_state().active.remove(0);
+        request.output_tokens = Some(0);
+        request.streamed_bytes = 12_345;
+
+        let rendered = draw(154, 4, |frame| {
+            render_active(frame, frame.area(), std::slice::from_ref(&request), 0)
+        });
+        let text = buffer_text(&rendered);
+
+        assert!(text.contains("12.3kB"), "{text}");
+    }
+
+    #[test]
+    fn request_tables_keep_session_agent_model_together() {
         assert_eq!(
-            headers(&active_columns(LayoutTier::Medium))[..4],
-            ["Started", "Status", "Provider", "Model"]
+            headers(&active_columns(LayoutTier::Medium))[2..5],
+            ["Session", "Agent", "Model"]
         );
         assert_eq!(
-            headers(&recent_columns(LayoutTier::Medium))[..4],
-            ["Finished", "Code", "Provider", "Model"]
+            headers(&recent_columns(LayoutTier::Medium))[1..4],
+            ["Session", "Agent", "Model"]
         );
         assert_eq!(
-            headers(&event_columns(LayoutTier::Medium))[..4],
-            ["Time", "Code", "Provider", "Model"]
+            headers(&event_columns(LayoutTier::Medium))[2..5],
+            ["Session", "Agent", "Model"]
         );
     }
 
     #[test]
-    fn wide_tables_use_shared_model_and_provider_widths() {
+    fn session_table_uses_id_header_without_agent_at_every_tier() {
+        for tier in [
+            LayoutTier::Emergency,
+            LayoutTier::Narrow,
+            LayoutTier::Medium,
+            LayoutTier::Expanded,
+            LayoutTier::Wide,
+        ] {
+            let columns = session_columns(tier, tier == LayoutTier::Wide);
+            let headers = headers(&columns);
+            assert_eq!(headers.iter().filter(|header| **header == "ID").count(), 1);
+            assert!(!headers.contains(&"Session"));
+            assert!(!headers.contains(&"Agent"));
+        }
+    }
+
+    #[test]
+    fn request_tables_use_shared_agent_width_and_all_tables_use_model_width() {
         let sessions = session_columns(LayoutTier::Wide, true);
         let active = active_columns(LayoutTier::Wide);
         let recent = recent_columns(LayoutTier::Wide);
         let events = event_columns(LayoutTier::Wide);
 
+        assert_eq!(fixed_width(&active, ActiveColumn::Agent), Some(AGENT_WIDTH));
+        assert_eq!(fixed_width(&recent, RecentColumn::Agent), Some(AGENT_WIDTH));
+        assert_eq!(fixed_width(&events, EventColumn::Agent), Some(AGENT_WIDTH));
         assert_eq!(
             fixed_width(&sessions, SessionColumn::Model),
-            Some(MODEL_WIDE_WIDTH)
+            Some(MODEL_WIDTH)
         );
-        assert_eq!(
-            fixed_width(&active, ActiveColumn::Model),
-            Some(MODEL_WIDE_WIDTH)
-        );
-        assert_eq!(
-            fixed_width(&recent, RecentColumn::Model),
-            Some(MODEL_WIDE_WIDTH)
-        );
-        assert_eq!(
-            fixed_width(&events, EventColumn::Model),
-            Some(MODEL_WIDE_WIDTH)
-        );
-        assert_eq!(
-            fixed_width(&active, ActiveColumn::Provider),
-            Some(PROVIDER_WIDTH)
-        );
-        assert_eq!(
-            fixed_width(&recent, RecentColumn::Provider),
-            Some(PROVIDER_WIDTH)
-        );
+        assert_eq!(fixed_width(&active, ActiveColumn::Model), Some(MODEL_WIDTH));
+        assert_eq!(fixed_width(&recent, RecentColumn::Model), Some(MODEL_WIDTH));
+        assert_eq!(fixed_width(&events, EventColumn::Model), Some(MODEL_WIDTH));
     }
 
     #[test]
@@ -1918,6 +2611,50 @@ mod tests {
     }
 
     #[test]
+    fn emergency_schemas_keep_core_fields_visible_at_small_widths() {
+        let state = mock_state();
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| session.session_id.as_deref() == Some("terminal-refactor"))
+            .unwrap();
+        let active = &state.active[0];
+        let failed = state
+            .recent
+            .iter()
+            .find(|request| request.request_id == "req-failed-kimi")
+            .unwrap();
+
+        for width in [40, 50, 77] {
+            let sessions = buffer_text(&draw(width, 5, |frame| {
+                render_sessions(frame, frame.area(), std::slice::from_ref(session), 0, true)
+            }));
+            assert!(sessions.contains("ID"), "width={width}\n{sessions}");
+            assert!(sessions.contains("Model"), "width={width}\n{sessions}");
+
+            let active = buffer_text(&draw(width, 5, |frame| {
+                render_active(frame, frame.area(), std::slice::from_ref(active), 0)
+            }));
+            assert!(active.contains("Session"), "width={width}\n{active}");
+            assert!(active.contains("Model"), "width={width}\n{active}");
+
+            let recent = buffer_text(&draw(width, 5, |frame| {
+                render_recent(frame, frame.area(), std::slice::from_ref(failed), 0, true)
+            }));
+            assert!(recent.contains("Session"), "width={width}\n{recent}");
+            assert!(recent.contains("Model"), "width={width}\n{recent}");
+
+            let events = buffer_text(&draw(width, 5, |frame| {
+                render_events(frame, frame.area(), std::slice::from_ref(failed))
+            }));
+            assert!(
+                events.contains("upstream connection"),
+                "width={width}\n{events}"
+            );
+        }
+    }
+
+    #[test]
     fn active_table_renders_expected_headers_at_tier_boundaries() {
         let state = mock_state();
         let render_at = |width| {
@@ -1928,31 +2665,41 @@ mod tests {
         };
 
         let emergency = render_at(77);
-        assert!(emergency.contains("Started"), "{emergency}");
-        assert!(emergency.contains("Target"), "{emergency}");
-        assert!(!emergency.contains("Rate"), "{emergency}");
+        assert!(emergency.contains("Session"), "{emergency}");
+        assert!(!emergency.contains("Agent"), "{emergency}");
+        assert!(emergency.contains("Model"), "{emergency}");
+        assert!(!emergency.contains("Project"), "{emergency}");
+        assert!(!emergency.contains("Started"), "{emergency}");
 
         let narrow = render_at(78);
-        assert!(narrow.contains("Provider"), "{narrow}");
+        assert!(narrow.contains("Session"), "{narrow}");
+        assert!(narrow.contains("Agent"), "{narrow}");
         assert!(narrow.contains("Model"), "{narrow}");
-        assert!(narrow.contains("Effort"), "{narrow}");
         assert!(!narrow.contains("Project"), "{narrow}");
+        assert!(!narrow.contains("Started"), "{narrow}");
 
         let medium = render_at(90);
-        assert!(medium.contains("Provider"), "{medium}");
+        assert!(medium.contains("Project"), "{medium}");
+        assert!(medium.contains("Session"), "{medium}");
+        assert!(medium.contains("Agent"), "{medium}");
         assert!(medium.contains("Model"), "{medium}");
-        assert!(medium.contains("Endpoint"), "{medium}");
-        assert!(!medium.contains("Project"), "{medium}");
+        assert!(!medium.contains("Started"), "{medium}");
 
         let expanded = render_at(120);
+        assert!(expanded.contains("Started"), "{expanded}");
         assert!(expanded.contains("Project"), "{expanded}");
         assert!(expanded.contains("Session"), "{expanded}");
-        assert!(expanded.contains("Endpoint"), "{expanded}");
-        assert!(!expanded.contains("In"), "{expanded}");
+        assert!(expanded.contains("Agent"), "{expanded}");
+        assert!(expanded.contains("Model"), "{expanded}");
+        assert!(!expanded.contains("Endpoint"), "{expanded}");
 
         let wide = render_at(154);
+        assert!(wide.contains("Started"), "{wide}");
         assert!(wide.contains("Project"), "{wide}");
         assert!(wide.contains("Session"), "{wide}");
+        assert!(wide.contains("Agent"), "{wide}");
+        assert!(wide.contains("Model"), "{wide}");
+        assert!(wide.contains("Endpoint"), "{wide}");
         assert!(wide.contains("In"), "{wide}");
         assert!(wide.contains("Out"), "{wide}");
     }
@@ -2025,8 +2772,13 @@ mod tests {
     }
 
     #[test]
-    fn narrow_schemas_use_available_space_for_context() {
+    fn narrow_schemas_preserve_identity_and_model_context() {
         let sessions = session_columns(LayoutTier::Narrow, false);
+        assert!(
+            sessions
+                .iter()
+                .any(|column| column.key == SessionColumn::Id)
+        );
         assert!(
             sessions
                 .iter()
@@ -2035,45 +2787,52 @@ mod tests {
         assert!(
             sessions
                 .iter()
-                .any(|column| column.key == SessionColumn::Target)
+                .any(|column| column.key == SessionColumn::Model)
         );
 
         let active = active_columns(LayoutTier::Narrow);
         assert!(
             active
                 .iter()
-                .any(|column| column.key == ActiveColumn::Provider)
+                .any(|column| column.key == ActiveColumn::Session)
+        );
+        assert!(
+            active
+                .iter()
+                .any(|column| column.key == ActiveColumn::Agent)
         );
         assert!(
             active
                 .iter()
                 .any(|column| column.key == ActiveColumn::Model)
         );
-        assert!(
-            active
-                .iter()
-                .any(|column| column.key == ActiveColumn::Effort)
-        );
 
         let recent = recent_columns(LayoutTier::Narrow);
         assert!(
             recent
                 .iter()
-                .any(|column| column.key == RecentColumn::Provider)
+                .any(|column| column.key == RecentColumn::Session)
         );
         assert!(
             recent
                 .iter()
-                .any(|column| column.key == RecentColumn::Input)
+                .any(|column| column.key == RecentColumn::Agent)
         );
         assert!(
             recent
                 .iter()
-                .any(|column| column.key == RecentColumn::Output)
+                .any(|column| column.key == RecentColumn::Model)
         );
 
-        let events = event_columns(LayoutTier::Emergency);
-        assert_eq!(headers(&events), ["Time", "Code", "Message"]);
+        let events = event_columns(LayoutTier::Narrow);
+        assert_eq!(
+            headers(&events),
+            ["Time", "Code", "Session", "Agent", "Model", "Message"]
+        );
+        assert_eq!(
+            headers(&event_columns(LayoutTier::Emergency)),
+            ["Time", "Code", "Message"]
+        );
     }
 
     #[test]
@@ -2087,8 +2846,38 @@ mod tests {
     #[test]
     fn display_session_id_handles_atypical_ids() {
         assert_eq!(display_session_id(Some("custom-session")), "custom-session");
-        assert_eq!(display_session_id(Some("")), "no-session");
-        assert_eq!(display_session_id(None), "no-session");
+        assert_eq!(display_session_id(Some("")), "-");
+        assert_eq!(display_session_id(None), "-");
+    }
+
+    #[test]
+    fn display_agent_id_distinguishes_agent_main_and_stateless_requests() {
+        assert_eq!(
+            display_agent_id(
+                Some("57c7c914-ada4-4f40-9672-985f950fbb66"),
+                Some("a11ce914-ada4-4f40-9672-985f950fbb66")
+            ),
+            "a11ce914"
+        );
+        assert_eq!(
+            display_agent_id(Some("sess-1"), Some("a36e47fc1d0e9d5a6")),
+            "a36e47fc"
+        );
+        assert_eq!(display_agent_id(Some("sess-1"), None), "main");
+        assert_eq!(display_agent_id(None, None), "-");
+    }
+
+    #[test]
+    fn mapped_model_detail_only_returns_distinct_resolved_models() {
+        assert_eq!(
+            mapped_model_detail(Some("claude-sonnet-4-6"), Some("gpt-5.6-sol")),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            mapped_model_detail(Some("gpt-5.6-sol"), Some("gpt-5.6-sol")),
+            None
+        );
+        assert_eq!(mapped_model_detail(Some("gpt-5.6-sol"), None), None);
     }
 
     #[test]
@@ -2275,7 +3064,10 @@ mod tests {
             render_sessions(frame, frame.area(), &active_state.sessions, 0, true)
         });
         let sessions_text = buffer_text(&sessions);
-        assert!(sessions_text.contains("Provider"));
+        assert!(sessions_text.contains("ID"));
+        assert!(!sessions_text.contains("Agent"));
+        assert!(sessions_text.contains("Model"));
+        assert!(!sessions_text.contains("Provider"));
         assert!(sessions_text.contains("Project"));
         assert!(sessions_text.contains("example-project"));
         assert!(sessions_text.contains("sess-1"));
@@ -2303,6 +3095,53 @@ mod tests {
             render_events(frame, frame.area(), &completed_state.recent)
         });
         assert!(buffer_text(&events).contains("No events"));
+    }
+
+    #[test]
+    fn home_tables_show_mapped_models_and_effective_codex_priority() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "request-priority",
+            Some("sess-priority".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("request-priority", "claude-sonnet-4-6");
+        monitor.provider_selected("request-priority", "codex", "gpt-5.6-sol", None);
+        monitor.model_resolved("request-priority", "gpt-5.6-sol");
+        monitor.codex_acceleration_resolved("request-priority", Some("fast"), Some("priority"));
+
+        let active_state = monitor.snapshot();
+        let session = draw(180, 8, |frame| {
+            render_sessions(frame, frame.area(), &active_state.sessions, 0, true)
+        });
+        let active = draw(180, 8, |frame| {
+            render_active(frame, frame.area(), &active_state.active, 0)
+        });
+        for text in [buffer_text(&session), buffer_text(&active)] {
+            assert!(text.contains("f|gpt-5.6-sol"), "{text}");
+            assert!(!text.contains("claude-sonnet-4-6"), "{text}");
+        }
+
+        monitor.request_failed("request-priority", Some(502), "upstream unavailable");
+        let completed_state = monitor.snapshot();
+        let session = draw(180, 8, |frame| {
+            render_sessions(frame, frame.area(), &completed_state.sessions, 0, true)
+        });
+        let recent = draw(180, 8, |frame| {
+            render_recent(frame, frame.area(), &completed_state.recent, 0, false)
+        });
+        let events = draw(180, 8, |frame| {
+            render_events(frame, frame.area(), &completed_state.recent)
+        });
+        for text in [
+            buffer_text(&session),
+            buffer_text(&recent),
+            buffer_text(&events),
+        ] {
+            assert!(text.contains("f|gpt-5.6-sol"), "{text}");
+            assert!(!text.contains("claude-sonnet-4-6"), "{text}");
+        }
     }
 
     #[test]
@@ -2346,6 +3185,7 @@ mod tests {
             show_setup: false,
             show_help: false,
             detail: None,
+            detail_scroll: 0,
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
@@ -2361,7 +3201,11 @@ mod tests {
         assert!(text.contains("mock://tui-demo"), "{text}");
         assert!(text.contains("claude-code-proxy"), "{text}");
         assert!(text.contains("streaming"), "{text}");
+        assert!(text.contains("Agent"), "{text}");
+        assert!(text.contains("a11ce914"), "{text}");
+        assert!(text.contains("gpt-5.6-sol"), "{text}");
         assert!(text.contains("gpt-5.6-terra"), "{text}");
+        assert!(!text.contains("claude-sonnet-4…"), "{text}");
         assert!(text.contains("upstream connection closed"), "{text}");
     }
 
@@ -2382,6 +3226,50 @@ mod tests {
         assert!(text.contains("req-failed-kimi"), "{text}");
         assert!(text.contains("upstream connection closed"), "{text}");
         assert!(text.contains("req-failed-kimi.json"), "{text}");
+    }
+
+    #[test]
+    fn request_detail_uses_main_area_and_scrolls_to_codex_diagnostics() {
+        let mut state = mock_state();
+        let request_index = state
+            .recent
+            .iter()
+            .position(|request| request.request_id == "req-complete-codex")
+            .unwrap();
+        let request = &mut state.recent[request_index];
+        request.status = crate::monitor::RequestStatus::Failed;
+        request.http_status = Some(502);
+        request.error = Some("failed codex detail".to_string());
+
+        for (width, height) in [(80, 24), (120, 40)] {
+            let mut app = test_app();
+            app.focus = FocusPane::Recent;
+            app.recent_selected = request_index;
+            app.set_detail(Some(DetailView::Request));
+            let detail = draw(width, height, |frame| render(frame, &mut app, &state));
+            let text = buffer_text(&detail);
+
+            assert!(text.contains("Request detail"), "{width}x{height}\n{text}");
+            assert!(
+                text.contains("failed codex detail"),
+                "{width}x{height}\n{text}"
+            );
+            assert!(text.contains("capture"), "{width}x{height}\n{text}");
+            assert!(
+                !text.contains("Active requests"),
+                "{width}x{height}\n{text}"
+            );
+        }
+
+        let mut app = test_app();
+        app.focus = FocusPane::Recent;
+        app.recent_selected = request_index;
+        app.set_detail(Some(DetailView::Request));
+        app.detail_scroll = u16::MAX;
+        let detail = draw(80, 24, |frame| render(frame, &mut app, &state));
+        let text = buffer_text(&detail);
+        assert!(text.contains("socket dispatch"), "{text}");
+        assert!(app.detail_scroll < u16::MAX);
     }
 
     #[test]
@@ -2458,6 +3346,189 @@ mod tests {
     }
 
     #[test]
+    fn details_show_requested_model_mapping_and_request_agent() {
+        let monitor = MonitorHandle::new(10);
+        let identity = crate::request_identity::ConversationIdentity::Agent(
+            "57c7c914-ada4-4f40-9672-985f950fbb66".to_string(),
+            "a11ce914-ada4-4f40-9672-985f950fbb66".to_string(),
+        );
+        monitor.request_started_with_identity(
+            "request-agent",
+            Some(&identity),
+            Some(7),
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("request-agent", "claude-sonnet-4-6");
+        monitor.provider_selected("request-agent", "codex", "gpt-5.6-sol", None);
+        monitor.model_resolved("request-agent", "gpt-5.6-sol");
+        monitor.request_completed("request-agent", 200, Some(100), Some(25));
+        let state = monitor.snapshot();
+
+        let session_detail = draw(120, 24, |frame| {
+            render_session_detail(frame, frame.area(), &state, 0)
+        });
+        let request_detail = draw(120, 24, |frame| {
+            render_request_detail(frame, frame.area(), &state, 0)
+        });
+        let session_text = buffer_text(&session_detail);
+        let request_text = buffer_text(&request_detail);
+
+        assert!(!session_text.contains("a11ce914"), "{session_text}");
+        assert!(request_text.contains("a11ce914"), "{request_text}");
+        for text in [session_text, request_text] {
+            assert!(text.contains("claude-sonnet-4-6"), "{text}");
+            assert!(text.contains("mapped model"), "{text}");
+            assert!(text.contains("gpt-5.6-sol"), "{text}");
+            assert!(!text.contains("provider"), "{text}");
+        }
+    }
+
+    #[test]
+    fn codex_request_text_compacts_lane_previous_id_route_and_socket() {
+        let diagnostics = CodexRequestDiagnostics {
+            lane: Some(CodexLane::Full),
+            previous_id: CodexRequestPreviousId::Hit,
+            recovery: Default::default(),
+            route: CodexDispatchSummary {
+                dispatches: 2,
+                baselines: 1,
+                switches: 1,
+                latest: Some(CodexDispatchOutcome::Switch),
+                first: Some(CodexDispatchOutcome::Baseline),
+                ..CodexDispatchSummary::default()
+            },
+            socket: CodexDispatchSummary {
+                dispatches: 2,
+                baselines: 1,
+                reuses: 1,
+                latest: Some(CodexDispatchOutcome::Reuse),
+                first: Some(CodexDispatchOutcome::Baseline),
+                ..CodexDispatchSummary::default()
+            },
+            ..CodexRequestDiagnostics::default()
+        };
+
+        assert_eq!(codex_request_text(Some(&diagnostics)), "F H/S/R");
+        assert_eq!(codex_request_text(None), "- -/-/-");
+    }
+
+    #[test]
+    fn codex_recovery_detail_uses_bounded_labels_and_stable_order() {
+        let mut causes = CodexCauseSet::default();
+        assert_eq!(codex_socket_recovery_detail(causes), "-");
+        causes.insert(CodexRecoveryCause::TransportFailure);
+        causes.insert(CodexRecoveryCause::AuthRejection);
+        causes.insert(CodexRecoveryCause::TransportFailure);
+        assert_eq!(
+            codex_socket_recovery_detail(causes),
+            "auth rejection · transport failure"
+        );
+        assert_eq!(
+            codex_recovery_cause_label(CodexRecoveryCause::OriginSocketMissing),
+            "exact origin unavailable"
+        );
+    }
+
+    #[test]
+    fn request_tables_and_detail_render_codex_request_diagnostics() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "request-codex",
+            Some("sess-codex".to_string()),
+            Some(4),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("request-codex", "codex", "gpt-5.6-sol", None);
+        monitor.codex_request_lane("request-codex", true);
+        monitor.codex_previous_id_pending("request-codex");
+        monitor
+            .codex_previous_id_cause("request-codex", CodexRecoveryCause::PreviousResponseMissing);
+        monitor.codex_socket_cause("request-codex", CodexRecoveryCause::TransportFailure);
+        monitor.codex_socket_cause("request-codex", CodexRecoveryCause::AuthRejection);
+        monitor.codex_append_only(
+            "request-codex",
+            crate::monitor::CodexAppendOnlyDiagnostics {
+                outcome: crate::monitor::CodexAppendOnlyOutcome::FirstMismatch,
+                incoming_items: 12,
+                retained_items: 10,
+                delta_items: 2,
+                first_mismatch_index: Some(7),
+            },
+        );
+        monitor.codex_pool_resolution(
+            "request-codex",
+            crate::monitor::CodexPoolResolution::ExactOriginMatched,
+        );
+        monitor.codex_socket_validation(
+            "request-codex",
+            Some(crate::monitor::CodexSocketValidationFailure::Timeout),
+            1_000,
+            true,
+        );
+        monitor.codex_websocket_dispatch(
+            "request-codex",
+            crate::request_identity::ConversationIdentity::Main("sess-codex".into()),
+            [7; 32],
+            true,
+            41,
+        );
+        let state = monitor.snapshot();
+
+        let active = draw(180, 8, |frame| {
+            render_active(frame, frame.area(), &state.active, 0)
+        });
+        let active_text = buffer_text(&active);
+        assert!(active_text.contains("C P/R/S"), "{active_text}");
+        assert!(active_text.contains("L P/B/B"), "{active_text}");
+
+        monitor.request_completed("request-codex", 200, None, None);
+        monitor.codex_previous_id_settled(
+            "request-codex",
+            crate::monitor::CodexPreviousIdOutcome::Fallback,
+        );
+        let state = monitor.snapshot();
+        let recent = draw(180, 8, |frame| {
+            render_recent(frame, frame.area(), &state.recent, 0, false)
+        });
+        let recent_text = buffer_text(&recent);
+        assert!(recent_text.contains("C P/R/S"), "{recent_text}");
+        assert!(recent_text.contains("L F/B/B"), "{recent_text}");
+
+        let detail = draw(120, 32, |frame| {
+            render_request_detail(frame, frame.area(), &state, 0)
+        });
+        let detail_text = buffer_text(&detail);
+        assert!(detail_text.contains("codex lane"), "{detail_text}");
+        assert!(detail_text.contains("lite"), "{detail_text}");
+        assert!(detail_text.contains("previous ID"), "{detail_text}");
+        assert!(detail_text.contains("fallback"), "{detail_text}");
+        assert!(detail_text.contains("previous cause"), "{detail_text}");
+        assert!(
+            detail_text.contains("previous response missing"),
+            "{detail_text}"
+        );
+        assert!(detail_text.contains("socket recovery"), "{detail_text}");
+        assert!(
+            detail_text.contains("auth rejection · transport failure"),
+            "{detail_text}"
+        );
+        assert!(detail_text.contains("append check"), "{detail_text}");
+        assert!(
+            detail_text.contains("first mismatch at item 7"),
+            "{detail_text}"
+        );
+        assert!(detail_text.contains("pool lookup"), "{detail_text}");
+        assert!(
+            detail_text.contains("exact origin matched"),
+            "{detail_text}"
+        );
+        assert!(detail_text.contains("socket validate"), "{detail_text}");
+        assert!(detail_text.contains("failed: timeout"), "{detail_text}");
+        assert!(detail_text.contains("route dispatch"), "{detail_text}");
+        assert!(detail_text.contains("socket dispatch"), "{detail_text}");
+    }
+
+    #[test]
     fn request_detail_renders_claude_fast_and_effective_codex_tier() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("request-fast", None, None, EndpointKind::Messages);
@@ -2510,6 +3581,7 @@ mod tests {
             show_setup: false,
             show_help: false,
             detail: None,
+            detail_scroll: 0,
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
@@ -2556,6 +3628,7 @@ mod tests {
             show_setup: false,
             show_help: false,
             detail: None,
+            detail_scroll: 0,
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
@@ -2586,6 +3659,7 @@ mod tests {
             show_setup: false,
             show_help: false,
             detail: None,
+            detail_scroll: 0,
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
@@ -2614,6 +3688,7 @@ mod tests {
             show_setup: false,
             show_help: false,
             detail: None,
+            detail_scroll: 0,
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
@@ -2639,6 +3714,7 @@ mod tests {
             show_setup: false,
             show_help: false,
             detail: None,
+            detail_scroll: 0,
             focus: FocusPane::Sessions,
             selected: 10,
             recent_selected: 10,
@@ -2665,6 +3741,7 @@ mod tests {
             show_setup: false,
             show_help: false,
             detail: None,
+            detail_scroll: 0,
             focus: FocusPane::Sessions,
             selected: 1,
             recent_selected: 0,
@@ -2691,6 +3768,7 @@ mod tests {
             show_setup: false,
             show_help: false,
             detail: None,
+            detail_scroll: 0,
             focus: FocusPane::Sessions,
             selected: 1,
             recent_selected: 0,
@@ -2708,5 +3786,257 @@ mod tests {
         app.move_up(2, 3, false);
         assert_eq!(app.focus, FocusPane::Recent);
         assert_eq!(app.recent_selected, 0);
+    }
+
+    #[test]
+    fn key_release_does_not_repeat_navigation() {
+        let mut app = test_app();
+        let mut input = MonitorInputState::default();
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Down, KeyEventKind::Press),
+            4,
+            0,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Down, KeyEventKind::Release),
+            4,
+            0,
+        );
+        assert_eq!(app.selected, 1);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Down, KeyEventKind::Repeat),
+            4,
+            0,
+        );
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn key_release_does_not_toggle_or_cancel_commands() {
+        let mut app = test_app();
+        let mut input = MonitorInputState::default();
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('?'), KeyEventKind::Press),
+            1,
+            1,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('?'), KeyEventKind::Release),
+            1,
+            1,
+        );
+        assert!(app.show_help);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('q'), KeyEventKind::Press),
+            1,
+            1,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('q'), KeyEventKind::Release),
+            1,
+            1,
+        );
+        assert_eq!(app.phase, MonitorPhase::ConfirmingShutdown);
+    }
+
+    #[test]
+    fn key_repeat_is_limited_to_navigation() {
+        let mut app = test_app();
+        let mut input = MonitorInputState::default();
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('?'), KeyEventKind::Press),
+            1,
+            1,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('?'), KeyEventKind::Repeat),
+            1,
+            1,
+        );
+        assert!(app.show_help);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('q'), KeyEventKind::Press),
+            1,
+            1,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('q'), KeyEventKind::Repeat),
+            1,
+            1,
+        );
+        assert_eq!(app.phase, MonitorPhase::ConfirmingShutdown);
+
+        let mut app = test_app();
+        let mut input = MonitorInputState::default();
+        let ctrl_c =
+            |kind| key_event_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL, kind);
+        assert_eq!(
+            handle_monitor_event(&mut app, &mut input, ctrl_c(KeyEventKind::Press), 1, 1),
+            None
+        );
+        assert_eq!(app.phase, MonitorPhase::ShuttingDown);
+        assert_eq!(
+            handle_monitor_event(&mut app, &mut input, ctrl_c(KeyEventKind::Repeat), 1, 1),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repeated_windows_press_waits_for_release_for_one_shot_keys() {
+        let mut app = test_app();
+        let mut input = MonitorInputState::default();
+        let press = key_event(KeyCode::Char('q'), KeyEventKind::Press);
+
+        handle_monitor_event(&mut app, &mut input, press.clone(), 1, 1);
+        handle_monitor_event(&mut app, &mut input, press, 1, 1);
+        assert_eq!(app.phase, MonitorPhase::ConfirmingShutdown);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('q'), KeyEventKind::Release),
+            1,
+            1,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('q'), KeyEventKind::Press),
+            1,
+            1,
+        );
+        assert_eq!(app.phase, MonitorPhase::Running);
+    }
+
+    #[test]
+    fn detail_navigation_scrolls_without_changing_selection() {
+        let mut app = test_app();
+        let mut input = MonitorInputState::default();
+        app.focus = FocusPane::Recent;
+        app.recent_selected = 1;
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Enter, KeyEventKind::Press),
+            4,
+            4,
+        );
+        assert_eq!(app.detail, Some(DetailView::Request));
+        assert_eq!(app.detail_scroll, 0);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Down, KeyEventKind::Press),
+            4,
+            4,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            mouse_event(MouseEventKind::ScrollDown),
+            4,
+            4,
+        );
+        assert_eq!(app.detail_scroll, 2);
+        assert_eq!(app.recent_selected, 1);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Up, KeyEventKind::Press),
+            4,
+            4,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            mouse_event(MouseEventKind::ScrollUp),
+            4,
+            4,
+        );
+        assert_eq!(app.detail_scroll, 0);
+        assert_eq!(app.recent_selected, 1);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Esc, KeyEventKind::Press),
+            4,
+            4,
+        );
+        assert_eq!(app.detail, None);
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_scroll_moves_one_row_per_event() {
+        let mut app = test_app();
+        let mut input = MonitorInputState::default();
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            mouse_event(MouseEventKind::ScrollDown),
+            4,
+            0,
+        );
+        assert_eq!(app.selected, 1);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            mouse_event(MouseEventKind::ScrollUp),
+            4,
+            0,
+        );
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn mouse_scroll_is_ignored_outside_running_phase() {
+        let mut app = test_app();
+        let mut input = MonitorInputState::default();
+        app.phase = MonitorPhase::ConfirmingShutdown;
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            mouse_event(MouseEventKind::ScrollDown),
+            4,
+            0,
+        );
+
+        assert_eq!(app.selected, 0);
     }
 }

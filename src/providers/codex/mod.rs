@@ -98,6 +98,17 @@ fn service_tier_label(service_tier: &ServiceTier) -> &'static str {
         ServiceTier::Flex => "flex",
     }
 }
+
+fn service_tier_value_label(request: &serde_json::Value) -> Option<&'static str> {
+    match request
+        .get("service_tier")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("priority") => Some("priority"),
+        Some("flex") => Some("flex"),
+        _ => None,
+    }
+}
 use self::translate::stream::translate_stream_bytes_scoped;
 
 // ---------------------------------------------------------------------------
@@ -878,6 +889,11 @@ impl Provider for CodexProvider {
 
         let tokens = count_translated_tokens(&translated);
         if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.codex_acceleration_resolved(
+                &ctx.req_id,
+                None,
+                translated.service_tier.as_ref().map(service_tier_label),
+            );
             monitor.usage_updated(&ctx.req_id, Some(tokens), None);
         }
         (
@@ -2174,6 +2190,49 @@ mod tests {
             merge_claude_fast_service_tier(resolved.service_tier, true),
             Some(ServiceTier::Priority)
         );
+    }
+
+    #[test]
+    fn service_tier_value_labels_only_monitor_effective_codex_tiers() {
+        assert_eq!(
+            service_tier_value_label(&serde_json::json!({"service_tier":"priority"})),
+            Some("priority")
+        );
+        assert_eq!(
+            service_tier_value_label(&serde_json::json!({"service_tier":"flex"})),
+            Some("flex")
+        );
+        assert_eq!(
+            service_tier_value_label(&serde_json::json!({"service_tier":"auto"})),
+            None
+        );
+        assert_eq!(service_tier_value_label(&serde_json::json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn count_tokens_records_effective_priority_tier() {
+        let monitor = crate::monitor::MonitorHandle::new(10);
+        monitor.request_started(
+            "count-priority",
+            None,
+            None,
+            crate::monitor::EndpointKind::CountTokens,
+        );
+        let mut ctx = messages_test_context("count-priority", None);
+        ctx.monitor = Some(monitor.clone());
+        let body = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.4-fast",
+            "max_tokens": 64,
+            "messages": [{"role":"user", "content":"count me"}]
+        }))
+        .unwrap();
+
+        let response = CodexProvider::new().handle_count_tokens(body, ctx).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let state = monitor.snapshot();
+        assert_eq!(state.active[0].resolved_model.as_deref(), Some("gpt-5.4"));
+        assert!(state.active[0].codex_priority());
     }
 
     fn live_test_request(text: &str) -> translate::request::ResponsesRequest {

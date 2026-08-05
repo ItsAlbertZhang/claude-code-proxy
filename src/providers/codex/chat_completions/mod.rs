@@ -62,6 +62,11 @@ impl ChatCompletionsBackend {
         let (ctx, scope) = scoped.into_parts();
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &request.model);
+            monitor.codex_acceleration_resolved(
+                &ctx.req_id,
+                None,
+                super::service_tier_value_label(&request.upstream),
+            );
             monitor.codex_request_lane(&ctx.req_id, request.use_responses_lite);
         }
         let lane = scope.provider_lane(LaneDomain::CodexConversation);
@@ -639,7 +644,7 @@ mod tests {
         const SSE: &[u8] = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"answer\\\":\\\"yes\\\"}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_buffered\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"usage\":{\"input_tokens\":8,\"output_tokens\":4}}}\n\n";
         let (backend, server) = mock_backend(SSE).await;
         let request = request::translate_request(json!({
-            "model":"gpt-5.6-sol",
+            "model":"gpt-5.6-sol-fast",
             "messages":[{"role":"system","content":"JSON only"},{"role":"user","content":"answer"}],
             "reasoning_effort":"low",
             "response_format":{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object"}}}
@@ -667,10 +672,16 @@ mod tests {
         assert_eq!(upstream["input"][0]["role"], "developer");
         assert_eq!(upstream["reasoning"]["effort"], "low");
         assert_eq!(upstream["reasoning"]["context"], "all_turns");
+        assert_eq!(upstream["service_tier"], "priority");
         assert_eq!(upstream["text"]["format"]["name"], "answer");
         let snapshot = monitor.snapshot();
         assert_eq!(snapshot.active[0].input_tokens, Some(8));
         assert_eq!(snapshot.active[0].output_tokens, Some(4));
+        assert_eq!(
+            snapshot.active[0].resolved_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert!(snapshot.active[0].codex_priority());
     }
 
     #[tokio::test]

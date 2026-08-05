@@ -67,6 +67,11 @@ impl CodexNativeBackend {
         };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
+            monitor.codex_acceleration_resolved(
+                &ctx.req_id,
+                None,
+                super::service_tier_value_label(&body),
+            );
             monitor.codex_request_lane(&ctx.req_id, resolved.use_responses_lite);
         }
         let lane = scope.provider_lane(LaneDomain::CodexConversation);
@@ -703,6 +708,7 @@ fn retain_boundary_prefix(bytes: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::{EndpointKind, MonitorHandle};
     use crate::providers::codex::auth::{
         manager::CodexAuthManager,
         token_store::{StoredAuth, file_store},
@@ -779,6 +785,54 @@ mod tests {
         let scope =
             RequestScope::from_conversation_identity(Some(identity), RequestPurpose::Conversation);
         ScopedRequestContext::new(ctx, scope)
+    }
+
+    #[tokio::test]
+    async fn native_fast_request_records_effective_priority_tier() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (_, request) = read_http_request(&mut socket).await;
+            let body = br#"{"id":"resp_native","object":"response","status":"completed"}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+            request
+        });
+        let backend = test_backend(
+            address,
+            StoredAuth {
+                access: "native-token".into(),
+                refresh: String::new(),
+                account_id: Some("native-account".into()),
+                expires: u64::MAX,
+            },
+        );
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("native-priority", None, None, EndpointKind::Responses);
+        let mut ctx = observer_context();
+        ctx.req_id = "native-priority".into();
+        ctx.monitor = Some(monitor.clone());
+
+        let response = backend
+            .handle(
+                json!({"model":"gpt-5.4-fast","input":"hello","stream":false}),
+                ctx,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(server.await.unwrap()["service_tier"], "priority");
+        let state = monitor.snapshot();
+        assert_eq!(state.active[0].resolved_model.as_deref(), Some("gpt-5.4"));
+        assert!(state.active[0].codex_priority());
     }
 
     #[tokio::test]

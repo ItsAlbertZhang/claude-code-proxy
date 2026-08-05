@@ -1,13 +1,11 @@
 use ratatui::{layout::Alignment, layout::Constraint};
 
 pub const ID_WIDTH: u16 = 8;
+pub const AGENT_WIDTH: u16 = 8;
 pub const TIME_WIDTH: u16 = 8;
 pub const CODE_WIDTH: u16 = 4;
 pub const COUNT_WIDTH: u16 = 3;
-pub const PROVIDER_WIDTH: u16 = 8;
-pub const MODEL_NARROW_WIDTH: u16 = 18;
-pub const MODEL_MEDIUM_WIDTH: u16 = 28;
-pub const MODEL_WIDE_WIDTH: u16 = 36;
+pub const MODEL_WIDTH: u16 = 16;
 pub const PROJECT_MEDIUM_WIDTH: u16 = 12;
 pub const PROJECT_WIDE_WIDTH: u16 = 16;
 pub const EFFORT_WIDTH: u16 = 6;

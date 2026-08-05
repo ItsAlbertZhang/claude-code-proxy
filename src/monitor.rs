@@ -13,6 +13,9 @@ pub use mock::{MockMonitor, mock_state};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
 const MAX_CODEX_OWNER_STATES: usize = 10_000;
+const MAX_SESSION_MODEL_SELECTIONS: usize = 10_000;
+const MAX_MONITOR_MODEL_BYTES: usize = 512;
+const MAX_MONITOR_ERROR_BYTES: usize = 4 * 1024;
 const CODEX_OWNER_STATE_TTL: Duration = Duration::from_secs(30 * 60);
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
 
@@ -404,6 +407,10 @@ impl CodexRequestDiagnostics {
             self.previous_id = CodexRequestPreviousId::Unsettled;
         }
     }
+
+    fn priority_enabled(&self) -> bool {
+        self.acceleration.codex_service_tier == Some("priority")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,8 +466,13 @@ pub enum MonitorEvent {
     RequestStarted {
         request_id: String,
         session_id: Option<String>,
+        agent_id: Option<String>,
         session_seq: Option<u64>,
         endpoint: EndpointKind,
+    },
+    ModelRequested {
+        request_id: String,
+        model: String,
     },
     ProjectResolved {
         request_id: String,
@@ -526,10 +538,12 @@ pub enum MonitorEvent {
 pub struct ActiveRequest {
     pub request_id: String,
     pub session_id: Option<String>,
+    pub agent_id: Option<String>,
     pub session_seq: Option<u64>,
     pub project: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub resolved_model: Option<String>,
     pub effort: Option<String>,
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
@@ -558,6 +572,11 @@ impl ActiveRequest {
         self.codex.as_ref()
     }
 
+    pub(crate) fn codex_priority(&self) -> bool {
+        self.codex_diagnostics()
+            .is_some_and(CodexRequestDiagnostics::priority_enabled)
+    }
+
     pub fn rate(&self) -> Throughput {
         throughput(
             self.output_tokens
@@ -573,10 +592,12 @@ impl ActiveRequest {
 pub struct CompletedRequest {
     pub request_id: String,
     pub session_id: Option<String>,
+    pub agent_id: Option<String>,
     pub session_seq: Option<u64>,
     pub project: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub resolved_model: Option<String>,
     pub effort: Option<String>,
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
@@ -601,6 +622,11 @@ pub struct CompletedRequest {
 impl CompletedRequest {
     pub(crate) fn codex_diagnostics(&self) -> Option<&CodexRequestDiagnostics> {
         self.codex.as_ref()
+    }
+
+    pub(crate) fn codex_priority(&self) -> bool {
+        self.codex_diagnostics()
+            .is_some_and(CodexRequestDiagnostics::priority_enabled)
     }
 
     pub fn rate(&self) -> Throughput {
@@ -654,6 +680,8 @@ pub struct SessionSummary {
     pub failure_count: usize,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub resolved_model: Option<String>,
+    pub(crate) codex_priority: bool,
     pub effort: Option<String>,
     pub last_seen: SystemTime,
     pub input_tokens: u64,
@@ -681,13 +709,110 @@ impl SessionSummary {
     }
 }
 
+type SessionKey = Option<String>;
+
+#[derive(Debug, Clone)]
+struct SessionModelSelection {
+    provider: Option<String>,
+    model: Option<String>,
+    resolved_model: Option<String>,
+    codex_priority: bool,
+    effort: Option<String>,
+    primary: bool,
+    session_seq: Option<u64>,
+    started_at: SystemTime,
+    observed_at: Instant,
+    is_active: bool,
+    request_id: String,
+}
+
+impl SessionModelSelection {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        endpoint: EndpointKind,
+        session_seq: Option<u64>,
+        started_at: SystemTime,
+        is_active: bool,
+        request_id: &str,
+        model: Option<&str>,
+        resolved_model: Option<&str>,
+        codex_priority: bool,
+    ) -> Option<Self> {
+        (model.is_some() || resolved_model.is_some()).then(|| Self {
+            provider: None,
+            model: model.map(str::to_string),
+            resolved_model: resolved_model.map(str::to_string),
+            codex_priority,
+            effort: None,
+            primary: endpoint != EndpointKind::CountTokens,
+            session_seq,
+            started_at,
+            observed_at: Instant::now(),
+            is_active,
+            request_id: request_id.to_string(),
+        })
+    }
+
+    fn from_completed(request: &CompletedRequest) -> Option<Self> {
+        let mut selection = Self::new(
+            request.endpoint,
+            request.session_seq,
+            request.started_at,
+            false,
+            &request.request_id,
+            request.model.as_deref(),
+            request.resolved_model.as_deref(),
+            request.codex_priority(),
+        )?;
+        selection.provider.clone_from(&request.provider);
+        selection.effort.clone_from(&request.effort);
+        Some(selection)
+    }
+
+    fn from_active(request: &ActiveRequest) -> Option<Self> {
+        let mut selection = Self::new(
+            request.endpoint,
+            request.session_seq,
+            request.started_at,
+            true,
+            &request.request_id,
+            request.model.as_deref(),
+            request.resolved_model.as_deref(),
+            request.codex_priority(),
+        )?;
+        selection.provider.clone_from(&request.provider);
+        selection.effort.clone_from(&request.effort);
+        Some(selection)
+    }
+
+    fn supersedes(&self, current: &Self) -> bool {
+        self.primary
+            .cmp(&current.primary)
+            .then_with(|| self.started_at.cmp(&current.started_at))
+            .then_with(|| {
+                self.session_seq
+                    .is_some()
+                    .cmp(&current.session_seq.is_some())
+            })
+            .then_with(|| {
+                self.session_seq
+                    .unwrap_or_default()
+                    .cmp(&current.session_seq.unwrap_or_default())
+            })
+            .then_with(|| self.is_active.cmp(&current.is_active))
+            .then_with(|| self.request_id.cmp(&current.request_id))
+            .is_gt()
+    }
+}
+
 #[derive(Debug)]
 struct MonitorStore {
     started_at: SystemTime,
     active: HashMap<String, ActiveRequest>,
     recent: VecDeque<CompletedRequest>,
-    session_usage: HashMap<Option<String>, SessionUsage>,
-    session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
+    session_usage: HashMap<SessionKey, SessionUsage>,
+    session_models: HashMap<SessionKey, SessionModelSelection>,
+    session_output_buckets: HashMap<SessionKey, Vec<(u64, u64)>>,
     codex: CodexMetricsStore,
     recent_limit: usize,
 }
@@ -891,6 +1016,7 @@ impl MonitorHandle {
                 active: HashMap::new(),
                 recent: VecDeque::new(),
                 session_usage: HashMap::new(),
+                session_models: HashMap::new(),
                 session_output_buckets: HashMap::new(),
                 codex: CodexMetricsStore::default(),
                 recent_limit,
@@ -934,8 +1060,39 @@ impl MonitorHandle {
         self.publish(MonitorEvent::RequestStarted {
             request_id: request_id.into(),
             session_id,
+            agent_id: None,
             session_seq,
             endpoint,
+        });
+    }
+
+    pub fn request_started_with_identity(
+        &self,
+        request_id: impl Into<String>,
+        identity: Option<&ConversationIdentity>,
+        session_seq: Option<u64>,
+        endpoint: EndpointKind,
+    ) {
+        let (session_id, agent_id) = match identity {
+            Some(ConversationIdentity::Main(session_id)) => (Some(session_id.clone()), None),
+            Some(ConversationIdentity::Agent(session_id, agent_id)) => {
+                (Some(session_id.clone()), Some(agent_id.clone()))
+            }
+            None => (None, None),
+        };
+        self.publish(MonitorEvent::RequestStarted {
+            request_id: request_id.into(),
+            session_id,
+            agent_id,
+            session_seq,
+            endpoint,
+        });
+    }
+
+    pub fn model_requested(&self, request_id: impl Into<String>, model: impl Into<String>) {
+        self.publish(MonitorEvent::ModelRequested {
+            request_id: request_id.into(),
+            model: bounded_monitor_text(model.into(), MAX_MONITOR_MODEL_BYTES),
         });
     }
 
@@ -1054,7 +1211,7 @@ impl MonitorHandle {
         self.publish(MonitorEvent::RequestFailed {
             request_id: request_id.into(),
             http_status,
-            error: error.into(),
+            error: bounded_monitor_text(error.into(), MAX_MONITOR_ERROR_BYTES),
         });
     }
 
@@ -1368,7 +1525,7 @@ impl MonitorHandle {
     pub fn request_abandoned(&self, request_id: impl Into<String>, error: impl Into<String>) {
         self.publish(MonitorEvent::RequestAbandoned {
             request_id: request_id.into(),
-            error: error.into(),
+            error: bounded_monitor_text(error.into(), MAX_MONITOR_ERROR_BYTES),
         });
     }
 }
@@ -1464,20 +1621,28 @@ impl MonitorStore {
                 changed,
             });
         }
-        let completed = self
-            .recent
-            .iter_mut()
-            .find(|request| request.request_id == request_id)?;
-        let diagnostics = completed.codex.get_or_insert_default();
-        let before = *diagnostics;
-        update(diagnostics);
-        let changed = *diagnostics != before;
-        diagnostics.event_sequence = diagnostics.event_sequence.saturating_add(1);
-        Some(CodexUpdateSnapshot {
-            diagnostics: *diagnostics,
-            completed: Some(completed.clone()),
-            changed,
-        })
+        let (snapshot, key, candidate) = {
+            let completed = self
+                .recent
+                .iter_mut()
+                .find(|request| request.request_id == request_id)?;
+            let diagnostics = completed.codex.get_or_insert_default();
+            let before = *diagnostics;
+            update(diagnostics);
+            let changed = *diagnostics != before;
+            diagnostics.event_sequence = diagnostics.event_sequence.saturating_add(1);
+            (
+                CodexUpdateSnapshot {
+                    diagnostics: *diagnostics,
+                    completed: Some(completed.clone()),
+                    changed,
+                },
+                completed.session_id.clone(),
+                SessionModelSelection::from_completed(completed),
+            )
+        };
+        consider_session_model(&mut self.session_models, &key, candidate);
+        Some(snapshot)
     }
 
     fn apply(&mut self, event: MonitorEvent) -> Option<CompletedRequest> {
@@ -1485,6 +1650,7 @@ impl MonitorStore {
             MonitorEvent::RequestStarted {
                 request_id,
                 session_id,
+                agent_id,
                 session_seq,
                 endpoint,
             } => {
@@ -1493,10 +1659,12 @@ impl MonitorStore {
                     ActiveRequest {
                         request_id,
                         session_id,
+                        agent_id,
                         session_seq,
                         project: None,
                         provider: None,
                         model: None,
+                        resolved_model: None,
                         effort: None,
                         endpoint,
                         started_at: SystemTime::now(),
@@ -1516,6 +1684,11 @@ impl MonitorStore {
                         codex: None,
                     },
                 );
+            }
+            MonitorEvent::ModelRequested { request_id, model } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.model = Some(model);
+                }
             }
             MonitorEvent::ProjectResolved {
                 request_id,
@@ -1541,18 +1714,14 @@ impl MonitorStore {
             } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.provider = Some(provider);
-                    active.model = Some(model);
+                    active.model.get_or_insert(model);
                     active.effort = effort;
                     active.status = RequestStatus::ProviderSelected;
                 }
             }
             MonitorEvent::ModelResolved { request_id, model } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
-                    active.model = Some(match active.model.take() {
-                        Some(incoming) if incoming != model => format!("{incoming} → {model}"),
-                        Some(incoming) => incoming,
-                        None => model,
-                    });
+                    active.resolved_model = Some(model);
                 }
             }
             MonitorEvent::CompactionStarted { request_id } => {
@@ -1631,11 +1800,11 @@ impl MonitorStore {
                         ));
                     }
                 }
-                if let Some((session_id, input_delta, output_delta)) = usage_update {
-                    self.record_session_usage(session_id, input_delta, output_delta);
+                if let Some((key, input_delta, output_delta)) = usage_update {
+                    self.record_session_usage(key, input_delta, output_delta);
                 }
-                if let Some((session_id, timestamp, tokens)) = history_update {
-                    self.record_session_output(session_id, timestamp, tokens);
+                if let Some((key, timestamp, tokens)) = history_update {
+                    self.record_session_output(key, timestamp, tokens);
                 }
             }
             MonitorEvent::UsageUpdated {
@@ -1680,11 +1849,11 @@ impl MonitorStore {
                         ));
                     }
                 }
-                if let Some((session_id, input_delta, output_delta)) = usage_update {
-                    self.record_session_usage(session_id, input_delta, output_delta);
+                if let Some((key, input_delta, output_delta)) = usage_update {
+                    self.record_session_usage(key, input_delta, output_delta);
                 }
-                if let Some((session_id, timestamp, tokens)) = history_update {
-                    self.record_session_output(session_id, timestamp, tokens);
+                if let Some((key, timestamp, tokens)) = history_update {
+                    self.record_session_output(key, timestamp, tokens);
                 }
             }
             MonitorEvent::RequestCompleted {
@@ -1767,10 +1936,12 @@ impl MonitorStore {
             .unwrap_or_else(|| ActiveRequest {
                 request_id: request_id.to_string(),
                 session_id: None,
+                agent_id: None,
                 session_seq: None,
                 project: None,
                 provider: None,
                 model: None,
+                resolved_model: None,
                 effort: None,
                 endpoint: EndpointKind::Messages,
                 started_at: SystemTime::now(),
@@ -1804,10 +1975,12 @@ impl MonitorStore {
         let completed = CompletedRequest {
             request_id: active.request_id,
             session_id: active.session_id,
+            agent_id: active.agent_id,
             session_seq: active.session_seq,
             project: active.project,
             provider: active.provider,
             model: active.model,
+            resolved_model: active.resolved_model,
             effort: active.effort,
             endpoint: active.endpoint,
             started_at: active.started_at,
@@ -1837,6 +2010,12 @@ impl MonitorStore {
                 tokens,
             );
         }
+        let session_key = completed.session_id.clone();
+        consider_session_model(
+            &mut self.session_models,
+            &session_key,
+            SessionModelSelection::from_completed(&completed),
+        );
         self.recent.push_front(completed.clone());
         while self.recent.len() > self.recent_limit {
             self.recent.pop_back();
@@ -1844,25 +2023,15 @@ impl MonitorStore {
         Some(completed)
     }
 
-    fn record_session_usage(
-        &mut self,
-        session_id: Option<String>,
-        input_tokens: u64,
-        output_tokens: u64,
-    ) {
-        let usage = self.session_usage.entry(session_id).or_default();
+    fn record_session_usage(&mut self, key: SessionKey, input_tokens: u64, output_tokens: u64) {
+        let usage = self.session_usage.entry(key).or_default();
         usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
         usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
     }
 
-    fn record_session_output(
-        &mut self,
-        session_id: Option<String>,
-        timestamp: SystemTime,
-        tokens: u64,
-    ) {
+    fn record_session_output(&mut self, key: SessionKey, timestamp: SystemTime, tokens: u64) {
         let bucket = session_token_bucket(timestamp);
-        let buckets = self.session_output_buckets.entry(session_id).or_default();
+        let buckets = self.session_output_buckets.entry(key).or_default();
         match buckets.binary_search_by_key(&bucket, |(bucket, _)| *bucket) {
             Ok(index) => buckets[index].1 = buckets[index].1.saturating_add(tokens),
             Err(index) => buckets.insert(index, (bucket, tokens)),
@@ -1876,6 +2045,7 @@ impl MonitorStore {
             &active,
             &self.recent,
             &self.session_usage,
+            &self.session_models,
             &self.session_output_buckets,
         );
         MonitorState {
@@ -1891,13 +2061,17 @@ impl MonitorStore {
 fn session_summaries(
     active: &[ActiveRequest],
     recent: &VecDeque<CompletedRequest>,
-    session_usage: &HashMap<Option<String>, SessionUsage>,
-    session_output_buckets: &HashMap<Option<String>, Vec<(u64, u64)>>,
+    session_usage: &HashMap<SessionKey, SessionUsage>,
+    persisted_session_models: &HashMap<SessionKey, SessionModelSelection>,
+    session_output_buckets: &HashMap<SessionKey, Vec<(u64, u64)>>,
 ) -> Vec<SessionSummary> {
-    let mut sessions: HashMap<Option<String>, SessionSummary> = HashMap::new();
+    let mut sessions: HashMap<SessionKey, SessionSummary> = HashMap::new();
+    let mut session_models = HashMap::new();
     for request in recent.iter().rev() {
+        let key = request.session_id.clone();
+        seed_session_model(&mut session_models, persisted_session_models, &key);
         let entry = sessions
-            .entry(request.session_id.clone())
+            .entry(key.clone())
             .or_insert_with(|| SessionSummary {
                 session_id: request.session_id.clone(),
                 project: request.project.clone(),
@@ -1906,6 +2080,8 @@ fn session_summaries(
                 failure_count: 0,
                 provider: None,
                 model: None,
+                resolved_model: None,
+                codex_priority: false,
                 effort: None,
                 last_seen: request.finished_at,
                 input_tokens: 0,
@@ -1920,9 +2096,11 @@ fn session_summaries(
             entry.failure_count += 1;
         }
         entry.project = request.project.clone().or(entry.project.clone());
-        entry.provider = request.provider.clone().or(entry.provider.clone());
-        entry.model = request.model.clone().or(entry.model.clone());
-        entry.effort = request.effort.clone().or(entry.effort.clone());
+        consider_session_model(
+            &mut session_models,
+            &key,
+            SessionModelSelection::from_completed(request),
+        );
         entry.last_seen = max_system_time(entry.last_seen, request.finished_at);
         if let (Some(tokens), Some(duration)) = (
             request
@@ -1940,8 +2118,10 @@ fn session_summaries(
     }
 
     for request in active {
+        let key = request.session_id.clone();
+        seed_session_model(&mut session_models, persisted_session_models, &key);
         let entry = sessions
-            .entry(request.session_id.clone())
+            .entry(key.clone())
             .or_insert_with(|| SessionSummary {
                 session_id: request.session_id.clone(),
                 project: request.project.clone(),
@@ -1950,6 +2130,8 @@ fn session_summaries(
                 failure_count: 0,
                 provider: None,
                 model: None,
+                resolved_model: None,
+                codex_priority: false,
                 effort: None,
                 last_seen: request.started_at,
                 input_tokens: 0,
@@ -1962,9 +2144,11 @@ fn session_summaries(
         entry.active_count += 1;
         entry.request_count += 1;
         entry.project = request.project.clone().or(entry.project.clone());
-        entry.provider = request.provider.clone().or(entry.provider.clone());
-        entry.model = request.model.clone().or(entry.model.clone());
-        entry.effort = request.effort.clone().or(entry.effort.clone());
+        consider_session_model(
+            &mut session_models,
+            &key,
+            SessionModelSelection::from_active(request),
+        );
         entry.last_seen = max_system_time(entry.last_seen, request.started_at);
         if let (Some(tokens), Some(duration)) = (
             request
@@ -1981,12 +2165,19 @@ fn session_summaries(
         entry.last_status = request.status.label().to_string();
     }
 
-    for (session_id, session) in &mut sessions {
-        if let Some(usage) = session_usage.get(session_id) {
+    for (key, session) in &mut sessions {
+        if let Some(selection) = session_models.get(key) {
+            session.provider.clone_from(&selection.provider);
+            session.model.clone_from(&selection.model);
+            session.resolved_model.clone_from(&selection.resolved_model);
+            session.codex_priority = selection.codex_priority;
+            session.effort.clone_from(&selection.effort);
+        }
+        if let Some(usage) = session_usage.get(key) {
             session.input_tokens = usage.input_tokens;
             session.output_tokens = usage.output_tokens;
         }
-        if let Some(buckets) = session_output_buckets.get(session_id) {
+        if let Some(buckets) = session_output_buckets.get(key) {
             session.output_token_samples = buckets
                 .iter()
                 .map(|(bucket, tokens)| (session_token_bucket_start(*bucket), *tokens))
@@ -1995,8 +2186,57 @@ fn session_summaries(
     }
 
     let mut out: Vec<_> = sessions.into_values().collect();
-    out.sort_by_key(SessionSummary::label);
+    out.sort_by(|left, right| left.session_id.cmp(&right.session_id));
     out
+}
+
+fn seed_session_model(
+    selections: &mut HashMap<SessionKey, SessionModelSelection>,
+    persisted: &HashMap<SessionKey, SessionModelSelection>,
+    key: &SessionKey,
+) {
+    if selections.contains_key(key) {
+        return;
+    }
+    if let Some(selection) = persisted.get(key) {
+        selections.insert(key.clone(), selection.clone());
+    }
+}
+
+fn consider_session_model(
+    selections: &mut HashMap<SessionKey, SessionModelSelection>,
+    key: &SessionKey,
+    candidate: Option<SessionModelSelection>,
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    match selections.entry(key.clone()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry)
+            if candidate.request_id == entry.get().request_id
+                || candidate.supersedes(entry.get()) =>
+        {
+            entry.insert(candidate);
+        }
+        std::collections::hash_map::Entry::Occupied(_) => {}
+    }
+    prune_session_models(selections);
+}
+
+fn prune_session_models(selections: &mut HashMap<SessionKey, SessionModelSelection>) {
+    while selections.len() > MAX_SESSION_MODEL_SELECTIONS {
+        let oldest = selections
+            .iter()
+            .min_by_key(|(_, selection)| selection.observed_at)
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        selections.remove(&oldest);
+    }
 }
 
 fn session_token_bucket(timestamp: SystemTime) -> u64 {
@@ -2009,6 +2249,23 @@ fn session_token_bucket(timestamp: SystemTime) -> u64 {
 
 fn session_token_bucket_start(bucket: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(bucket.saturating_mul(SESSION_TOKEN_BUCKET_SECS))
+}
+
+fn bounded_monitor_text(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let suffix = (max_bytes >= '…'.len_utf8()).then_some("…");
+    let mut end = max_bytes.saturating_sub(suffix.map_or(0, str::len));
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value.truncate(end);
+    if let Some(suffix) = suffix {
+        value.push_str(suffix);
+    }
+    value
 }
 
 fn update_token_count(current: &mut Option<u64>, incoming: Option<u64>) -> u64 {
@@ -2469,32 +2726,364 @@ mod tests {
         assert_eq!(state.active.len(), 1);
         assert_eq!(state.active[0].request_id, "r1");
         assert_eq!(state.active[0].session_id.as_deref(), Some("s1"));
+        assert_eq!(state.active[0].agent_id, None);
         assert_eq!(state.active[0].session_seq, Some(3));
     }
 
     #[test]
-    fn resolved_model_appends_to_incoming_alias() {
+    fn monitor_bounds_untrusted_model_and_error_text() {
+        let monitor = MonitorHandle::new(10);
+        let model = "模型".repeat(MAX_MONITOR_MODEL_BYTES);
+        let error = "错误".repeat(MAX_MONITOR_ERROR_BYTES);
+
+        monitor.request_started("r-bounded", None, None, EndpointKind::Messages);
+        monitor.model_requested("r-bounded", model);
+        let active = monitor.snapshot();
+        let stored_model = active.active[0].model.as_deref().unwrap();
+        assert!(stored_model.len() <= MAX_MONITOR_MODEL_BYTES);
+        assert!(stored_model.ends_with('…'));
+
+        monitor.request_failed("r-bounded", Some(400), error);
+        let recent = monitor.snapshot();
+        let stored_error = recent.recent[0].error.as_deref().unwrap();
+        assert!(stored_error.len() <= MAX_MONITOR_ERROR_BYTES);
+        assert!(stored_error.ends_with('…'));
+    }
+
+    #[test]
+    fn persisted_session_models_are_capacity_bounded() {
+        let mut selections = HashMap::new();
+        for index in 0..=MAX_SESSION_MODEL_SELECTIONS {
+            let key = Some(format!("session-{index}"));
+            let candidate = SessionModelSelection::new(
+                EndpointKind::Messages,
+                Some(index as u64),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(index as u64),
+                false,
+                &format!("request-{index}"),
+                Some("claude-test"),
+                None,
+                false,
+            );
+            consider_session_model(&mut selections, &key, candidate);
+        }
+
+        assert_eq!(selections.len(), MAX_SESSION_MODEL_SELECTIONS);
+    }
+
+    #[test]
+    fn requested_and_resolved_models_are_stored_separately() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.model_requested("r1", "claude-sonnet-4-6[1m]");
         monitor.provider_selected("r1", "codex", "claude-sonnet-4-6", None);
         monitor.model_resolved("r1", "gpt-5.4");
 
         let state = monitor.snapshot();
         assert_eq!(
             state.active[0].model.as_deref(),
-            Some("claude-sonnet-4-6 → gpt-5.4")
+            Some("claude-sonnet-4-6[1m]")
         );
+        assert_eq!(state.active[0].resolved_model.as_deref(), Some("gpt-5.4"));
     }
 
     #[test]
-    fn identical_resolved_model_is_shown_once() {
+    fn identical_resolved_model_remains_separate() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.model_requested("r1", "gpt-5.6-sol");
         monitor.provider_selected("r1", "codex", "gpt-5.6-sol", None);
         monitor.model_resolved("r1", "gpt-5.6-sol");
 
         let state = monitor.snapshot();
         assert_eq!(state.active[0].model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            state.active[0].resolved_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn newer_unresolved_model_clears_stale_session_mapping() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r1",
+            Some("shared-session".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("r1", "claude-old");
+        monitor.provider_selected("r1", "codex", "gpt-old", None);
+        monitor.model_resolved("r1", "gpt-old");
+        monitor.session_sequence_resolved("r1", 1);
+        monitor.request_completed("r1", 200, None, None);
+
+        monitor.request_started(
+            "r2",
+            Some("shared-session".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("r2", "claude-new");
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].model.as_deref(), Some("claude-new"));
+        assert_eq!(state.sessions[0].resolved_model, None);
+
+        monitor.request_failed("r2", Some(400), "unresolved model");
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].model.as_deref(), Some("claude-new"));
+        assert_eq!(state.sessions[0].resolved_model, None);
+    }
+
+    #[test]
+    fn session_priority_follows_the_model_selected_for_display() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r-priority",
+            Some("shared-session".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("r-priority", "claude-priority");
+        monitor.provider_selected("r-priority", "codex", "gpt-priority", None);
+        monitor.model_resolved("r-priority", "gpt-priority");
+        monitor.codex_acceleration_resolved("r-priority", None, Some("priority"));
+        monitor.request_completed("r-priority", 200, None, None);
+
+        let priority = monitor.snapshot();
+        assert_eq!(
+            priority.sessions[0].resolved_model.as_deref(),
+            Some("gpt-priority")
+        );
+        assert!(priority.sessions[0].codex_priority);
+
+        monitor.request_started(
+            "r-flex",
+            Some("shared-session".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("r-flex", "claude-flex");
+        monitor.provider_selected("r-flex", "codex", "gpt-flex", None);
+        monitor.model_resolved("r-flex", "gpt-flex");
+        monitor.codex_acceleration_resolved("r-flex", None, Some("flex"));
+
+        let flex = monitor.snapshot();
+        assert_eq!(flex.sessions[0].resolved_model.as_deref(), Some("gpt-flex"));
+        assert!(!flex.sessions[0].codex_priority);
+    }
+
+    #[test]
+    fn count_tokens_does_not_replace_conversational_session_metadata() {
+        let monitor = MonitorHandle::new(1);
+        monitor.request_started(
+            "r-fast",
+            Some("shared-session".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("r-fast", "claude-opus-5");
+        monitor.provider_selected("r-fast", "codex", "gpt-5.6-sol", Some("xhigh".to_string()));
+        monitor.model_resolved("r-fast", "gpt-5.6-sol");
+        monitor.codex_acceleration_resolved("r-fast", Some("fast"), Some("priority"));
+        monitor.request_completed("r-fast", 200, None, None);
+
+        monitor.request_started(
+            "r-count",
+            Some("shared-session".to_string()),
+            Some(2),
+            EndpointKind::CountTokens,
+        );
+        monitor.model_requested("r-count", "claude-count");
+        monitor.provider_selected("r-count", "kimi", "kimi-count", Some("low".to_string()));
+        monitor.model_resolved("r-count", "kimi-count");
+
+        let active_count = monitor.snapshot();
+        assert_eq!(active_count.sessions[0].request_count, 2);
+        assert_eq!(active_count.sessions[0].active_count, 1);
+        assert_eq!(active_count.sessions[0].provider.as_deref(), Some("codex"));
+        assert_eq!(
+            active_count.sessions[0].model.as_deref(),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            active_count.sessions[0].resolved_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(active_count.sessions[0].effort.as_deref(), Some("xhigh"));
+        assert!(active_count.sessions[0].codex_priority);
+
+        monitor.request_completed("r-count", 200, None, None);
+        let completed_count = monitor.snapshot();
+        assert_eq!(
+            completed_count.sessions[0].provider.as_deref(),
+            Some("codex")
+        );
+        assert_eq!(completed_count.sessions[0].effort.as_deref(), Some("xhigh"));
+        assert!(completed_count.sessions[0].codex_priority);
+    }
+
+    #[test]
+    fn newer_primary_media_request_replaces_conversational_model() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r-message", None, None, EndpointKind::Messages);
+        monitor.model_requested("r-message", "claude-opus-5");
+        monitor.model_resolved("r-message", "gpt-5.6-sol");
+        monitor.codex_acceleration_resolved("r-message", Some("fast"), Some("priority"));
+        monitor.request_completed("r-message", 200, None, None);
+
+        monitor.request_started("r-image", None, None, EndpointKind::Images);
+        monitor.model_requested("r-image", "gpt-image-1");
+        monitor.model_resolved("r-image", "gpt-image-1");
+        monitor.request_completed("r-image", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].model.as_deref(), Some("gpt-image-1"));
+        assert_eq!(
+            state.sessions[0].resolved_model.as_deref(),
+            Some("gpt-image-1")
+        );
+        assert!(!state.sessions[0].codex_priority);
+    }
+
+    #[test]
+    fn newer_conversational_sequence_wins_when_older_request_finishes_later() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r-old",
+            Some("shared-session".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("r-old", "claude-old");
+        monitor.provider_selected("r-old", "codex", "gpt-old", None);
+        monitor.model_resolved("r-old", "gpt-old");
+
+        let agent =
+            ConversationIdentity::Agent("shared-session".to_string(), "agent-fast".to_string());
+        monitor.request_started_with_identity(
+            "r-fast",
+            Some(&agent),
+            Some(2),
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("r-fast", "claude-opus-5");
+        monitor.provider_selected("r-fast", "codex", "gpt-5.6-sol", None);
+        monitor.model_resolved("r-fast", "gpt-5.6-sol");
+        monitor.codex_acceleration_resolved("r-fast", Some("fast"), Some("priority"));
+        monitor.request_completed("r-fast", 200, None, None);
+        monitor.request_completed("r-old", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(
+            state.sessions[0].resolved_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert!(state.sessions[0].codex_priority);
+    }
+
+    #[test]
+    fn auxiliary_only_session_keeps_its_latest_model() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r-old-count",
+            Some("count-session".to_string()),
+            Some(1),
+            EndpointKind::CountTokens,
+        );
+        monitor.model_requested("r-old-count", "claude-old");
+        monitor.provider_selected("r-old-count", "codex", "gpt-old", None);
+        monitor.model_resolved("r-old-count", "gpt-old");
+        monitor.request_completed("r-old-count", 200, None, None);
+
+        monitor.request_started(
+            "r-count",
+            Some("count-session".to_string()),
+            Some(2),
+            EndpointKind::CountTokens,
+        );
+        monitor.model_requested("r-count", "claude-opus-5");
+        monitor.provider_selected("r-count", "codex", "gpt-5.6-sol", None);
+        monitor.model_resolved("r-count", "gpt-5.6-sol");
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(
+            state.sessions[0].resolved_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert!(!state.sessions[0].codex_priority);
+    }
+
+    #[test]
+    fn session_model_selection_has_a_deterministic_total_order() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let unsequenced = SessionModelSelection::new(
+            EndpointKind::Messages,
+            None,
+            started_at,
+            true,
+            "z-unsequenced",
+            Some("unsequenced"),
+            None,
+            false,
+        )
+        .unwrap();
+        let sequenced = SessionModelSelection::new(
+            EndpointKind::Messages,
+            Some(1),
+            started_at,
+            false,
+            "a-sequenced",
+            Some("sequenced"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(sequenced.supersedes(&unsequenced));
+        assert!(!unsequenced.supersedes(&sequenced));
+
+        let newer_unsequenced = SessionModelSelection::new(
+            EndpointKind::Messages,
+            None,
+            started_at + Duration::from_secs(1),
+            true,
+            "newer-unsequenced",
+            Some("newer"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(newer_unsequenced.supersedes(&sequenced));
+        assert!(!sequenced.supersedes(&newer_unsequenced));
+
+        let completed = SessionModelSelection::new(
+            EndpointKind::Messages,
+            Some(1),
+            started_at,
+            false,
+            "same-request",
+            Some("completed"),
+            None,
+            false,
+        )
+        .unwrap();
+        let active = SessionModelSelection::new(
+            EndpointKind::Messages,
+            Some(1),
+            started_at,
+            true,
+            "same-request",
+            Some("active"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(active.supersedes(&completed));
+        assert!(!completed.supersedes(&active));
     }
 
     #[test]
@@ -2676,10 +3265,12 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         CompletedRequest {
             request_id: request_id.to_string(),
             session_id: Some(session_id.to_string()),
+            agent_id: None,
             session_seq: None,
             project: None,
             provider: Some("codex".to_string()),
             model: Some("gpt-5.6-sol".to_string()),
+            resolved_model: None,
             effort: None,
             endpoint: EndpointKind::Messages,
             started_at: SystemTime::UNIX_EPOCH,
@@ -2704,7 +3295,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     fn session_summaries_for_requests(recent: &VecDeque<CompletedRequest>) -> Vec<SessionSummary> {
-        let mut usage = HashMap::<Option<String>, SessionUsage>::new();
+        let mut usage = HashMap::<SessionKey, SessionUsage>::new();
         for request in recent {
             let entry = usage.entry(request.session_id.clone()).or_default();
             entry.input_tokens = entry
@@ -2714,7 +3305,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 .output_tokens
                 .saturating_add(request.output_tokens.unwrap_or(0));
         }
-        session_summaries(&[], recent, &usage, &HashMap::new())
+        session_summaries(&[], recent, &usage, &HashMap::new(), &HashMap::new())
     }
 
     #[test]
@@ -2866,6 +3457,50 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
+    fn agent_requests_aggregate_into_their_parent_session() {
+        let monitor = MonitorHandle::new(10);
+        let main = ConversationIdentity::Main("shared-session".to_string());
+        let agent_a =
+            ConversationIdentity::Agent("shared-session".to_string(), "agent-a".to_string());
+        let agent_b =
+            ConversationIdentity::Agent("shared-session".to_string(), "agent-b".to_string());
+
+        for (request_id, identity, input, output) in [
+            ("main", &main, 100, 10),
+            ("agent-a", &agent_a, 200, 20),
+            ("agent-b", &agent_b, 300, 30),
+        ] {
+            monitor.request_started_with_identity(
+                request_id,
+                Some(identity),
+                None,
+                EndpointKind::Messages,
+            );
+            monitor.usage_updated(request_id, Some(input), Some(output));
+            monitor.request_completed(request_id, 200, None, None);
+        }
+        monitor.usage_updated("agent-b", Some(350), Some(35));
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions.len(), 1);
+        let session = &state.sessions[0];
+        assert_eq!(session.session_id.as_deref(), Some("shared-session"));
+        assert_eq!(session.request_count, 3);
+        assert_eq!((session.input_tokens, session.output_tokens), (650, 65));
+        assert_eq!(
+            session
+                .output_token_samples
+                .iter()
+                .map(|(_, tokens)| *tokens)
+                .sum::<u64>(),
+            session.output_tokens
+        );
+        assert!(state.recent.iter().any(|request| {
+            request.request_id == "agent-a" && request.agent_id.as_deref() == Some("agent-a")
+        }));
+    }
+
+    #[test]
     fn session_output_history_survives_request_eviction() {
         let monitor = MonitorHandle::new(1);
         for (request_id, tokens) in [("oldest", 20), ("newest", 80)] {
@@ -2954,6 +3589,9 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             EndpointKind::Messages,
         );
         monitor.session_sequence_resolved("before", 7);
+        monitor.model_requested("before", "claude-old");
+        monitor.model_resolved("before", "gpt-old");
+        monitor.codex_acceleration_resolved("before", Some("fast"), Some("priority"));
         monitor.request_completed("before", 200, Some(100), Some(20));
 
         monitor.request_started(
@@ -2963,11 +3601,16 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             EndpointKind::Messages,
         );
         monitor.session_sequence_resolved("after", 1);
+        monitor.model_requested("after", "claude-new");
+        monitor.model_resolved("after", "gpt-new");
         monitor.request_completed("after", 200, Some(25), Some(5));
 
         let state = monitor.snapshot();
         assert_eq!(state.sessions[0].input_tokens, 125);
         assert_eq!(state.sessions[0].output_tokens, 25);
+        assert_eq!(state.sessions[0].model.as_deref(), Some("claude-new"));
+        assert_eq!(state.sessions[0].resolved_model.as_deref(), Some("gpt-new"));
+        assert!(!state.sessions[0].codex_priority);
     }
 
     #[test]

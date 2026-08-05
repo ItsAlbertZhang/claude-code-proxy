@@ -1128,9 +1128,10 @@ async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
+    let monitor = MonitorHandle::new(10);
     let enabled = app_with_features(
         Arc::new(Registry::with_default_alias()),
-        None,
+        Some(monitor.clone()),
         AppFeatures {
             responses_api: false,
             images_api: false,
@@ -1163,6 +1164,16 @@ async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
     )
     .unwrap();
     assert_eq!(body["error"]["param"], "file");
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 1);
+    assert_eq!(
+        state.recent[0].model.as_deref(),
+        Some("gpt-4o-mini-transcribe")
+    );
+    assert_eq!(
+        state.recent[0].resolved_model.as_deref(),
+        Some("codex-transcribe")
+    );
 }
 
 #[tokio::test]
@@ -1626,8 +1637,12 @@ async fn monitor_records_successful_request_events() {
                 .uri("/v1/messages/count_tokens")
                 .header("content-type", "application/json")
                 .header("x-claude-code-session-id", "project-session")
+                .header(
+                    "x-claude-code-agent-id",
+                    "a11ce914-ada4-4f40-9672-985f950fbb66",
+                )
                 .body(body_string(
-                    r##"{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.177.45c"},{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK.","cache_control":{"type":"ephemeral"}},{"type":"text","text":"\nYou are an interactive agent.\n\n# Environment\nYou have been invoked in the following environment: \n - Primary working directory: /projects/example\n - Is a git repository: true","cache_control":{"type":"ephemeral"}}],"output_config":{"effort":"high"}}"##,
+                    r##"{"model":"gpt-5.4[1m]","messages":[{"role":"user","content":"hello"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.177.45c"},{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK.","cache_control":{"type":"ephemeral"}},{"type":"text","text":"\nYou are an interactive agent.\n\n# Environment\nYou have been invoked in the following environment: \n - Primary working directory: /projects/example\n - Is a git repository: true","cache_control":{"type":"ephemeral"}}],"output_config":{"effort":"high"}}"##,
                 ))
                 .unwrap(),
         )
@@ -1651,11 +1666,23 @@ async fn monitor_records_successful_request_events() {
         state.recent[0].session_id.as_deref(),
         Some("project-session")
     );
+    assert_eq!(
+        state.recent[0].agent_id.as_deref(),
+        Some("a11ce914-ada4-4f40-9672-985f950fbb66")
+    );
     assert!(state.recent[0].session_seq.is_none());
     assert_eq!(state.recent[0].project.as_deref(), Some("example"));
     assert_eq!(state.sessions[0].project.as_deref(), Some("example"));
+    assert_eq!(state.sessions.len(), 1);
+    assert_eq!(
+        state.sessions[0].session_id.as_deref(),
+        Some("project-session")
+    );
     assert_eq!(state.recent[0].provider.as_deref(), Some("codex"));
-    assert_eq!(state.recent[0].model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(state.recent[0].model.as_deref(), Some("gpt-5.4[1m]"));
+    assert_eq!(state.recent[0].resolved_model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(state.sessions[0].model.as_deref(), Some("gpt-5.4[1m]"));
+    assert_eq!(state.sessions[0].resolved_model.as_deref(), Some("gpt-5.4"));
     assert_eq!(state.recent[0].effort.as_deref(), Some("high"));
     assert!(state.recent[0].input_tokens.is_some());
 }
@@ -1716,6 +1743,50 @@ async fn monitor_records_unknown_model_failure() {
     let error = state.recent[0].error.as_deref().unwrap_or("");
     assert!(error.starts_with("Unknown model \"not-a-model\""));
     assert!(error.contains("Supported:"));
+}
+
+#[tokio::test]
+async fn monitor_bounds_unknown_model_text_without_changing_response() {
+    let monitor = MonitorHandle::new(10);
+    let model = "x".repeat(10 * 1024);
+    let response = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    )
+    .oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-claude-code-session-id", "bounded-model-session")
+            .body(body_string(
+                &json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "model": &model,
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(body["error"]["message"].as_str().unwrap().contains(&model));
+
+    let state = monitor.snapshot();
+    let stored_model = state.recent[0].model.as_deref().unwrap();
+    let stored_error = state.recent[0].error.as_deref().unwrap();
+    assert!(stored_model.len() <= 512);
+    assert!(stored_model.ends_with('…'));
+    assert!(stored_error.len() <= 4 * 1024);
+    assert!(stored_error.ends_with('…'));
 }
 
 async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {
