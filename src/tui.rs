@@ -1270,8 +1270,8 @@ enum ActiveColumn {
     Session,
     Agent,
     Model,
-    Codex,
     Effort,
+    Codex,
     Endpoint,
     Input,
     Output,
@@ -1289,8 +1289,8 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
-            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::flex(C::Endpoint, "Endpoint", Alignment::Left, 1),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
@@ -1304,8 +1304,8 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
-            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
@@ -1419,8 +1419,8 @@ enum RecentColumn {
     Session,
     Agent,
     Model,
-    Codex,
     Effort,
+    Codex,
     Endpoint,
     Latency,
     Rate,
@@ -1440,8 +1440,8 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Agent, "Agent", Alignment::Left, AGENT_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDTH),
-            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
+            ColumnSpec::fixed(C::Codex, "C P/R/S", Alignment::Left, CODEX_REQUEST_WIDTH),
             ColumnSpec::fixed(C::Endpoint, "Endpoint", Alignment::Left, ENDPOINT_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
@@ -2545,6 +2545,25 @@ mod tests {
             headers(&event_columns(LayoutTier::Medium))[2..5],
             ["Session", "Agent", "Model"]
         );
+    }
+
+    #[test]
+    fn effort_follows_model_before_codex_diagnostics() {
+        for tier in [LayoutTier::Expanded, LayoutTier::Wide] {
+            let headers = headers(&active_columns(tier));
+            let model = headers
+                .iter()
+                .position(|header| *header == "Model")
+                .unwrap();
+            assert_eq!(&headers[model..model + 3], ["Model", "Effort", "C P/R/S"]);
+        }
+
+        let headers = headers(&recent_columns(LayoutTier::Wide));
+        let model = headers
+            .iter()
+            .position(|header| *header == "Model")
+            .unwrap();
+        assert_eq!(&headers[model..model + 3], ["Model", "Effort", "C P/R/S"]);
     }
 
     #[test]

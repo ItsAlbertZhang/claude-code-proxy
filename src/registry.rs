@@ -1,7 +1,9 @@
 use crate::{
     anthropic::{json_error, schema::MessagesRequest},
     config::AliasProvider,
+    model_setting::{ClaudeAliasFamily, ModelSetting},
     provider::{CliHandlers, Provider, RequestContext},
+    providers::configured_anthropic::ConfiguredAnthropicProvider,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -56,6 +58,7 @@ pub struct Registry {
     alias_provider: AliasProvider,
     models: BTreeMap<String, Vec<String>>,
     handlers: BTreeMap<String, Arc<dyn Provider>>,
+    configured_alias_routes: BTreeMap<ClaudeAliasFamily, Arc<dyn Provider>>,
 }
 
 impl Registry {
@@ -96,11 +99,34 @@ impl Registry {
             alias_provider,
             models,
             handlers,
+            configured_alias_routes: BTreeMap::new(),
         }
     }
 
     pub fn with_default_alias() -> Self {
         Self::new(crate::config::alias_provider())
+    }
+
+    pub fn with_default_alias_and_model_setting() -> Result<Self> {
+        Self::with_model_setting(
+            crate::config::alias_provider(),
+            ModelSetting::load_from_env()?,
+        )
+    }
+
+    pub fn with_model_setting(
+        alias_provider: AliasProvider,
+        setting: Option<ModelSetting>,
+    ) -> Result<Self> {
+        let mut registry = Self::new(alias_provider);
+        if let Some(setting) = setting {
+            for (family, route) in setting.into_routes() {
+                registry
+                    .configured_alias_routes
+                    .insert(family, Arc::new(ConfiguredAnthropicProvider::new(route)?));
+            }
+        }
+        Ok(registry)
     }
 
     pub fn from_providers(
@@ -118,6 +144,7 @@ impl Registry {
             alias_provider,
             models,
             handlers,
+            configured_alias_routes: BTreeMap::new(),
         }
     }
 
@@ -160,6 +187,20 @@ impl Registry {
             out.insert(provider.clone(), self.supported_models_for(provider));
         }
         out
+    }
+
+    pub fn provider_for_anthropic_messages_model(
+        &self,
+        raw_model: &str,
+        session_affinity: Option<&AliasProvider>,
+    ) -> Option<Arc<dyn Provider>> {
+        let normalized = normalize_incoming_model(raw_model);
+        if let Some(family) = ClaudeAliasFamily::from_normalized_model(&normalized)
+            && let Some(provider) = self.configured_alias_routes.get(&family)
+        {
+            return Some(provider.clone());
+        }
+        self.provider_for_model(&normalized, session_affinity)
     }
 
     pub fn provider_for_model(
@@ -205,7 +246,7 @@ pub fn normalize_incoming_model(model: &str) -> String {
 }
 
 pub fn is_anthropic_alias(model: &str) -> bool {
-    ANTHROPIC_STYLE_ALIASES.contains(&model)
+    ClaudeAliasFamily::from_normalized_model(model).is_some()
 }
 
 pub fn is_cursor_model(model: &str) -> bool {
@@ -375,6 +416,88 @@ mod tests {
             assert!(p.is_some(), "{model} should route to a provider");
             assert_eq!(p.expect("provider").name(), "codex");
         }
+    }
+
+    #[test]
+    fn configured_alias_routes_override_only_present_families() {
+        let setting = ModelSetting::parse(
+            &serde_json::json!({
+                "version": 1,
+                "routes": {
+                    "sonnet": {
+                        "url": "http://127.0.0.1:1/v1/messages",
+                        "apiKey": "sonnet-key",
+                        "model": "sonnet-target"
+                    },
+                    "fable": {
+                        "url": "http://127.0.0.1:2/v1/messages",
+                        "apiKey": "fable-key",
+                        "model": "fable-target"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let registry = Registry::with_model_setting(AliasProvider::Codex, Some(setting)).unwrap();
+        let kimi_affinity = AliasProvider::Kimi;
+
+        for model in ["sonnet", "claude-sonnet-5", "fable", "claude-fable-5"] {
+            assert_eq!(
+                registry
+                    .provider_for_anthropic_messages_model(model, Some(&kimi_affinity))
+                    .unwrap()
+                    .name(),
+                "model-setting"
+            );
+        }
+        for model in ["haiku", "opus", "claude-opus-5"] {
+            assert_eq!(
+                registry
+                    .provider_for_anthropic_messages_model(model, Some(&kimi_affinity))
+                    .unwrap()
+                    .name(),
+                "kimi"
+            );
+        }
+        assert_eq!(
+            registry
+                .provider_for_anthropic_messages_model("glm-5.2", None)
+                .unwrap()
+                .name(),
+            "opencode"
+        );
+    }
+
+    #[test]
+    fn regular_model_lookup_ignores_configured_alias_routes() {
+        let setting = ModelSetting::parse(
+            &serde_json::json!({
+                "version": 1,
+                "routes": {
+                    "sonnet": {
+                        "url": "http://127.0.0.1:1/v1/messages",
+                        "apiKey": "test-key",
+                        "model": "target"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let registry = Registry::with_model_setting(AliasProvider::Codex, Some(setting)).unwrap();
+
+        assert_eq!(
+            registry.provider_for_model("sonnet", None).unwrap().name(),
+            "codex"
+        );
+        assert_eq!(
+            registry
+                .provider_for_anthropic_messages_model("sonnet[1m]", None)
+                .unwrap()
+                .name(),
+            "model-setting"
+        );
     }
 
     #[test]

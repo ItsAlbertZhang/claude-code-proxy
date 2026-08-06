@@ -215,6 +215,16 @@ pub async fn serve_listener(
     monitor: Option<MonitorHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    let registry = Arc::new(Registry::with_default_alias_and_model_setting()?);
+    serve_listener_with_registry(listener, registry, monitor, shutdown).await
+}
+
+pub async fn serve_listener_with_registry(
+    listener: TcpListener,
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
     create_logger("server").info(
@@ -235,7 +245,7 @@ pub async fn serve_listener(
             ),
         ])),
     );
-    let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
+    let app = app_with_monitor(registry, monitor);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
@@ -1683,9 +1693,15 @@ async fn dispatch_request(
     if !count_tokens && is_claude_auto_review_request(&body) {
         request_scope = request_scope.with_purpose(RequestPurpose::AutoReview);
     }
-    let original_provider = state
-        .registry
-        .provider_for_model(&normalized_model, session_affinity);
+    let original_provider = if count_tokens {
+        state
+            .registry
+            .provider_for_model(&normalized_model, session_affinity)
+    } else {
+        state
+            .registry
+            .provider_for_anthropic_messages_model(&normalized_model, session_affinity)
+    };
     let configured_auto_review_model = crate::config::auto_review_model();
     let auto_review_route = original_provider.as_ref().and_then(|provider| {
         apply_auto_review_model(

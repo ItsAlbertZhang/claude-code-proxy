@@ -492,6 +492,10 @@ pub enum MonitorEvent {
         request_id: String,
         model: String,
     },
+    EffortResolved {
+        request_id: String,
+        effort: String,
+    },
     CompactionStarted {
         request_id: String,
     },
@@ -1132,6 +1136,13 @@ impl MonitorHandle {
         });
     }
 
+    pub fn effort_resolved(&self, request_id: impl Into<String>, effort: impl Into<String>) {
+        self.publish(MonitorEvent::EffortResolved {
+            request_id: request_id.into(),
+            effort: effort.into(),
+        });
+    }
+
     pub fn compaction_started(&self, request_id: impl Into<String>) {
         self.publish(MonitorEvent::CompactionStarted {
             request_id: request_id.into(),
@@ -1722,6 +1733,11 @@ impl MonitorStore {
             MonitorEvent::ModelResolved { request_id, model } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.resolved_model = Some(model);
+                }
+            }
+            MonitorEvent::EffortResolved { request_id, effort } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.effort = Some(effort);
                 }
             }
             MonitorEvent::CompactionStarted { request_id } => {
