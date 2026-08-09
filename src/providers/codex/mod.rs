@@ -21,15 +21,16 @@ use axum::Json;
 use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use futures_util::StreamExt;
 use http::StatusCode;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-#[cfg(test)]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
-use crate::anthropic::sse::parse_sse_events;
+use crate::anthropic::sse::{encode_sse_event, parse_sse_events};
 use crate::config;
 use crate::logging::create_logger;
 use crate::monitor::{CodexRecoveryCause, usage_from_anthropic_sse};
@@ -64,6 +65,7 @@ use self::continuation::{
     record_continuation_for_owner, reserve_continuation_for_owner,
 };
 use self::count_tokens::count_translated_tokens;
+use self::native::NativeResponseOutcome;
 use self::state::{CodexBoundRoute, ProtocolLane};
 use self::translate::accumulate::accumulate_response_scoped;
 use self::translate::live_stream::LiveStreamTranslator;
@@ -80,6 +82,13 @@ use self::translate::request::{
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
+const CODEX_DOWNSTREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const COMMITTED_ERROR_BODY_LIMIT: usize = 1024 * 1024;
+const CLAUDE_PING_JSON: &str = r#"{"type":"ping"}"#;
+
+type PendingCodexResponse = Pin<Box<dyn Future<Output = Response> + Send>>;
+type CodexResponseBodyStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, axum::Error>> + Send>>;
 
 fn merge_claude_fast_service_tier(
     model_tier: Option<ServiceTier>,
@@ -121,6 +130,7 @@ pub(crate) fn clear_conversation_state(identity: &ConversationIdentity) {
     compaction::clear_compactions_for_owner(identity);
 }
 
+#[derive(Clone)]
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
     #[cfg(test)]
@@ -167,6 +177,27 @@ impl CodexProvider {
 
 impl CodexProvider {
     async fn handle_messages_inner(
+        &self,
+        body: MessagesRequest,
+        scoped: ScopedRequestContext,
+        claude_fast_intent: bool,
+    ) -> Response {
+        if !body.stream {
+            return self
+                .handle_messages_core(body, scoped, claude_fast_intent)
+                .await;
+        }
+
+        let provider = self.clone();
+        let response = Box::pin(async move {
+            provider
+                .handle_messages_core(body, scoped, claude_fast_intent)
+                .await
+        });
+        await_codex_response_with_heartbeat(response).await
+    }
+
+    async fn handle_messages_core(
         &self,
         body: MessagesRequest,
         scoped: ScopedRequestContext,
@@ -387,7 +418,7 @@ impl CodexProvider {
         let compaction_start_permit = (server_compaction_enabled && compact_boundary)
             .then(|| reserve_compaction_start(codex_lane))
             .flatten();
-        let mut logical_continuation = owner_continuation.clone();
+        let logical_continuation = owner_continuation.clone();
         let mut cleanup =
             LiveRequestStateCleanup::new(owner_continuation.clone(), None, compaction_start_permit);
 
@@ -411,142 +442,54 @@ impl CodexProvider {
         let mut empty_completion_attempt = 0_u32;
         let mut upstream_started = false;
 
-        // A compact boundary first runs one hidden, ownerful CompactionTrigger
-        // turn. The caller-visible Claude plaintext summary is detached work
-        // performed only after that hidden terminal has been published.
+        // The hidden ownerful trigger and detached plaintext summary do not
+        // depend on each other's output. Start both upstream turns together,
+        // then keep the compacted history pending until the summary's terminal
+        // event passes through the downstream coordinator.
         let hidden_compaction_permit = cleanup.take_compaction_start_permit();
-        if compact_boundary && let Some(permit) = hidden_compaction_permit.as_ref() {
-            'hidden_routes: loop {
-                let translated = bind_messages_request_to_route(&original_translated, &route);
-                let prepared = prepare_compaction_request(&translated);
-                let mut hidden_continuation = owner_continuation
-                    .evaluate_hidden_compaction(prepared.request())
-                    .bind_route(&route);
-                if route_rebuilt {
-                    hidden_continuation =
-                        hidden_continuation.full_context_retry(CodexRecoveryCause::AuthRejection);
-                }
-                cleanup.replace_continuation(hidden_continuation.clone());
-                log_compaction_event(
-                    "server_compaction_triggered",
-                    &ctx,
-                    prepared.request().input.len(),
-                    None,
-                );
-                if let Some(monitor) = ctx.monitor.as_ref() {
-                    monitor.compaction_started(&ctx.req_id);
-                }
-                let Some(build_lease) = begin_compaction_for_route_with_owner(
-                    permit,
-                    &route,
-                    &translated.model,
-                    conversation_identity.as_ref(),
-                ) else {
-                    abort_continuation_for_owner(&hidden_continuation);
-                    log_compaction_event(
-                        "server_compaction_failed",
-                        &ctx,
-                        prepared.request().input.len(),
-                        Some("compaction route lease could not be acquired"),
-                    );
-                    break 'hidden_routes;
-                };
-                cleanup.replace_compaction_lease(Some(build_lease.clone()));
-                let mut compaction_ctx = ctx.clone();
-                compaction_ctx.monitor = None;
-                match request_compaction_bound_result(
-                    client.as_ref(),
-                    &route,
-                    prepared,
-                    &compaction_ctx,
-                    &hidden_continuation,
-                    &mut buffered_retry_state,
-                )
-                .await
-                {
-                    Ok(bound) => {
-                        if let Some(publication) = bound.continuation_publication() {
-                            if record_continuation_for_owner(
-                                &hidden_continuation,
-                                publication.request,
-                                Some(publication.response_id),
-                                Some(publication.socket_id),
-                                publication.output_items,
-                            ) == ContinuationPublication::Rejected
-                            {
-                                websocket::invalidate_codex_websocket_pool_for_reservation(
-                                    &hidden_continuation,
-                                );
-                            }
-                        } else {
-                            // HTTP can install compacted history, but cannot
-                            // fabricate a socket-bound continuation baseline.
-                            abort_continuation_for_owner(&hidden_continuation);
-                        }
-                        if store_compaction_for_route(&build_lease, bound.compacted_history()) {
-                            log_compaction_event(
-                                "server_compaction_completed",
-                                &ctx,
-                                translated.input.len(),
-                                None,
-                            );
-                        } else {
-                            cleanup.abort_compaction();
-                            log_compaction_event(
-                                "server_compaction_failed",
-                                &ctx,
-                                translated.input.len(),
-                                Some("compaction state exceeded the in-memory limit"),
-                            );
-                        }
-                        break 'hidden_routes;
-                    }
-                    Err(error) => {
-                        cleanup.abort_compaction();
-                        log_compaction_event(
-                            "server_compaction_failed",
-                            &ctx,
-                            translated.input.len(),
-                            Some(&error.to_string()),
-                        );
-                        if let compaction::CompactionError::Upstream(upstream) = error {
-                            if upstream.is_in_band_auth_rejection() {
-                                client.refresh_conversation_auth_after_rejection_in_background(
-                                    &route,
-                                    auth_rejection_budget.clone(),
-                                );
-                                cleanup.abort();
-                                return map_codex_error_to_response(&upstream);
-                            }
-                            if upstream.is_replayable_auth_rejection() {
-                                let Some(next_route) = rebuild_route_after_unauthorized(
-                                    client.as_ref(),
-                                    &route,
-                                    auth_rejection_budget.as_ref(),
-                                )
-                                .await
-                                else {
-                                    cleanup.abort();
-                                    return map_codex_error_to_response(&upstream);
-                                };
-                                route = next_route;
-                                route_rebuilt = true;
-                                continue 'hidden_routes;
-                            }
-                        }
-                        abort_continuation_for_owner(&hidden_continuation);
-                        break 'hidden_routes;
-                    }
-                }
-            }
-
-            logical_continuation = ContinuationReservation::detached(
+        if compact_boundary && let Some(permit) = hidden_compaction_permit {
+            cleanup.disarm();
+            let summary_continuation = ContinuationReservation::detached(
                 original_translated.input.len(),
                 "claude_plaintext_summary",
             );
-            cleanup.replace_continuation(logical_continuation.clone());
-            route = route.auxiliary();
-            route_rebuilt = false;
+            let parallel_auth = Arc::new(ParallelCompactionAuth::new(
+                client.clone(),
+                route.clone(),
+                auth_rejection_budget.clone(),
+            ));
+            let hidden = run_hidden_compaction(
+                client.clone(),
+                route.clone(),
+                original_translated.clone(),
+                owner_continuation,
+                permit,
+                ctx.clone(),
+                conversation_identity.clone(),
+                parallel_auth.clone(),
+            );
+            let summary = request_plaintext_compaction_summary(
+                client.clone(),
+                route.auxiliary(),
+                original_translated,
+                summary_continuation,
+                message_id,
+                model,
+                want_stream,
+                ctx,
+                read_lane,
+                auth_rejection_budget,
+                parallel_auth,
+                &mut conversation_admission,
+            );
+            let (hidden, summary) = tokio::join!(hidden, summary);
+            return match hidden {
+                HiddenCompactionOutcome::Fatal(response) => response,
+                HiddenCompactionOutcome::Completed(compaction_lease) => {
+                    coordinate_compaction_summary_response(summary, compaction_lease, want_stream)
+                        .await
+                }
+            };
         }
 
         'routes: loop {
@@ -783,6 +726,479 @@ impl CodexProvider {
             };
         }
     }
+}
+
+struct ParallelCompactionAuth {
+    client: Arc<CodexHttpClient>,
+    initial_route: CodexBoundRoute,
+    rejection_budget: Arc<AuthRejectionBudget>,
+    rebound: tokio::sync::OnceCell<Option<CodexBoundRoute>>,
+}
+
+impl ParallelCompactionAuth {
+    fn new(
+        client: Arc<CodexHttpClient>,
+        initial_route: CodexBoundRoute,
+        rejection_budget: Arc<AuthRejectionBudget>,
+    ) -> Self {
+        Self {
+            client,
+            initial_route,
+            rejection_budget,
+            rebound: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn rebuild_after(&self, rejected: &CodexBoundRoute) -> Option<CodexBoundRoute> {
+        let rebound = self
+            .rebound
+            .get_or_init(|| async {
+                if !self.rejection_budget.try_claim() {
+                    return None;
+                }
+                self.client
+                    .refresh_conversation_route_after_rejection(&self.initial_route)
+                    .await
+                    .into_route()
+            })
+            .await
+            .clone()?;
+        (rebound.route_identity() != rejected.route_identity()).then_some(rebound)
+    }
+}
+
+enum HiddenCompactionOutcome {
+    Completed(Option<CompactionLease>),
+    Fatal(Response),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_hidden_compaction(
+    client: Arc<CodexHttpClient>,
+    mut route: CodexBoundRoute,
+    original_translated: translate::request::ResponsesRequest,
+    owner_continuation: ContinuationReservation,
+    permit: CompactionStartPermit,
+    ctx: RequestContext,
+    conversation_identity: Option<ConversationIdentity>,
+    parallel_auth: Arc<ParallelCompactionAuth>,
+) -> HiddenCompactionOutcome {
+    let mut cleanup = LiveRequestStateCleanup::new(owner_continuation.clone(), None, Some(permit));
+    let permit = cleanup
+        .take_compaction_start_permit()
+        .expect("hidden compaction owns its start permit");
+    let mut route_rebuilt = false;
+    let mut buffered_retry_state = BufferedRetryState::default();
+
+    loop {
+        let translated = bind_messages_request_to_route(&original_translated, &route);
+        let prepared = prepare_compaction_request(&translated);
+        let mut hidden_continuation = owner_continuation
+            .evaluate_hidden_compaction(prepared.request())
+            .bind_route(&route);
+        if route_rebuilt {
+            hidden_continuation =
+                hidden_continuation.full_context_retry(CodexRecoveryCause::AuthRejection);
+        }
+        cleanup.replace_continuation(hidden_continuation.clone());
+        log_compaction_event(
+            "server_compaction_triggered",
+            &ctx,
+            prepared.request().input.len(),
+            None,
+        );
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.compaction_started(&ctx.req_id);
+        }
+        let Some(build_lease) = begin_compaction_for_route_with_owner(
+            &permit,
+            &route,
+            &translated.model,
+            conversation_identity.as_ref(),
+        ) else {
+            abort_continuation_for_owner(&hidden_continuation);
+            log_compaction_event(
+                "server_compaction_failed",
+                &ctx,
+                prepared.request().input.len(),
+                Some("compaction route lease could not be acquired"),
+            );
+            cleanup.disarm();
+            return HiddenCompactionOutcome::Completed(None);
+        };
+        cleanup.replace_compaction_lease(Some(build_lease.clone()));
+        let mut compaction_ctx = ctx.clone();
+        compaction_ctx.monitor = None;
+        match request_compaction_bound_result(
+            client.as_ref(),
+            &route,
+            prepared,
+            &compaction_ctx,
+            &hidden_continuation,
+            &mut buffered_retry_state,
+        )
+        .await
+        {
+            Ok(bound) => {
+                if let Some(publication) = bound.continuation_publication() {
+                    if record_continuation_for_owner(
+                        &hidden_continuation,
+                        publication.request,
+                        Some(publication.response_id),
+                        Some(publication.socket_id),
+                        publication.output_items,
+                    ) == ContinuationPublication::Rejected
+                    {
+                        websocket::invalidate_codex_websocket_pool_for_reservation(
+                            &hidden_continuation,
+                        );
+                    }
+                } else {
+                    abort_continuation_for_owner(&hidden_continuation);
+                }
+                if store_compaction_for_route(&build_lease, bound.compacted_history()) {
+                    log_compaction_event(
+                        "server_compaction_completed",
+                        &ctx,
+                        translated.input.len(),
+                        None,
+                    );
+                    cleanup.disarm();
+                    return HiddenCompactionOutcome::Completed(Some(build_lease));
+                }
+                cleanup.abort_compaction();
+                log_compaction_event(
+                    "server_compaction_failed",
+                    &ctx,
+                    translated.input.len(),
+                    Some("compaction state exceeded the in-memory limit"),
+                );
+                cleanup.disarm();
+                return HiddenCompactionOutcome::Completed(None);
+            }
+            Err(error) => {
+                cleanup.abort_compaction();
+                log_compaction_event(
+                    "server_compaction_failed",
+                    &ctx,
+                    translated.input.len(),
+                    Some(&error.to_string()),
+                );
+                if let compaction::CompactionError::Upstream(upstream) = error {
+                    if upstream.is_in_band_auth_rejection() {
+                        client.refresh_conversation_auth_after_rejection_in_background(
+                            &route,
+                            parallel_auth.rejection_budget.clone(),
+                        );
+                        cleanup.abort();
+                        return HiddenCompactionOutcome::Fatal(map_codex_error_to_response(
+                            &upstream,
+                        ));
+                    }
+                    if upstream.is_replayable_auth_rejection() {
+                        let Some(next_route) = parallel_auth.rebuild_after(&route).await else {
+                            cleanup.abort();
+                            return HiddenCompactionOutcome::Fatal(map_codex_error_to_response(
+                                &upstream,
+                            ));
+                        };
+                        route = next_route;
+                        route_rebuilt = true;
+                        continue;
+                    }
+                }
+                abort_continuation_for_owner(&hidden_continuation);
+                cleanup.disarm();
+                return HiddenCompactionOutcome::Completed(None);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn request_plaintext_compaction_summary(
+    client: Arc<CodexHttpClient>,
+    mut route: CodexBoundRoute,
+    original_translated: translate::request::ResponsesRequest,
+    logical_continuation: ContinuationReservation,
+    message_id: String,
+    model: &str,
+    want_stream: bool,
+    ctx: RequestContext,
+    read_lane: Option<OpaqueLane>,
+    auth_rejection_budget: Arc<AuthRejectionBudget>,
+    parallel_auth: Arc<ParallelCompactionAuth>,
+    conversation_admission: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
+) -> Response {
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.upstream_started(&ctx.req_id);
+    }
+    let mut live_start_attempt = 0_u32;
+    let mut buffered_retry_state = BufferedRetryState::default();
+    let mut empty_completion_attempt = 0_u32;
+
+    'routes: loop {
+        let translated = bind_messages_request_to_route(&original_translated, &route);
+        let request_continuation = logical_continuation
+            .evaluate(&translated)
+            .bind_route(&route);
+        let mut cleanup = LiveRequestStateCleanup::new(request_continuation.clone(), None, None);
+
+        if want_stream {
+            match live_stream_route_attempt(
+                client.clone(),
+                &route,
+                message_id.clone(),
+                model,
+                ctx.clone(),
+                translated,
+                request_continuation,
+                None,
+                read_lane,
+                auth_rejection_budget.clone(),
+                &mut live_start_attempt,
+                conversation_admission,
+            )
+            .await
+            {
+                LiveRouteOutcome::Response(response) => {
+                    cleanup.disarm();
+                    return response;
+                }
+                LiveRouteOutcome::Unauthorized(error) => {
+                    cleanup.abort();
+                    let Some(next_route) = parallel_auth.rebuild_after(&route).await else {
+                        return map_codex_error_to_response(&error);
+                    };
+                    route = next_route.auxiliary();
+                    continue 'routes;
+                }
+            }
+        }
+
+        let mut active_continuation = Some(request_continuation.clone());
+        let upstream = loop {
+            let response = match client
+                .post_codex_bound_with_retry_state(
+                    &route,
+                    &translated,
+                    &ctx,
+                    active_continuation.as_ref(),
+                    &mut buffered_retry_state,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    if error.is_in_band_auth_rejection() {
+                        client.refresh_conversation_auth_after_rejection_in_background(
+                            &route,
+                            auth_rejection_budget.clone(),
+                        );
+                        cleanup.abort();
+                        return map_codex_error_to_response(&error);
+                    }
+                    if error.is_replayable_auth_rejection() {
+                        cleanup.abort();
+                        let Some(next_route) = parallel_auth.rebuild_after(&route).await else {
+                            return map_codex_error_to_response(&error);
+                        };
+                        route = next_route.auxiliary();
+                        continue 'routes;
+                    }
+                    cleanup.abort();
+                    return map_codex_error_to_response(&error);
+                }
+            };
+            if !is_empty_codex_success_completion(&response.body) {
+                break response;
+            }
+            let error = empty_buffered_completion_error();
+            drop_live_continuation_for_retry(
+                &mut active_continuation,
+                CodexRecoveryCause::EmptyCompletion,
+            );
+            if empty_completion_attempt >= MAX_EMPTY_COMPLETION_RETRIES {
+                cleanup.abort();
+                return map_codex_error_to_response(&error);
+            }
+            let delay = compute_backoff_delay(empty_completion_attempt, None);
+            if delay.exceeds_budget {
+                cleanup.abort();
+                return map_codex_error_to_response(&error);
+            }
+            empty_completion_attempt += 1;
+            sleep(delay.wait_ms).await;
+        };
+
+        return match accumulate_response_scoped(
+            &upstream.body,
+            &message_id,
+            model,
+            ctx.traffic.as_deref(),
+            read_lane,
+        ) {
+            Ok(json) => {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.usage_updated(
+                        &ctx.req_id,
+                        json.pointer("/usage/input_tokens")
+                            .and_then(|value| value.as_u64()),
+                        json.pointer("/usage/output_tokens")
+                            .and_then(|value| value.as_u64()),
+                    );
+                }
+                update_continuation_from_upstream(
+                    &request_continuation,
+                    &translated,
+                    &upstream.body,
+                    upstream.socket_id,
+                    None,
+                    read_lane,
+                );
+                cleanup.disarm();
+                (StatusCode::OK, Json(json)).into_response()
+            }
+            Err(error) => {
+                cleanup.abort();
+                map_codex_failure_to_response(&format!("Accumulation error: {error}"))
+            }
+        };
+    }
+}
+
+async fn coordinate_compaction_summary_response(
+    response: Response,
+    compaction_lease: Option<CompactionLease>,
+    want_stream: bool,
+) -> Response {
+    let Some(compaction_lease) = compaction_lease else {
+        return response;
+    };
+    if !response.status().is_success() {
+        abort_compaction_for_route(&compaction_lease);
+        return response;
+    }
+    if !want_stream {
+        let (parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                abort_compaction_for_route(&compaction_lease);
+                return map_codex_failure_to_response(&format!(
+                    "Plaintext summary body read failed: {error}"
+                ));
+            }
+        };
+        let text = plaintext_summary_from_anthropic_response(&bytes);
+        activate_compaction_for_route(
+            &compaction_lease,
+            &portable_summary_output(text.unwrap_or_default()),
+        );
+        return Response::from_parts(parts, Body::from(bytes));
+    }
+
+    let (parts, body) = response.into_parts();
+    let state = (
+        body.into_data_stream(),
+        Some(compaction_lease),
+        String::new(),
+    );
+    let stream =
+        futures_util::stream::unfold(state, |(mut body, mut lease, mut summary)| async move {
+            match body.next().await {
+                Some(Ok(chunk)) => {
+                    append_plaintext_summary_deltas(&chunk, &mut summary);
+                    if contains_claude_event(&chunk, "message_stop") {
+                        if let Some(active) = lease.take() {
+                            activate_compaction_for_route(
+                                &active,
+                                &portable_summary_output(summary.clone()),
+                            );
+                        }
+                    } else if contains_claude_event(&chunk, "error")
+                        && let Some(active) = lease.take()
+                    {
+                        abort_compaction_for_route(&active);
+                    }
+                    Some((Ok::<Bytes, std::io::Error>(chunk), (body, lease, summary)))
+                }
+                Some(Err(error)) => {
+                    if let Some(active) = lease.take() {
+                        abort_compaction_for_route(&active);
+                    }
+                    Some((
+                        Err(std::io::Error::other(error.to_string())),
+                        (body, lease, summary),
+                    ))
+                }
+                None => None,
+            }
+        });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn portable_summary_output(text: String) -> Vec<translate::request::ResponsesInputItem> {
+    vec![translate::request::ResponsesInputItem::Message {
+        role: "assistant".to_string(),
+        content: vec![translate::request::ResponsesContentPart::OutputText { text }],
+    }]
+}
+
+fn plaintext_summary_from_anthropic_response(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let text = value
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
+
+fn append_plaintext_summary_deltas(chunk: &[u8], summary: &mut String) {
+    for event in parse_sse_events(chunk) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+            continue;
+        };
+        let text = match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("content_block_delta") => value
+                .get("delta")
+                .filter(|delta| {
+                    delta.get("type").and_then(serde_json::Value::as_str) == Some("text_delta")
+                })
+                .and_then(|delta| delta.get("text"))
+                .and_then(serde_json::Value::as_str),
+            Some("content_block_start") => value
+                .get("content_block")
+                .filter(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                })
+                .and_then(|block| block.get("text"))
+                .and_then(serde_json::Value::as_str),
+            _ => None,
+        };
+        if let Some(text) = text {
+            summary.push_str(text);
+        }
+    }
+}
+
+fn contains_claude_event(chunk: &[u8], expected: &str) -> bool {
+    parse_sse_events(chunk).iter().any(|event| {
+        event.event.as_deref() == Some(expected)
+            || serde_json::from_str::<serde_json::Value>(&event.data)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some(expected)
+    })
 }
 
 #[async_trait]
@@ -1566,6 +1982,222 @@ fn record_live_stream_progress(ctx: &RequestContext, chunk: &[u8]) {
     }
 }
 
+async fn await_codex_response_with_heartbeat(mut response: PendingCodexResponse) -> Response {
+    let grace = tokio::time::sleep(CODEX_DOWNSTREAM_HEARTBEAT_INTERVAL);
+    tokio::pin!(grace);
+    tokio::select! {
+        biased;
+        response = response.as_mut() => response,
+        _ = grace.as_mut() => committed_heartbeat_response(response),
+    }
+}
+
+enum HeartbeatResponsePhase {
+    Awaiting(PendingCodexResponse),
+    Streaming(CodexResponseBodyStream),
+    Done,
+}
+
+struct HeartbeatResponseState {
+    phase: HeartbeatResponsePhase,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    emit_ping: bool,
+    terminal_seen: bool,
+    outcome: NativeResponseOutcome,
+    inner_outcome: Option<NativeResponseOutcome>,
+}
+
+impl HeartbeatResponseState {
+    fn new(response: PendingCodexResponse, outcome: NativeResponseOutcome) -> Self {
+        Self {
+            phase: HeartbeatResponsePhase::Awaiting(response),
+            deadline: Box::pin(tokio::time::sleep(CODEX_DOWNSTREAM_HEARTBEAT_INTERVAL)),
+            emit_ping: true,
+            terminal_seen: false,
+            outcome,
+            inner_outcome: None,
+        }
+    }
+
+    fn reset_deadline(&mut self) {
+        self.deadline = Box::pin(tokio::time::sleep(CODEX_DOWNSTREAM_HEARTBEAT_INTERVAL));
+    }
+}
+
+enum HeartbeatPoll<T> {
+    Ready(T),
+    Elapsed,
+}
+
+fn committed_heartbeat_response(response: PendingCodexResponse) -> Response {
+    let outcome = NativeResponseOutcome::default();
+    let state = HeartbeatResponseState::new(response, outcome.clone());
+    let stream = futures_util::stream::unfold(state, next_heartbeat_response_chunk);
+    let mut response = event_stream_response(stream);
+    response.extensions_mut().insert(outcome);
+    response
+}
+
+async fn next_heartbeat_response_chunk(
+    mut state: HeartbeatResponseState,
+) -> Option<(Result<Bytes, std::io::Error>, HeartbeatResponseState)> {
+    loop {
+        if state.emit_ping {
+            state.emit_ping = false;
+            state.reset_deadline();
+            return Some((
+                Ok(Bytes::from(encode_sse_event(
+                    Some("ping"),
+                    CLAUDE_PING_JSON,
+                ))),
+                state,
+            ));
+        }
+
+        match &mut state.phase {
+            HeartbeatResponsePhase::Awaiting(response) => {
+                let poll = {
+                    let deadline = &mut state.deadline;
+                    tokio::select! {
+                        biased;
+                        response = response.as_mut() => HeartbeatPoll::Ready(response),
+                        _ = deadline.as_mut() => HeartbeatPoll::Elapsed,
+                    }
+                };
+                match poll {
+                    HeartbeatPoll::Elapsed => {
+                        state.emit_ping = true;
+                    }
+                    HeartbeatPoll::Ready(response) if response.status().is_success() => {
+                        state.inner_outcome = response
+                            .extensions()
+                            .get::<NativeResponseOutcome>()
+                            .cloned();
+                        state.phase = HeartbeatResponsePhase::Streaming(Box::pin(
+                            response.into_body().into_data_stream(),
+                        ));
+                    }
+                    HeartbeatPoll::Ready(response) => {
+                        state.phase = HeartbeatResponsePhase::Done;
+                        let (chunk, failure) = committed_http_error_chunk(response).await;
+                        state.outcome.fail(failure);
+                        return Some((Ok(chunk), state));
+                    }
+                }
+            }
+            HeartbeatResponsePhase::Streaming(stream) => {
+                let poll = if state.terminal_seen {
+                    HeartbeatPoll::Ready(stream.next().await)
+                } else {
+                    let deadline = &mut state.deadline;
+                    tokio::select! {
+                        biased;
+                        item = stream.next() => HeartbeatPoll::Ready(item),
+                        _ = deadline.as_mut() => HeartbeatPoll::Elapsed,
+                    }
+                };
+                match poll {
+                    HeartbeatPoll::Elapsed => {
+                        state.emit_ping = true;
+                    }
+                    HeartbeatPoll::Ready(Some(Ok(chunk))) if chunk.is_empty() => {}
+                    HeartbeatPoll::Ready(Some(Ok(chunk))) => {
+                        state.terminal_seen = contains_terminal_claude_event(&chunk);
+                        state.reset_deadline();
+                        return Some((Ok(chunk), state));
+                    }
+                    HeartbeatPoll::Ready(Some(Err(error))) => {
+                        let message =
+                            format!("Codex response body failed after heartbeat: {error}");
+                        state.outcome.fail(message.clone());
+                        state.phase = HeartbeatResponsePhase::Done;
+                        return Some((Ok(committed_error_chunk("api_error", &message)), state));
+                    }
+                    HeartbeatPoll::Ready(None) => {
+                        if let Some(failure) = state
+                            .inner_outcome
+                            .as_ref()
+                            .and_then(NativeResponseOutcome::failure)
+                        {
+                            state.outcome.fail(failure);
+                        }
+                        return None;
+                    }
+                }
+            }
+            HeartbeatResponsePhase::Done => return None,
+        }
+    }
+}
+
+fn contains_terminal_claude_event(chunk: &[u8]) -> bool {
+    parse_sse_events(chunk).iter().any(|event| {
+        matches!(event.event.as_deref(), Some("message_stop" | "error"))
+            || serde_json::from_str::<serde_json::Value>(&event.data)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|kind| matches!(kind.as_str(), "message_stop" | "error"))
+    })
+}
+
+async fn committed_http_error_chunk(response: Response) -> (Bytes, String) {
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), COMMITTED_ERROR_BODY_LIMIT)
+        .await
+        .unwrap_or_default();
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let error = parsed.as_ref().and_then(|value| value.get("error"));
+    let kind = error
+        .and_then(|value| value.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| committed_http_error_type(status));
+    let message = error
+        .and_then(|value| value.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "Upstream request failed with HTTP {} after downstream streaming began",
+                status.as_u16()
+            )
+        });
+    let failure = format!(
+        "HTTP {} after downstream heartbeat: {message}",
+        status.as_u16()
+    );
+    (committed_error_chunk(kind, &message), failure)
+}
+
+fn committed_http_error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY => {
+            "invalid_request_error"
+        }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "authentication_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        _ => "api_error",
+    }
+}
+
+fn committed_error_chunk(kind: &str, message: &str) -> Bytes {
+    Bytes::from(encode_sse_event(
+        Some("error"),
+        &serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": kind,
+                "message": message,
+            }
+        })
+        .to_string(),
+    ))
+}
+
 fn single_live_stream_response(chunk: Vec<u8>) -> Response {
     event_stream_response(futures_util::stream::once(async move {
         Ok::<Bytes, std::io::Error>(Bytes::from(chunk))
@@ -2150,6 +2782,152 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_heartbeat_preserves_response_before_grace_period() {
+        let response = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(http::header::RETRY_AFTER, "7")
+            .body(Body::from("limited"))
+            .unwrap();
+
+        let response = await_codex_response_with_heartbeat(Box::pin(async move { response })).await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "7");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "limited"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_heartbeat_commits_named_ping_and_repeats_while_waiting() {
+        let response = await_codex_response_with_heartbeat(Box::pin(async {
+            std::future::pending::<Response>().await
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        for _ in 0..2 {
+            let chunk = body.next().await.unwrap().unwrap();
+            assert_eq!(
+                parse_sse_events(&chunk),
+                vec![crate::anthropic::sse::SseEvent {
+                    event: Some("ping".to_string()),
+                    data: CLAUDE_PING_JSON.to_string(),
+                }]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_heartbeat_converts_late_http_failure_to_sse_error() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let response =
+            await_codex_response_with_heartbeat(Box::pin(async move { receive.await.unwrap() }))
+                .await;
+        let outcome = response
+            .extensions()
+            .get::<NativeResponseOutcome>()
+            .cloned()
+            .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let ping = body.next().await.unwrap().unwrap();
+        assert_eq!(parse_sse_events(&ping)[0].event.as_deref(), Some("ping"));
+
+        send.send(
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(Body::from(
+                    serde_json::json!({
+                        "type": "error",
+                        "error": {"type": "rate_limit_error", "message": "slow down"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        let error = body.next().await.unwrap().unwrap();
+        let events = parse_sse_events(&error);
+        assert_eq!(events[0].event.as_deref(), Some("error"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[0].data).unwrap()["error"]["message"],
+            "slow down"
+        );
+        assert!(outcome.failure().unwrap().contains("HTTP 429"));
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_heartbeat_body_cancels_pending_response() {
+        struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = DropSignal(dropped.clone());
+        let response = await_codex_response_with_heartbeat(Box::pin(async move {
+            let _signal = signal;
+            std::future::pending::<Response>().await
+        }))
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            parse_sse_events(&body.next().await.unwrap().unwrap())[0]
+                .event
+                .as_deref(),
+            Some("ping")
+        );
+
+        drop(body);
+
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_heartbeat_stops_after_terminal_claude_event() {
+        let terminal = Bytes::from(encode_sse_event(
+            Some("message_stop"),
+            r#"{"type":"message_stop"}"#,
+        ));
+        let inner_stream =
+            futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(terminal) })
+                .chain(futures_util::stream::pending());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let response =
+            await_codex_response_with_heartbeat(Box::pin(async move { receive.await.unwrap() }))
+                .await;
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            parse_sse_events(&body.next().await.unwrap().unwrap())[0]
+                .event
+                .as_deref(),
+            Some("ping")
+        );
+        send.send(event_stream_response(inner_stream)).unwrap();
+        assert_eq!(
+            parse_sse_events(&body.next().await.unwrap().unwrap())[0]
+                .event
+                .as_deref(),
+            Some("message_stop")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), body.next())
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn claude_fast_promotes_only_the_derived_service_tier() {
@@ -2941,7 +3719,274 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_401_rebinds_permit_and_primary_send_to_route_b() {
+    async fn compaction_summary_coordinator_activates_on_downstream_terminal() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
+        compaction::clear_all_compactions_for_tests();
+        let owner = ConversationIdentity::Main("coordinator-terminal".to_string());
+        let lane =
+            RequestScope::from_conversation_identity(Some(owner), RequestPurpose::Conversation)
+                .provider_lane(LaneDomain::CodexConversation);
+        let client = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let permit = reserve_compaction_start(lane).unwrap();
+        let build = begin_compaction_for_route(&permit, &route, "gpt-5.6-sol").unwrap();
+        assert!(store_compaction_for_route(
+            &build,
+            native_compaction("coordinated-native")
+        ));
+        let text = Bytes::from(encode_sse_event(
+            Some("content_block_delta"),
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": COMPACTION_SUMMARY}
+            })
+            .to_string(),
+        ));
+        let terminal = Bytes::from(encode_sse_event(
+            Some("message_stop"),
+            r#"{"type":"message_stop"}"#,
+        ));
+        let response = event_stream_response(futures_util::stream::iter([
+            Ok::<Bytes, std::io::Error>(text),
+            Ok(terminal),
+        ]));
+        let response = coordinate_compaction_summary_response(response, Some(build), true).await;
+        let mut body = response.into_body().into_data_stream();
+
+        body.next().await.unwrap().unwrap();
+        assert!(
+            apply_compaction_replay_for_route(&route, &compaction_replay_request()).is_none(),
+            "coordinator activated before the downstream terminal"
+        );
+        body.next().await.unwrap().unwrap();
+        let replay = apply_compaction_replay_for_route(&route, &compaction_replay_request())
+            .expect("downstream terminal must activate compacted history");
+        assert!(replay.request.input.iter().any(|item| {
+            matches!(item, translate::request::ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "coordinated-native")
+        }));
+        assert!(activate_compaction_for_route(&replay.lease, &[]));
+        compaction::clear_compactions_for_lane(lane.unwrap());
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn dropping_compaction_summary_before_terminal_aborts_pending_anchor() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
+        compaction::clear_all_compactions_for_tests();
+        let owner = ConversationIdentity::Main("coordinator-cancel".to_string());
+        let lane =
+            RequestScope::from_conversation_identity(Some(owner), RequestPurpose::Conversation)
+                .provider_lane(LaneDomain::CodexConversation);
+        let client = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let permit = reserve_compaction_start(lane).unwrap();
+        let build = begin_compaction_for_route(&permit, &route, "gpt-5.6-sol").unwrap();
+        assert!(store_compaction_for_route(
+            &build,
+            native_compaction("cancelled-native")
+        ));
+        let text = Bytes::from(encode_sse_event(
+            Some("content_block_delta"),
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": COMPACTION_SUMMARY}
+            })
+            .to_string(),
+        ));
+        let stream = futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(text) })
+            .chain(futures_util::stream::pending());
+        let response = coordinate_compaction_summary_response(
+            event_stream_response(stream),
+            Some(build),
+            true,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        body.next().await.unwrap().unwrap();
+
+        drop(body);
+
+        assert!(!compaction::has_bound_compaction_for_tests(&route));
+        drop(permit);
+        compaction::clear_all_compactions_for_tests();
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_error_aborts_pending_anchor() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
+        compaction::clear_all_compactions_for_tests();
+        let owner = ConversationIdentity::Main("coordinator-error".to_string());
+        let lane =
+            RequestScope::from_conversation_identity(Some(owner), RequestPurpose::Conversation)
+                .provider_lane(LaneDomain::CodexConversation);
+        let client = authenticated_live_test_client("http://127.0.0.1:1/responses".to_string());
+        let route = client
+            .bind_conversation_route(lane, ProtocolLane::ResponsesFull)
+            .await
+            .unwrap();
+        let permit = reserve_compaction_start(lane).unwrap();
+        let build = begin_compaction_for_route(&permit, &route, "gpt-5.6-sol").unwrap();
+        assert!(store_compaction_for_route(
+            &build,
+            native_compaction("errored-native")
+        ));
+        let error = Bytes::from(encode_sse_event(
+            Some("error"),
+            r#"{"type":"error","error":{"type":"api_error","message":"summary failed"}}"#,
+        ));
+        let response = coordinate_compaction_summary_response(
+            event_stream_response(futures_util::stream::once(async move {
+                Ok::<Bytes, std::io::Error>(error)
+            })),
+            Some(build),
+            true,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+
+        let chunk = body.next().await.unwrap().unwrap();
+
+        assert_eq!(parse_sse_events(&chunk)[0].event.as_deref(), Some("error"));
+        assert!(!compaction::has_bound_compaction_for_tests(&route));
+        drop(permit);
+        compaction::clear_all_compactions_for_tests();
+    }
+
+    #[tokio::test]
+    async fn parallel_compaction_withholds_summary_until_hidden_terminal() {
+        let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
+        compaction::clear_all_compactions_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{address}/v1/responses"),
+            1_000,
+            1_000,
+            0,
+        )
+        .with_test_transport(config::CodexTransport::Http);
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "parallel-token".into(),
+                refresh: "parallel-refresh".into(),
+                expires: u64::MAX,
+                account_id: Some("parallel-account".into()),
+            });
+        let provider = CodexProvider::with_client(client).with_server_compaction_for_test();
+        let compacted = upstream_sse(&[
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{"type":"compaction","encrypted_content":"parallel-native"}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"parallel-compact","status":"completed"}
+            }),
+        ]);
+        let summary = upstream_sse(&[
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"parallel-summary"}
+            }),
+            serde_json::json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "delta":COMPACTION_SUMMARY
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"message","id":"parallel-summary"}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"parallel-summary","status":"completed","usage":{}}
+            }),
+        ]);
+        let (summary_sent_tx, summary_sent_rx) = tokio::sync::oneshot::channel();
+        let (release_hidden_tx, release_hidden_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut hidden = None;
+            let mut plaintext = None;
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (_, body) = http_request_parts(&read_http_request(&mut socket).await);
+                let has_trigger = body["input"].as_array().is_some_and(|input| {
+                    input
+                        .iter()
+                        .any(|item| item["type"] == "compaction_trigger")
+                });
+                if has_trigger {
+                    hidden = Some(socket);
+                } else {
+                    plaintext = Some(socket);
+                }
+            }
+            let mut plaintext = plaintext.expect("detached summary request");
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                summary.len()
+            );
+            plaintext.write_all(head.as_bytes()).await.unwrap();
+            plaintext.write_all(&summary).await.unwrap();
+            summary_sent_tx.send(()).unwrap();
+
+            release_hidden_rx.await.unwrap();
+            let mut hidden = hidden.expect("hidden compaction request");
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                compacted.len()
+            );
+            hidden.write_all(head.as_bytes()).await.unwrap();
+            hidden.write_all(&compacted).await.unwrap();
+        });
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-5.4",
+            "max_tokens":256,
+            "stream":false,
+            "system":"You are a helpful AI assistant tasked with summarizing conversations",
+            "messages":[{"role":"user","content":"summarize this boundary"}]
+        }))
+        .unwrap();
+        let request_provider = provider.clone();
+        let mut response_task = tokio::spawn(async move {
+            request_provider
+                .handle_messages(
+                    request,
+                    messages_test_context("parallel-gate", Some("parallel-gate-lane")),
+                )
+                .await
+        });
+
+        summary_sent_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_task)
+                .await
+                .is_err(),
+            "plaintext summary escaped before hidden compaction completed"
+        );
+        release_hidden_tx.send(()).unwrap();
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains(COMPACTION_SUMMARY));
+        server.await.unwrap();
+        compaction::clear_all_compactions_for_tests();
+    }
+
+    #[tokio::test]
+    async fn parallel_compaction_401_rebinds_both_requests_to_route_b() {
         let _compaction_guard = compaction::lock_compaction_registry_for_async_tests().await;
         compaction::clear_all_compactions_for_tests();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2983,7 +4028,7 @@ mod tests {
             serde_json::json!({
                 "type":"response.output_text.delta",
                 "output_index":0,
-                "delta":"route-b-compacted"
+                "delta":"route-b-compacted summary is long enough to persist"
             }),
             serde_json::json!({
                 "type":"response.output_item.done",
@@ -2997,43 +4042,46 @@ mod tests {
         ]);
         let server = tokio::spawn(async move {
             let mut captured = Vec::new();
-            for attempt in 0..3 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                captured.push(http_request_parts(&read_http_request(&mut socket).await));
-                match attempt {
-                    0 => {
-                        server_client
-                            .auth_manager()
-                            .set_test_auth(auth::token_store::StoredAuth {
-                                access: "compact-b".into(),
-                                refresh: "refresh-b".into(),
-                                expires: u64::MAX,
-                                account_id: Some("compact-account".into()),
-                            });
+            for wave in 0..2 {
+                let mut requests = Vec::new();
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request = http_request_parts(&read_http_request(&mut socket).await);
+                    requests.push((socket, request));
+                }
+                if wave == 0 {
+                    server_client
+                        .auth_manager()
+                        .set_test_auth(auth::token_store::StoredAuth {
+                            access: "compact-b".into(),
+                            refresh: "refresh-b".into(),
+                            expires: u64::MAX,
+                            account_id: Some("compact-account".into()),
+                        });
+                }
+                for (mut socket, request) in requests {
+                    let has_trigger = request.1["input"].as_array().is_some_and(|input| {
+                        input
+                            .iter()
+                            .any(|item| item["type"] == "compaction_trigger")
+                    });
+                    captured.push(request);
+                    if wave == 0 {
                         socket
                             .write_all(
                                 b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 15\r\nconnection: close\r\n\r\ncompact-route-a",
                             )
                             .await
                             .unwrap();
+                        continue;
                     }
-                    1 => {
-                        let head = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                            compacted.len()
-                        );
-                        socket.write_all(head.as_bytes()).await.unwrap();
-                        socket.write_all(&compacted).await.unwrap();
-                    }
-                    2 => {
-                        let head = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                            success.len()
-                        );
-                        socket.write_all(head.as_bytes()).await.unwrap();
-                        socket.write_all(&success).await.unwrap();
-                    }
-                    _ => unreachable!(),
+                    let body = if has_trigger { &compacted } else { &success };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
                 }
             }
             assert!(
@@ -3065,10 +4113,17 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("route-b-compacted"));
 
         let captured = server.await.unwrap();
-        assert_eq!(captured.len(), 3);
-        assert!(captured[0].0.contains("authorization: Bearer compact-a"));
-        assert!(captured[1].0.contains("authorization: Bearer compact-b"));
-        assert!(captured[2].0.contains("authorization: Bearer compact-b"));
+        assert_eq!(captured.len(), 4);
+        assert!(
+            captured[..2]
+                .iter()
+                .all(|(headers, _)| headers.contains("authorization: Bearer compact-a"))
+        );
+        assert!(
+            captured[2..]
+                .iter()
+                .all(|(headers, _)| headers.contains("authorization: Bearer compact-b"))
+        );
         let has_trigger = |body: &serde_json::Value| {
             body["input"].as_array().is_some_and(|input| {
                 input
@@ -3076,19 +4131,28 @@ mod tests {
                     .any(|item| item["type"] == "compaction_trigger")
             })
         };
-        assert!(has_trigger(&captured[0].1));
-        assert!(has_trigger(&captured[1].1));
-        assert!(!has_trigger(&captured[2].1));
+        let hidden: Vec<_> = captured
+            .iter()
+            .filter(|(_, body)| has_trigger(body))
+            .collect();
+        let summaries: Vec<_> = captured
+            .iter()
+            .filter(|(_, body)| !has_trigger(body))
+            .collect();
+        assert_eq!(hidden.len(), 2);
+        assert_eq!(summaries.len(), 2);
         assert_ne!(
-            captured[0].1["prompt_cache_key"],
-            captured[1].1["prompt_cache_key"]
+            hidden[0].1["prompt_cache_key"],
+            hidden[1].1["prompt_cache_key"]
         );
-        assert!(captured[2].1["prompt_cache_key"].is_null());
-        for header in ["session_id", "x-client-request-id", "x-codex-window-id"] {
-            assert!(
-                captured_header(&captured[2].0, header).is_none(),
-                "detached summary leaked {header}"
-            );
+        for (headers, body) in summaries {
+            assert!(body["prompt_cache_key"].is_null());
+            for header in ["session_id", "x-client-request-id", "x-codex-window-id"] {
+                assert!(
+                    captured_header(headers, header).is_none(),
+                    "detached summary leaked {header}"
+                );
+            }
         }
         compaction::clear_all_compactions_for_tests();
     }
