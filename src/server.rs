@@ -1,5 +1,6 @@
 use crate::{
     anthropic::json_error,
+    fast_policy::{ClaudeFastDecision, FastPolicyHandle},
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     openai_compat::{
@@ -225,6 +226,23 @@ pub async fn serve_listener_with_registry(
     monitor: Option<MonitorHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    serve_listener_with_registry_and_fast_policy(
+        listener,
+        registry,
+        monitor,
+        FastPolicyHandle::default(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_listener_with_registry_and_fast_policy(
+    listener: TcpListener,
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    fast_policy: FastPolicyHandle,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
     create_logger("server").info(
@@ -245,7 +263,7 @@ pub async fn serve_listener_with_registry(
             ),
         ])),
     );
-    let app = app_with_monitor(registry, monitor);
+    let app = app_with_monitor_and_fast_policy(registry, monitor, fast_policy);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
@@ -253,7 +271,11 @@ pub async fn serve_listener_with_registry(
 }
 
 pub fn app(registry: Arc<Registry>) -> Router {
-    app_with_features(
+    app_with_fast_policy(registry, FastPolicyHandle::default())
+}
+
+pub fn app_with_fast_policy(registry: Arc<Registry>, fast_policy: FastPolicyHandle) -> Router {
+    app_with_features_and_fast_policy(
         registry,
         None,
         AppFeatures {
@@ -261,11 +283,20 @@ pub fn app(registry: Arc<Registry>) -> Router {
             images_api: crate::config::codex_images_api(),
             transcriptions_api: crate::config::codex_transcriptions_api(),
         },
+        fast_policy,
     )
 }
 
 pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
-    app_with_features(
+    app_with_monitor_and_fast_policy(registry, monitor, FastPolicyHandle::default())
+}
+
+pub fn app_with_monitor_and_fast_policy(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    fast_policy: FastPolicyHandle,
+) -> Router {
+    app_with_features_and_fast_policy(
         registry,
         monitor,
         AppFeatures {
@@ -273,6 +304,7 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
             images_api: crate::config::codex_images_api(),
             transcriptions_api: crate::config::codex_transcriptions_api(),
         },
+        fast_policy,
     )
 }
 
@@ -304,6 +336,15 @@ pub fn app_with_features(
     monitor: Option<MonitorHandle>,
     features: AppFeatures,
 ) -> Router {
+    app_with_features_and_fast_policy(registry, monitor, features, FastPolicyHandle::default())
+}
+
+pub fn app_with_features_and_fast_policy(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    features: AppFeatures,
+    fast_policy: FastPolicyHandle,
+) -> Router {
     let native_responses = features
         .responses_api
         .then(|| Arc::new(CodexNativeBackend::new()));
@@ -330,6 +371,7 @@ pub fn app_with_features(
     let state = Arc::new(AppState {
         registry,
         monitor,
+        fast_policy,
         native_responses,
         chat_completions,
         images,
@@ -373,6 +415,7 @@ pub fn app_with_features(
 struct AppState {
     registry: Arc<Registry>,
     monitor: Option<MonitorHandle>,
+    fast_policy: FastPolicyHandle,
     native_responses: Option<Arc<CodexNativeBackend>>,
     chat_completions: Option<Arc<ChatCompletionsBackend>>,
     images: Option<Arc<CodexImagesBackend>>,
@@ -1872,12 +1915,13 @@ async fn dispatch_request(
     let response = if count_tokens {
         provider.handle_count_tokens(body, context).await
     } else if provider.name() == "codex" {
+        let fast_decision = ClaudeFastDecision::new(claude_fast_intent, state.fast_policy.get());
         provider
-            .handle_messages_with_claude_fast_intent(
+            .handle_messages_with_claude_fast_decision(
                 body,
                 context,
                 request_scope.conversational_lane().cloned(),
-                claude_fast_intent,
+                fast_decision,
             )
             .await
     } else {

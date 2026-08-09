@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use claude_code_proxy::{
-    config, logging,
+    config,
+    fast_policy::FastPolicyHandle,
+    logging,
     monitor::MonitorHandle,
     paths,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
@@ -98,6 +100,7 @@ fn main() -> Result<()> {
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Arc::new(Registry::with_default_alias_and_model_setting()?);
+            let fast_policy = FastPolicyHandle::default();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -107,10 +110,11 @@ fn main() -> Result<()> {
                     let listener = runtime
                         .block_on(server::bind_proxy_listener(&bind_address, effective_port))?;
                     runtime
-                        .block_on(server::serve_listener_with_registry(
+                        .block_on(server::serve_listener_with_registry_and_fast_policy(
                             listener,
                             registry,
                             Some(MonitorHandle::default()),
+                            fast_policy,
                             std::future::pending(),
                         ))
                         .map_err(|err| anyhow::anyhow!(err))
@@ -127,11 +131,13 @@ fn main() -> Result<()> {
                         listen_url(&local_addr.ip().to_string(), local_addr.port());
                     let server_monitor = monitor.clone();
                     let server_registry = registry.clone();
+                    let server_fast_policy = fast_policy.clone();
                     let server_task = runtime.spawn(async move {
-                        let result = server::serve_listener_with_registry(
+                        let result = server::serve_listener_with_registry_and_fast_policy(
                             listener,
                             server_registry,
                             Some(server_monitor),
+                            server_fast_policy,
                             async move {
                                 let _ = shutdown_rx.await;
                             },
@@ -140,7 +146,7 @@ fn main() -> Result<()> {
                         let _ = shutdown_complete_tx.send(());
                         result
                     });
-                    let ui_result = tui::run_monitor(
+                    let ui_result = tui::run_monitor_with_fast_policy(
                         monitor,
                         MonitorUiConfig {
                             listen_url: monitor_listen_url,
@@ -149,6 +155,7 @@ fn main() -> Result<()> {
                             shutdown: Some(shutdown_tx),
                             shutdown_complete: Some(shutdown_complete_rx),
                         },
+                        fast_policy,
                     );
                     if matches!(&ui_result, Ok(MonitorExit::ForceQuit)) {
                         server_task.abort();

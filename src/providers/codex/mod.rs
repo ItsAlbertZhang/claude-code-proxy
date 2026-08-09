@@ -32,6 +32,7 @@ use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::anthropic::sse::{encode_sse_event, parse_sse_events};
 use crate::config;
+use crate::fast_policy::{ClaudeFastDecision, FastPolicy};
 use crate::logging::create_logger;
 use crate::monitor::{CodexRecoveryCause, usage_from_anthropic_sse};
 use crate::provider::{
@@ -98,6 +99,20 @@ fn merge_claude_fast_service_tier(
         Some(ServiceTier::Priority)
     } else {
         model_tier
+    }
+}
+
+fn apply_fast_policy_to_service_tier(
+    service_tier: Option<ServiceTier>,
+    policy: FastPolicy,
+) -> Option<ServiceTier> {
+    match policy {
+        FastPolicy::Passthrough => service_tier,
+        FastPolicy::ForceFast => Some(ServiceTier::Priority),
+        FastPolicy::ForceOff => match service_tier {
+            Some(ServiceTier::Flex) => Some(ServiceTier::Flex),
+            Some(ServiceTier::Priority) | None => None,
+        },
     }
 }
 
@@ -180,18 +195,16 @@ impl CodexProvider {
         &self,
         body: MessagesRequest,
         scoped: ScopedRequestContext,
-        claude_fast_intent: bool,
+        fast_decision: ClaudeFastDecision,
     ) -> Response {
         if !body.stream {
-            return self
-                .handle_messages_core(body, scoped, claude_fast_intent)
-                .await;
+            return self.handle_messages_core(body, scoped, fast_decision).await;
         }
 
         let provider = self.clone();
         let response = Box::pin(async move {
             provider
-                .handle_messages_core(body, scoped, claude_fast_intent)
+                .handle_messages_core(body, scoped, fast_decision)
                 .await
         });
         await_codex_response_with_heartbeat(response).await
@@ -201,7 +214,7 @@ impl CodexProvider {
         &self,
         body: MessagesRequest,
         scoped: ScopedRequestContext,
-        claude_fast_intent: bool,
+        fast_decision: ClaudeFastDecision,
     ) -> Response {
         let (ctx, scope) = scoped.into_parts();
         let conversation_identity = scope.conversational_lane().cloned();
@@ -348,7 +361,7 @@ impl CodexProvider {
             );
         }
         resolved.service_tier =
-            merge_claude_fast_service_tier(resolved.service_tier, claude_fast_intent);
+            merge_claude_fast_service_tier(resolved.service_tier, fast_decision.effective_fast());
         let full_lane = config::codex_full_lane();
         let use_responses_lite =
             apply_model_lane_for_request(&mut resolved.model, &body, full_lane);
@@ -357,7 +370,7 @@ impl CodexProvider {
             monitor.codex_request_lane(&ctx.req_id, use_responses_lite);
         }
 
-        let original_translated = match translate_request_scoped(
+        let mut original_translated = match translate_request_scoped(
             &body,
             TranslateOptions {
                 // Route binding owns all upstream conversation identity. Never
@@ -378,10 +391,14 @@ impl CodexProvider {
                 );
             }
         };
+        original_translated.service_tier = apply_fast_policy_to_service_tier(
+            original_translated.service_tier,
+            fast_decision.policy(),
+        );
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.codex_acceleration_resolved(
                 &ctx.req_id,
-                claude_fast_intent.then_some("fast"),
+                fast_decision.requested_fast().then_some("fast"),
                 original_translated
                     .service_tier
                     .as_ref()
@@ -1226,8 +1243,12 @@ impl Provider for CodexProvider {
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let scope = legacy_scope(&ctx, RequestPurpose::Conversation);
-        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope), false)
-            .await
+        self.handle_messages_inner(
+            body,
+            ScopedRequestContext::new(ctx, scope),
+            ClaudeFastDecision::passthrough(false),
+        )
+        .await
     }
 
     async fn handle_messages_with_conversation_identity(
@@ -1239,8 +1260,12 @@ impl Provider for CodexProvider {
         let identity = compatible_explicit_identity(&ctx, conversation_identity);
         let scope =
             RequestScope::from_conversation_identity(identity, RequestPurpose::Conversation);
-        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope), false)
-            .await
+        self.handle_messages_inner(
+            body,
+            ScopedRequestContext::new(ctx, scope),
+            ClaudeFastDecision::passthrough(false),
+        )
+        .await
     }
 
     async fn handle_messages_with_claude_fast_intent(
@@ -1256,9 +1281,23 @@ impl Provider for CodexProvider {
         self.handle_messages_inner(
             body,
             ScopedRequestContext::new(ctx, scope),
-            claude_fast_intent,
+            ClaudeFastDecision::passthrough(claude_fast_intent),
         )
         .await
+    }
+
+    async fn handle_messages_with_claude_fast_decision(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+        decision: ClaudeFastDecision,
+    ) -> Response {
+        let identity = compatible_explicit_identity(&ctx, conversation_identity);
+        let scope =
+            RequestScope::from_conversation_identity(identity, RequestPurpose::Conversation);
+        self.handle_messages_inner(body, ScopedRequestContext::new(ctx, scope), decision)
+            .await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -2951,6 +2990,32 @@ mod tests {
     }
 
     #[test]
+    fn global_fast_policy_is_the_final_service_tier_override() {
+        for tier in [None, Some(ServiceTier::Priority), Some(ServiceTier::Flex)] {
+            assert_eq!(
+                apply_fast_policy_to_service_tier(tier.clone(), FastPolicy::Passthrough),
+                tier
+            );
+            assert_eq!(
+                apply_fast_policy_to_service_tier(tier, FastPolicy::ForceFast),
+                Some(ServiceTier::Priority)
+            );
+        }
+        assert_eq!(
+            apply_fast_policy_to_service_tier(Some(ServiceTier::Priority), FastPolicy::ForceOff,),
+            None
+        );
+        assert_eq!(
+            apply_fast_policy_to_service_tier(Some(ServiceTier::Flex), FastPolicy::ForceOff),
+            Some(ServiceTier::Flex)
+        );
+        assert_eq!(
+            apply_fast_policy_to_service_tier(None, FastPolicy::ForceOff),
+            None
+        );
+    }
+
+    #[test]
     fn existing_fast_alias_stays_priority_without_claude_fast() {
         let resolved = resolve_model_request_with_config_override("gpt-5.5-fast", false);
         assert_eq!(resolved.model, "gpt-5.5");
@@ -4267,7 +4332,11 @@ mod tests {
         }))
         .unwrap();
         let response = provider
-            .handle_messages_inner(initial, scope("agent-a", "read-first"), false)
+            .handle_messages_inner(
+                initial,
+                scope("agent-a", "read-first"),
+                ClaudeFastDecision::passthrough(false),
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let downstream: serde_json::Value = serde_json::from_slice(
@@ -4311,7 +4380,11 @@ mod tests {
         };
         for (agent, req_id) in [("agent-a", "read-same-lane"), ("agent-b", "read-sibling")] {
             let response = provider
-                .handle_messages_inner(result_request(), scope(agent, req_id), false)
+                .handle_messages_inner(
+                    result_request(),
+                    scope(agent, req_id),
+                    ClaudeFastDecision::passthrough(false),
+                )
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
             let _ = axum::body::to_bytes(response.into_body(), usize::MAX)

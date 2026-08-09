@@ -1,4 +1,5 @@
 use crate::anthropic::schema::MessagesRequest;
+use crate::fast_policy::ClaudeFastDecision;
 use crate::monitor::MonitorHandle;
 use crate::request_identity::{ConversationIdentity, RequestPurpose, RequestScope};
 use crate::traffic::TrafficCapture;
@@ -49,6 +50,22 @@ pub trait Provider: Send + Sync {
         let _ = claude_fast_intent;
         self.handle_messages_with_conversation_identity(body, ctx, conversation_identity)
             .await
+    }
+
+    async fn handle_messages_with_claude_fast_decision(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+        decision: ClaudeFastDecision,
+    ) -> Response {
+        self.handle_messages_with_claude_fast_intent(
+            body,
+            ctx,
+            conversation_identity,
+            decision.effective_fast(),
+        )
+        .await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response;

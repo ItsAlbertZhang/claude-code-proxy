@@ -36,6 +36,7 @@ use ratatui::{
 use tokio::sync::oneshot;
 
 use crate::{
+    fast_policy::{FastPolicy, FastPolicyHandle},
     monitor::{
         ActiveRequest, CodexAppendOnlyDiagnostics, CodexCauseSet, CodexDispatchOutcome,
         CodexDispatchSummary, CodexLane, CodexMetricsSnapshot, CodexPoolDiagnostics,
@@ -82,7 +83,15 @@ pub fn run_monitor(
     handle: MonitorHandle,
     config: MonitorUiConfig<'_>,
 ) -> Result<MonitorExit, anyhow::Error> {
-    run_monitor_loop(|| handle.snapshot(), config, None)
+    run_monitor_with_fast_policy(handle, config, FastPolicyHandle::default())
+}
+
+pub fn run_monitor_with_fast_policy(
+    handle: MonitorHandle,
+    config: MonitorUiConfig<'_>,
+    fast_policy: FastPolicyHandle,
+) -> Result<MonitorExit, anyhow::Error> {
+    run_monitor_loop(|| handle.snapshot(), config, fast_policy, None)
 }
 
 pub fn run_mock_monitor(port: u16, registry: &Registry) -> Result<(), anyhow::Error> {
@@ -96,6 +105,7 @@ pub fn run_mock_monitor(port: u16, registry: &Registry) -> Result<(), anyhow::Er
             shutdown: None,
             shutdown_complete: None,
         },
+        FastPolicyHandle::default(),
         Some(mock_setup_text(port, registry)),
     )
     .map(|_| ())
@@ -104,6 +114,7 @@ pub fn run_mock_monitor(port: u16, registry: &Registry) -> Result<(), anyhow::Er
 fn run_monitor_loop(
     mut snapshot: impl FnMut() -> MonitorState,
     config: MonitorUiConfig<'_>,
+    fast_policy: FastPolicyHandle,
     setup_text_override: Option<String>,
 ) -> Result<MonitorExit, anyhow::Error> {
     let (mut terminal, _guard) = setup_terminal()?;
@@ -119,6 +130,7 @@ fn run_monitor_loop(
         recent_selected: 0,
         tick: 0,
         phase: MonitorPhase::Running,
+        fast_policy,
         shutdown: config.shutdown,
         shutdown_complete: config.shutdown_complete,
     };
@@ -226,6 +238,9 @@ fn handle_monitor_event(
             KeyCode::Char('q') => app.request_shutdown_confirmation(),
             KeyCode::Char('?') => app.show_help = !app.show_help,
             KeyCode::Char('b') => app.show_setup = !app.show_setup,
+            KeyCode::Char('f') => {
+                app.fast_policy.cycle();
+            }
             KeyCode::Tab => app.focus = app.focus.next(),
             KeyCode::Down | KeyCode::Char('j') if app.detail.is_some() => app.scroll_detail_down(),
             KeyCode::Up | KeyCode::Char('k') if app.detail.is_some() => app.scroll_detail_up(),
@@ -306,6 +321,7 @@ struct MonitorApp {
     recent_selected: usize,
     tick: usize,
     phase: MonitorPhase,
+    fast_policy: FastPolicyHandle,
     shutdown: Option<oneshot::Sender<()>>,
     shutdown_complete: Option<mpsc::Receiver<()>>,
 }
@@ -565,6 +581,13 @@ fn render_header(
         .started_at
         .elapsed()
         .unwrap_or_else(|_| Duration::from_secs(0));
+    let fast_policy = app.fast_policy.get();
+    let fast_style = match fast_policy {
+        FastPolicy::Passthrough => Style::default().fg(BG).bg(DIM_WHITE),
+        FastPolicy::ForceFast => Style::default().fg(BG).bg(YELLOW),
+        FastPolicy::ForceOff => Style::default().fg(WHITE).bg(BLUE),
+    }
+    .add_modifier(Modifier::BOLD);
     let text = Line::from(vec![
         Span::styled(
             " claude-code-proxy",
@@ -575,6 +598,8 @@ fn render_header(
         ),
         Span::styled("  ", Style::default().fg(BG).bg(TEAL)),
         Span::styled(&app.listen_url, Style::default().fg(BG).bg(TEAL)),
+        Span::styled("  FAST ", Style::default().fg(BG).bg(TEAL)),
+        Span::styled(format!(" {} ", fast_policy.label()), fast_style),
         Span::styled("  uptime ", Style::default().fg(BG).bg(TEAL)),
         Span::styled(
             format_duration(uptime),
@@ -2056,6 +2081,8 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled(" help  ", Style::default().fg(DIM)),
         Span::styled("b", Style::default().fg(TEAL)),
         Span::styled(" setup  ", Style::default().fg(DIM)),
+        Span::styled("f", Style::default().fg(TEAL)),
+        Span::styled(" fast policy  ", Style::default().fg(DIM)),
         Span::styled("arrows/j/k", Style::default().fg(TEAL)),
         Span::styled(" navigate/scroll  ", Style::default().fg(DIM)),
         Span::styled("Tab", Style::default().fg(TEAL)),
@@ -2144,7 +2171,7 @@ fn render_shutdown_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, tick: usi
 
 fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let width = 48.min(area.width.saturating_sub(4)).max(24);
-    let height = 12.min(area.height.saturating_sub(2)).max(8);
+    let height = 13.min(area.height.saturating_sub(2)).max(8);
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -2164,6 +2191,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("q / Ctrl-C", "quit proxy"),
         ("?", "toggle help"),
         ("b", "toggle setup"),
+        ("f", "cycle fast policy"),
         ("arrows", "navigate / scroll detail"),
         ("j / k", "rows / scroll detail"),
         ("Tab", "switch pane"),
@@ -2333,6 +2361,7 @@ mod tests {
             recent_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
+            fast_policy: FastPolicyHandle::default(),
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
         }
@@ -3210,6 +3239,7 @@ mod tests {
             recent_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
+            fast_policy: FastPolicyHandle::default(),
             shutdown: None,
             shutdown_complete: None,
         };
@@ -3606,6 +3636,7 @@ mod tests {
             recent_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
+            fast_policy: FastPolicyHandle::default(),
             shutdown: Some(shutdown_tx),
             shutdown_complete: Some(mpsc::channel().1),
         };
@@ -3653,6 +3684,7 @@ mod tests {
             recent_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
+            fast_policy: FastPolicyHandle::default(),
             shutdown: Some(shutdown_tx),
             shutdown_complete: Some(shutdown_complete_rx),
         };
@@ -3684,6 +3716,7 @@ mod tests {
             recent_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
+            fast_policy: FastPolicyHandle::default(),
             shutdown: None,
             shutdown_complete: Some(complete_rx),
         };
@@ -3713,6 +3746,7 @@ mod tests {
             recent_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
+            fast_policy: FastPolicyHandle::default(),
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
         };
@@ -3722,7 +3756,85 @@ mod tests {
             render_header(frame, frame.area(), &app, &state)
         });
 
-        assert!(buffer_text(&header).contains("http://[::]:18765"));
+        let text = buffer_text(&header);
+        assert!(text.contains("http://[::]:18765"));
+        assert!(text.contains("FAST  AUTO"));
+    }
+
+    #[test]
+    fn fast_key_cycles_shared_policy_only_while_running() {
+        let mut app = test_app();
+        let fast_policy = app.fast_policy.clone();
+        let mut input = MonitorInputState::default();
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('f'), KeyEventKind::Press),
+            1,
+            1,
+        );
+        assert_eq!(fast_policy.get(), FastPolicy::ForceFast);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('f'), KeyEventKind::Repeat),
+            1,
+            1,
+        );
+        assert_eq!(fast_policy.get(), FastPolicy::ForceFast);
+
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('f'), KeyEventKind::Release),
+            1,
+            1,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('f'), KeyEventKind::Press),
+            1,
+            1,
+        );
+        assert_eq!(fast_policy.get(), FastPolicy::ForceOff);
+
+        app.phase = MonitorPhase::ConfirmingShutdown;
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('f'), KeyEventKind::Release),
+            1,
+            1,
+        );
+        handle_monitor_event(
+            &mut app,
+            &mut input,
+            key_event(KeyCode::Char('f'), KeyEventKind::Press),
+            1,
+            1,
+        );
+        assert_eq!(fast_policy.get(), FastPolicy::ForceOff);
+    }
+
+    #[test]
+    fn header_renders_each_fast_policy_label() {
+        let app = test_app();
+        let state = MonitorHandle::default().snapshot();
+
+        for (policy, label) in [
+            (FastPolicy::Passthrough, "FAST  AUTO"),
+            (FastPolicy::ForceFast, "FAST  ON"),
+            (FastPolicy::ForceOff, "FAST  OFF"),
+        ] {
+            app.fast_policy.set(policy);
+            let header = draw(100, 1, |frame| {
+                render_header(frame, frame.area(), &app, &state)
+            });
+            assert!(buffer_text(&header).contains(label));
+        }
     }
 
     #[test]
@@ -3739,6 +3851,7 @@ mod tests {
             recent_selected: 10,
             tick: 0,
             phase: MonitorPhase::Running,
+            fast_policy: FastPolicyHandle::default(),
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
         };
@@ -3766,6 +3879,7 @@ mod tests {
             recent_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
+            fast_policy: FastPolicyHandle::default(),
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
         };
@@ -3793,6 +3907,7 @@ mod tests {
             recent_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
+            fast_policy: FastPolicyHandle::default(),
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
         };

@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod auth;
 pub mod config;
+pub mod fast_policy;
 pub mod logging;
 pub mod model_setting;
 pub mod monitor;

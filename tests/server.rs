@@ -5,13 +5,14 @@ use axum::response::IntoResponse;
 use claude_code_proxy::{
     MessagesRequest,
     config::AliasProvider,
+    fast_policy::{FastPolicy, FastPolicyHandle},
     monitor::{MonitorHandle, RequestStatus},
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
     request_identity::ConversationIdentity,
     server::{
-        AppFeatures, app, app_with_features, app_with_monitor, app_with_options,
-        bind_proxy_listener,
+        AppFeatures, app, app_with_fast_policy, app_with_features, app_with_monitor,
+        app_with_options, bind_proxy_listener,
     },
 };
 use serde_json::{Value, json};
@@ -496,6 +497,75 @@ async fn claude_fast_intent_is_strict_and_codex_scoped() {
 
     assert_eq!(*codex_captured.lock().unwrap(), vec![true, true, false]);
     assert_eq!(*kimi_captured.lock().unwrap(), vec![false]);
+}
+
+#[tokio::test]
+async fn live_fast_policy_overrides_codex_messages_at_dispatch() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(FastIntentCaptureProvider {
+        name: "codex",
+        model: "gpt-5.5",
+        captured: captured.clone(),
+    }) as Arc<dyn Provider>;
+    let fast_policy = FastPolicyHandle::default();
+    let app = app_with_fast_policy(
+        Arc::new(Registry::from_providers(AliasProvider::Codex, [provider])),
+        fast_policy.clone(),
+    );
+    let body = || {
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+    };
+
+    assert_eq!(
+        call_identity_ingress(&app, "/v1/messages", &[], body()).await,
+        StatusCode::OK
+    );
+
+    fast_policy.set(FastPolicy::ForceFast);
+    assert_eq!(
+        call_identity_ingress(&app, "/v1/messages", &[], body()).await,
+        StatusCode::OK
+    );
+
+    fast_policy.set(FastPolicy::ForceOff);
+    assert_eq!(
+        call_identity_ingress(
+            &app,
+            "/v1/messages",
+            &[("anthropic-beta", "fast-mode-2026-02-01")],
+            json!({
+                "model": "gpt-5.5",
+                "max_tokens": 32,
+                "speed": "fast",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    fast_policy.set(FastPolicy::Passthrough);
+    assert_eq!(
+        call_identity_ingress(
+            &app,
+            "/v1/messages",
+            &[("anthropic-beta", "fast-mode-2026-02-01")],
+            json!({
+                "model": "gpt-5.5",
+                "max_tokens": 32,
+                "speed": "fast",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    assert_eq!(*captured.lock().unwrap(), vec![false, true, false, true]);
 }
 
 #[tokio::test]
